@@ -254,7 +254,7 @@ public class SyncSocketSession : IDisposable
     {
         int encryptedLength = _transport!.WriteMessage(source, destination);
         if (Logger.WillLog(LogLevel.Debug))
-            Logger.Debug<SyncSocketSession>($"Encrypted message bytes (source size: {source.Length}, destination size: {destination.Length})\n{Utilities.HexDump(source)}");
+            Logger.Debug<SyncSocketSession>($"Encrypted message bytes (source size: {source.Length}, destination size: {encryptedLength})\n{Utilities.HexDump(source)}");
         return encryptedLength;
     }
 
@@ -262,7 +262,7 @@ public class SyncSocketSession : IDisposable
     {
         int plen = _transport!.ReadMessage(source, destination);
         if (Logger.WillLog(LogLevel.Debug))
-            Logger.Debug<SyncSocketSession>($"Decrypted message bytes (source size: {source.Length}, destination size: {destination.Length})\n{Utilities.HexDump(destination.Slice(0, plen))}");
+            Logger.Debug<SyncSocketSession>($"Decrypted message bytes (source size: {source.Length}, destination size: {plen})\n{Utilities.HexDump(destination.Slice(0, plen))}");
         return plen;
     }
 

@@ -271,7 +271,7 @@ public class SyncSession
     {
         int encryptedLength = _transport!.WriteMessage(source, destination);
         if (Logger.WillLog(LogLevel.Debug))
-            Logger.Debug<SyncSession>($"Encrypted message bytes (source size: {source.Length}, destination size: {destination.Length})\n{Utilities.HexDump(source)}");
+            Logger.Debug<SyncSession>($"Encrypted message bytes (source size: {source.Length}, destination size: {encryptedLength})\n{Utilities.HexDump(source)}");
         return encryptedLength;
     }
 
@@ -279,7 +279,7 @@ public class SyncSession
     {
         int plen = _transport!.ReadMessage(source, destination);
         if (Logger.WillLog(LogLevel.Debug))
-            Logger.Debug<SyncSession>($"Decrypted message bytes (source size: {source.Length}, destination size: {destination.Length})\n{Utilities.HexDump(destination.Slice(0, plen))}");
+            Logger.Debug<SyncSession>($"Decrypted message bytes (source size: {source.Length}, destination size: {plen})\n{Utilities.HexDump(destination.Slice(0, plen))}");
         return plen;
     }
 
