@@ -1,7 +1,12 @@
 using System.Buffers.Binary;
+using System.Net.NetworkInformation;
+using System.Net.Sockets;
+using System.Net;
 using Noise;
 using SyncShared;
 using static System.Runtime.InteropServices.JavaScript.JSType;
+using System.Threading.Tasks;
+using System.Text;
 
 namespace SyncClient;
 
@@ -22,7 +27,10 @@ public class SyncSocketSession : IDisposable
         STREAM_START = 4,
         STREAM_DATA = 5,
         STREAM_END = 6,
-        DATA = 7
+        DATA = 7,
+        PUBLISH_CONNECTION_INFO = 8,
+        REQUEST_CONNECTION_INFO = 9,
+        RESPONSE_CONNECTION_INFO = 10
     }
 
 
@@ -436,6 +444,109 @@ public class SyncSocketSession : IDisposable
         HandlePacket((Opcode)opcode, subOpcode, packetData);
     }
 
+    public async Task SendRequestConnectionInfoAsync(string publicKey, CancellationToken cancellationToken = default)
+    {
+        byte[] publicKeyBytes;
+        try
+        {
+            publicKeyBytes = Convert.FromBase64String(publicKey);
+            if (publicKeyBytes.Length != 32)
+                throw new ArgumentException("Public key must be 32 bytes.");
+        }
+        catch (FormatException ex)
+        {
+            throw new ArgumentException("Invalid base64 encoding for public key.", ex);
+        }
+
+        await SendAsync(Opcode.REQUEST_CONNECTION_INFO, 0, publicKeyBytes, cancellationToken: cancellationToken);
+    }
+
+    public async Task PublishConnectionInformationAsync(string[] authorizedKeys, int port, bool allowLocal, bool allowProxy, CancellationToken cancellationToken = default)
+    {
+        const int MAX_AUTHORIZED_KEYS = 255;
+        if (authorizedKeys.Length > MAX_AUTHORIZED_KEYS)
+            throw new ArgumentException($"Number of authorized keys exceeds the maximum limit of {MAX_AUTHORIZED_KEYS}.");
+
+        // Collect network information
+        var ipv4Addresses = new List<IPAddress>(capacity: 4);
+        var ipv6Addresses = new List<IPAddress>(capacity: 4);
+        foreach (var nic in NetworkInterface.GetAllNetworkInterfaces())
+        {
+            if (nic.OperationalStatus == OperationalStatus.Up)
+            {
+                foreach (var unicast in nic.GetIPProperties().UnicastAddresses)
+                {
+                    var ip = unicast.Address;
+                    if (!IPAddress.IsLoopback(ip))
+                    {
+                        if (ip.AddressFamily == AddressFamily.InterNetwork)
+                            ipv4Addresses.Add(ip);
+                        else if (ip.AddressFamily == AddressFamily.InterNetworkV6)
+                            ipv6Addresses.Add(ip);
+                    }
+                }
+            }
+        }
+
+        // Serialize connection information
+        var nameBytes = Utilities.GetLimitedUtf8Bytes(OSHelper.GetComputerName(), 255);
+        int blobSize = 2 + 1 + nameBytes.Length + 1 + ipv4Addresses.Count * 4 + 1 + ipv6Addresses.Count * 16 + 1 + 1;
+        byte[] data = new byte[blobSize];
+        using (var stream = new MemoryStream(data))
+        using (var writer = new BinaryWriter(stream))
+        {
+            writer.Write((ushort)port);
+            writer.Write((byte)nameBytes.Length);
+            writer.Write(nameBytes);
+            writer.Write((byte)ipv4Addresses.Count);
+            foreach (var addr in ipv4Addresses)
+                writer.Write(addr.GetAddressBytes());
+            writer.Write((byte)ipv6Addresses.Count);
+            foreach (var addr in ipv6Addresses)
+                writer.Write(addr.GetAddressBytes());
+            writer.Write((byte)(allowLocal ? 1 : 0));
+            writer.Write((byte)(allowProxy ? 1 : 0));
+        }
+
+        // Precalculate total size
+        int totalSize = 1 + authorizedKeys.Length * (100 + data.Length);
+        var publishBytes = new byte[totalSize];
+
+        // Encrypt data for each authorized key
+        using (var publishDataStream = new MemoryStream(publishBytes, 0, totalSize, true, true))
+        using (var writer = new BinaryWriter(publishDataStream))
+        {
+            writer.Write((byte)authorizedKeys.Length);
+            foreach (var authorizedKey in authorizedKeys)
+            {
+                var publicKeyBytes = Convert.FromBase64String(authorizedKey);
+                if (publicKeyBytes.Length != 32)
+                    throw new InvalidOperationException("Public key must be 32 bytes.");
+                writer.Write(publicKeyBytes);
+
+                var protocol = new Protocol(HandshakePattern.N, CipherFunction.ChaChaPoly, HashFunction.Blake2b);
+                using var handshakeState = protocol.Create(true, rs: publicKeyBytes);
+
+                var expectedHandshakeSize = 32 + 16;
+                var handshakeMessage = new byte[expectedHandshakeSize];
+                var (handshakeBytesWritten, _, transport) = handshakeState.WriteMessage(null, handshakeMessage);
+                if (handshakeBytesWritten != expectedHandshakeSize)
+                    throw new InvalidOperationException($"Handshake message must be {expectedHandshakeSize} bytes.");
+                writer.Write(handshakeMessage, 0, expectedHandshakeSize);
+
+                var ciphertext = new byte[data.Length + 16];
+                var ciphertextBytesWritten = transport.WriteMessage(data, ciphertext);
+                if (ciphertextBytesWritten != data.Length + 16)
+                    throw new InvalidOperationException("Ciphertext size mismatch.");
+                writer.Write(data.Length + 16);
+                writer.Write(ciphertext, 0, data.Length + 16);
+            }
+        }
+
+        // Send encrypted data
+        await SendAsync(Opcode.PUBLISH_CONNECTION_INFO, 0, publishBytes, cancellationToken: cancellationToken);
+    }
+
     private void HandlePacket(Opcode opcode, byte subOpcode, byte[] data)
     {
         switch (opcode)
@@ -457,11 +568,74 @@ public class SyncSocketSession : IDisposable
             case Opcode.PONG:
                 Logger.Debug<SyncSocketSession>("Received PONG");
                 return;
+            case Opcode.RESPONSE_CONNECTION_INFO:
+                {
+                    if (subOpcode == 0)
+                        ProcessConnectionInfo(data);
+                    else
+                        Logger.Info<SyncSocketSession>($"Connection info request failed with error code {subOpcode}");
+                    return;
+                }
             case Opcode.NOTIFY_AUTHORIZED:
             case Opcode.NOTIFY_UNAUTHORIZED:
                 _onData(this, opcode, subOpcode, data);
                 return;
         }
+    }
+
+    private void ProcessConnectionInfo(byte[] data)
+    {
+        using var stream = new MemoryStream(data);
+        using var reader = new BinaryReader(stream);
+
+        var expectedHandshakeSize = 32 + 16;
+        byte[] handshakeMessage = reader.ReadBytes(expectedHandshakeSize);
+        byte[] ciphertext = reader.ReadBytes(data.Length - expectedHandshakeSize);
+        var protocol = new Protocol(HandshakePattern.N, CipherFunction.ChaChaPoly, HashFunction.Blake2b);
+        
+        using var handshakeState = protocol.Create(false, s: _localKeyPair.PrivateKey);
+        var plaintextBuffer = new byte[0];
+        var (_, _, transport) = handshakeState.ReadMessage(handshakeMessage, plaintextBuffer);
+
+        var decryptedData = new byte[ciphertext.Length - 16];
+        var decryptedLength = transport.ReadMessage(ciphertext, decryptedData);
+        if (decryptedLength != decryptedData.Length)
+        {
+            throw new Exception("Decryption failed: incomplete data");
+        }
+
+        using var infoStream = new MemoryStream(decryptedData);
+        using var infoReader = new BinaryReader(infoStream);
+        ushort port = infoReader.ReadUInt16();
+
+        byte nameLength = infoReader.ReadByte();
+        byte[] nameBytes = infoReader.ReadBytes(nameLength);
+        string name = Encoding.UTF8.GetString(nameBytes);
+
+        byte ipv4Count = infoReader.ReadByte();
+        List<IPAddress> ipv4Addresses = new List<IPAddress>();
+        for (int i = 0; i < ipv4Count; i++)
+        {
+            byte[] addrBytes = infoReader.ReadBytes(4);
+            ipv4Addresses.Add(new IPAddress(addrBytes));
+        }
+
+        byte ipv6Count = infoReader.ReadByte();
+        List<IPAddress> ipv6Addresses = new List<IPAddress>();
+        for (int i = 0; i < ipv6Count; i++)
+        {
+            byte[] addrBytes = infoReader.ReadBytes(16);
+            ipv6Addresses.Add(new IPAddress(addrBytes));
+        }
+
+        bool allowLocal = infoReader.ReadByte() != 0;
+        bool allowProxy = infoReader.ReadByte() != 0;
+        Logger.Info<SyncSocketSession>(
+            $"Received connection info: port={port}, name={name}, " +
+            $"ipv4={string.Join(", ", ipv4Addresses)}, ipv6={string.Join(", ", ipv6Addresses)}, " +
+            $"allowLocal={allowLocal}, allowProxy={allowProxy}"
+        );
+
     }
 
     public void Dispose()

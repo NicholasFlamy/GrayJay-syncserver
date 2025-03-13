@@ -23,6 +23,7 @@ public class TcpSyncServer
     private readonly SocketAsyncEventArgsPool _readWritePool;
     private readonly ConcurrentDictionary<Socket, SyncSession> _clients = new();
     private readonly KeyPair _keyPair;
+    private readonly ConcurrentDictionary<(string, string), byte[]> _connectionInfoStore = new();
 
     public TcpSyncServer(KeyPair keyPair)
     {
@@ -30,6 +31,18 @@ public class TcpSyncServer
         _readWritePool = new SocketAsyncEventArgsPool(MaxConnections);
         _keyPair = keyPair;
         InitializeBufferPool();
+    }
+
+    public void StoreConnectionInfo(string publicKey, string intendedPublicKey, byte[] encryptedBlob)
+    {
+        _connectionInfoStore[(publicKey, intendedPublicKey)] = encryptedBlob;
+    }
+
+    public byte[]? RetrieveConnectionInfo(string publicKey, string intendedPublicKey)
+    {
+        if (_connectionInfoStore.TryGetValue((publicKey, intendedPublicKey), out byte[]? block))
+            return block;
+        return null;
     }
 
     private void InitializeBufferPool()

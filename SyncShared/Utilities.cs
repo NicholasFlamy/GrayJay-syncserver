@@ -31,4 +31,22 @@ public static class Utilities
         }
         return builder.ToString();
     }
+
+    public static byte[] GetLimitedUtf8Bytes(string str, int maxByteLength)
+    {
+        if (str == null) throw new ArgumentNullException(nameof(str));
+        if (maxByteLength < 0) throw new ArgumentOutOfRangeException(nameof(maxByteLength));
+
+        byte[] bytes = Encoding.UTF8.GetBytes(str);
+        if (bytes.Length <= maxByteLength)
+            return bytes;
+
+        int truncateAt = maxByteLength;
+        while (truncateAt > 0 && (bytes[truncateAt] & 0xC0) == 0x80) // Continuation byte: 10xxxxxx
+            truncateAt--;
+
+        byte[] truncatedBytes = new byte[truncateAt];
+        Array.Copy(bytes, truncatedBytes, truncateAt);
+        return truncatedBytes;
+    }
 }

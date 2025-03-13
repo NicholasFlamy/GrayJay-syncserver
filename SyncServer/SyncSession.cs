@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Buffers;
 using System.Buffers.Binary;
+using System.Collections.Concurrent;
 using System.Net.Sockets;
 using System.Runtime.CompilerServices;
 using Noise;
@@ -34,7 +35,10 @@ public class SyncSession
         STREAM_START = 4,
         STREAM_DATA = 5,
         STREAM_END = 6,
-        DATA = 7
+        DATA = 7,
+        PUBLISH_CONNECTION_INFO = 8,
+        REQUEST_CONNECTION_INFO = 9,
+        RESPONSE_CONNECTION_INFO = 10
     }
 
     public const int HEADER_SIZE = 6;
@@ -216,14 +220,80 @@ public class SyncSession
 
         Opcode opcode = (Opcode)data[4];
         byte subOpcode = data[5];
-        byte[] packetData = new byte[size - 2];
+        var packetData = data.Slice(6);
 
         Logger.Info<SyncSession>($"HandleDecryptedPacket (opcode = {opcode}, subOpcode = {subOpcode}, size = {packetData.Length})");
 
-        if (opcode == Opcode.PING)
+        switch (opcode)
         {
-            Send(Opcode.PONG);
+            case Opcode.PING:
+                Send(Opcode.PONG);
+                break;
+            case Opcode.PUBLISH_CONNECTION_INFO:
+                HandlePublishConnectionInfo(packetData);
+                break;
+            case Opcode.REQUEST_CONNECTION_INFO:
+                HandleRequestConnectionInfo(packetData);
+                break;
+            default:
+                Logger.Debug<SyncSession>($"Received unhandled opcode: {opcode}");
+                break;
         }
+    }
+
+    private void HandlePublishConnectionInfo(ReadOnlySpan<byte> data)
+    {
+        if (RemotePublicKey == null)
+        {
+            Logger.Error<SyncSession>("Cannot publish connection info before handshake completes.");
+            return;
+        }
+
+        int offset = 0;
+        byte numEntries = data[offset];
+        offset += 1;
+
+        for (int i = 0; i < numEntries; i++)
+        {
+            ReadOnlySpan<byte> publicKeySpan = data.Slice(offset, 32);
+            string intendedPublicKey = Convert.ToBase64String(publicKeySpan);
+            offset += 32;
+
+            ReadOnlySpan<byte> handshakeSpan = data.Slice(offset, 48);
+            offset += 48;
+
+            int ciphertextLength = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(offset, 4));
+            offset += 4;
+
+            ReadOnlySpan<byte> ciphertextSpan = data.Slice(offset, ciphertextLength);
+            offset += ciphertextLength;
+
+            byte[] block = new byte[48 + ciphertextLength];
+            handshakeSpan.CopyTo(block.AsSpan(0, 48));
+            ciphertextSpan.CopyTo(block.AsSpan(48, ciphertextLength));
+
+            _server.StoreConnectionInfo(RemotePublicKey, intendedPublicKey, block);
+        }
+
+        Logger.Info<SyncSession>($"Published connection info for {numEntries} authorized keys.");
+    }
+
+    private void HandleRequestConnectionInfo(ReadOnlySpan<byte> targetPublicKeyBytes)
+    {
+        if (targetPublicKeyBytes.Length != 32)
+        {
+            Logger.Error<SyncSession>("Invalid target public key length in REQUEST_CONNECTION_INFO");
+            return;
+        }
+
+        string targetPublicKey = Convert.ToBase64String(targetPublicKeyBytes);
+        string requestingPublicKey = RemotePublicKey!;
+
+        var block = _server.RetrieveConnectionInfo(targetPublicKey, requestingPublicKey);
+        if (block != null)
+            Send(Opcode.RESPONSE_CONNECTION_INFO, 0, block);
+        else
+            Send(Opcode.RESPONSE_CONNECTION_INFO, 1, Array.Empty<byte>());
     }
 
     public void HandleVersionCheck(ReadOnlySpan<byte> data)
