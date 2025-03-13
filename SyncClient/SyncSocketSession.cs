@@ -1,5 +1,7 @@
 using System.Buffers.Binary;
 using Noise;
+using SyncShared;
+using static System.Runtime.InteropServices.JavaScript.JSType;
 
 namespace SyncClient;
 
@@ -113,7 +115,7 @@ public class SyncSocketSession : IDisposable
             try
             {
                 byte[] messageSizeBytes = new byte[4];
-                _inputStream.Read(messageSizeBytes, 0, 4);
+                Read(messageSizeBytes, 0, 4);
                 int messageSize = BitConverter.ToInt32(messageSizeBytes, 0);
                 if (messageSize == 0)
                     throw new Exception("Disconnected.");
@@ -127,7 +129,7 @@ public class SyncSocketSession : IDisposable
                 int bytesRead = 0;
                 while (bytesRead < messageSize)
                 {
-                    int read = _inputStream.Read(_buffer, bytesRead, messageSize - bytesRead);
+                    int read = Read(_buffer, bytesRead, messageSize - bytesRead);
                     if (read == -1)
                         throw new Exception("Stream closed");
                     bytesRead += read;
@@ -136,7 +138,7 @@ public class SyncSocketSession : IDisposable
                 if (Logger.WillLog(LogLevel.Debug))
                     Logger.Debug<SyncSocketSession>($"Read message bytes {bytesRead}");
 
-                int plen = _transport!.ReadMessage(_buffer.AsSpan().Slice(0, messageSize), _bufferDecrypted);
+                int plen = Decrypt(_buffer.AsSpan().Slice(0, messageSize), _bufferDecrypted);
                 if (Logger.WillLog(LogLevel.Debug))
                     Logger.Debug<SyncSocketSession>($"Decrypted message bytes {plen}");
 
@@ -170,11 +172,11 @@ public class SyncSocketSession : IDisposable
         using (var handshakeState = _protocol.Create(true, s: _localKeyPair.PrivateKey, rs: Convert.FromBase64String(remotePublicKey)))
         {
             var (bytesWritten, _, _) = handshakeState.WriteMessage(null, message);
-            _outputStream.Write(BitConverter.GetBytes(bytesWritten));
-            _outputStream.Write(message, 0, bytesWritten);
+            Send(BitConverter.GetBytes(bytesWritten));
+            Send(message, 0, bytesWritten);
             Logger.Info<SyncSocketSession>($"HandshakeAsInitiator: Wrote message size {bytesWritten}");
 
-            var bytesRead = _inputStream.Read(message, 0, 4);
+            var bytesRead = Read(message, 0, 4);
             if (bytesRead != 4)
                 throw new Exception("Expected exactly 4 bytes (message size)");
 
@@ -183,7 +185,7 @@ public class SyncSocketSession : IDisposable
             bytesRead = 0;
             while (bytesRead < messageSize)
             {
-                var read = _inputStream.Read(message, bytesRead, messageSize - bytesRead);
+                var read = Read(message, bytesRead, messageSize - bytesRead);
                 if (read == 0)
                     throw new Exception("Stream closed.");
                 bytesRead += read;
@@ -204,7 +206,7 @@ public class SyncSocketSession : IDisposable
         var plaintext = new byte[Protocol.MaxMessageLength];
         using (var handshakeState = _protocol.Create(false, s: _localKeyPair.PrivateKey))
         {
-            var bytesRead = _inputStream.Read(message, 0, 4);
+            var bytesRead = Read(message, 0, 4);
             if (bytesRead != 4)
                 throw new Exception($"Expected exactly 4 bytes (message size), read {bytesRead}");
 
@@ -214,7 +216,7 @@ public class SyncSocketSession : IDisposable
             bytesRead = 0;
             while (bytesRead < messageSize)
             {
-                var read = _inputStream.Read(message, bytesRead, messageSize - bytesRead);
+                var read = Read(message, bytesRead, messageSize - bytesRead);
                 if (read == 0)
                     throw new Exception("Stream closed.");
                 bytesRead += read;
@@ -223,8 +225,8 @@ public class SyncSocketSession : IDisposable
             var (_, _, _) = handshakeState.ReadMessage(message.AsSpan().Slice(0, messageSize), plaintext);
 
             var (bytesWritten, _, transport) = handshakeState.WriteMessage(null, message);
-            _outputStream.Write(BitConverter.GetBytes(bytesWritten));
-            _outputStream.Write(message, 0, bytesWritten);
+            Send(BitConverter.GetBytes(bytesWritten));
+            Send(message, 0, bytesWritten);
             Logger.Info<SyncSocketSession>($"HandshakeAsResponder: Wrote message size {bytesWritten}");
 
             _transport = transport;
@@ -237,15 +239,63 @@ public class SyncSocketSession : IDisposable
     {
         const int CURRENT_VERSION = 3;
         const int MINIMUM_VERSION = 2;
-        _outputStream.Write(BitConverter.GetBytes(CURRENT_VERSION), 0, 4);
+        Send(BitConverter.GetBytes(CURRENT_VERSION), 0, 4);
         byte[] versionBytes = new byte[4];
-        int bytesRead = _inputStream.Read(versionBytes, 0, 4);
+        int bytesRead = Read(versionBytes, 0, 4);
         if (bytesRead != 4)
             throw new Exception($"Expected 4 bytes to be read, read {bytesRead}");
         RemoteVersion = BitConverter.ToInt32(versionBytes, 0);
         Logger.Info(nameof(SyncSocketSession), $"PerformVersionCheck {RemoteVersion}");
         if (RemoteVersion < MINIMUM_VERSION)
             throw new Exception("Invalid version");
+    }
+
+    private int Encrypt(ReadOnlySpan<byte> source, Span<byte> destination)
+    {
+        int encryptedLength = _transport!.WriteMessage(source, destination);
+        if (Logger.WillLog(LogLevel.Debug))
+            Logger.Debug<SyncSocketSession>($"Encrypted message bytes (source size: {source.Length}, destination size: {destination.Length})\n{Utilities.HexDump(source)}");
+        return encryptedLength;
+    }
+
+    private int Decrypt(ReadOnlySpan<byte> source, Span<byte> destination)
+    {
+        int plen = _transport!.ReadMessage(source, destination);
+        if (Logger.WillLog(LogLevel.Debug))
+            Logger.Debug<SyncSocketSession>($"Decrypted message bytes (source size: {source.Length}, destination size: {destination.Length})\n{Utilities.HexDump(destination.Slice(0, plen))}");
+        return plen;
+    }
+
+    private int Read(byte[] buffer, int offset, int size)
+    {
+        int bytesRead = _inputStream.Read(buffer, offset, size);
+        if (Logger.WillLog(LogLevel.Debug))
+            Logger.Debug<SyncSocketSession>($"Read {bytesRead} bytes.\n{Utilities.HexDump(buffer.AsSpan().Slice(offset, bytesRead))}");
+        return bytesRead;
+    }
+
+    private async Task SendAsync(byte[] data, int offset = 0, int size = -1, CancellationToken cancellationToken = default)
+    {
+        if (Logger.WillLog(LogLevel.Debug))
+            Logger.Debug<SyncSocketSession>($"Sending {data.Length} bytes.\n{Utilities.HexDump(data.AsSpan().Slice(offset, size))}");
+
+        if (size == -1)
+            size = data.Length;
+        await _outputStream.WriteAsync(data, offset, size, cancellationToken);
+    }
+
+    private void Send(byte[] data, int offset = 0, int size = -1)
+    {
+        if (size == -1)
+            size = data.Length;
+        Send(data.AsSpan().Slice(0, size));
+    }
+
+    private void Send(ReadOnlySpan<byte> data)
+    {
+        if (Logger.WillLog(LogLevel.Debug))
+            Logger.Debug<SyncSocketSession>($"Sending {data.Length} bytes.\n{Utilities.HexDump(data)}");
+        _outputStream.Write(data);
     }
 
     public async Task SendAsync(Opcode opcode, byte subOpcode, byte[] data, int offset = 0, int size = -1, CancellationToken cancellationToken = default) =>
@@ -320,14 +370,14 @@ public class SyncSocketSession : IDisposable
                 if (Logger.WillLog(LogLevel.Debug))
                     Logger.Debug<SyncSocketSession>($"Encrypted message bytes {data.Length + HEADER_SIZE}");
 
-                var len = _transport!.WriteMessage(_sendBuffer.AsSpan().Slice(0, data.Length + HEADER_SIZE), _sendBufferEncrypted);
+                var len = Encrypt(_sendBuffer.AsSpan().Slice(0, data.Length + HEADER_SIZE), _sendBufferEncrypted);
 
-                _outputStream.Write(BitConverter.GetBytes(len), 0, 4);
+                Send(BitConverter.GetBytes(len), 0, 4);
 
                 if (Logger.WillLog(LogLevel.Debug))
                     Logger.Debug<SyncSocketSession>($"Wrote message size {len}");
 
-                _outputStream.Write(_sendBufferEncrypted, 0, len);
+                Send(_sendBufferEncrypted, 0, len);
 
                 if (Logger.WillLog(LogLevel.Debug))
                     Logger.Debug<SyncSocketSession>($"Wrote message bytes {len}");
@@ -352,13 +402,13 @@ public class SyncSocketSession : IDisposable
             if (Logger.WillLog(LogLevel.Debug))
                 Logger.Debug<SyncSocketSession>($"Encrypted message bytes {HEADER_SIZE}");
 
-            var len = _transport!.WriteMessage(_sendBuffer.AsSpan().Slice(0, HEADER_SIZE), _sendBufferEncrypted);
-            await _outputStream.WriteAsync(BitConverter.GetBytes(len), 0, 4, cancellationToken);
+            var len = Encrypt(_sendBuffer.AsSpan().Slice(0, HEADER_SIZE), _sendBufferEncrypted);
+            await SendAsync(BitConverter.GetBytes(len), 0, 4, cancellationToken);
 
             if (Logger.WillLog(LogLevel.Debug))
                 Logger.Debug<SyncSocketSession>($"Wrote message size {len}");
 
-            await _outputStream.WriteAsync(_sendBufferEncrypted, 0, len, cancellationToken);
+            await SendAsync(_sendBufferEncrypted, 0, len, cancellationToken);
 
             if (Logger.WillLog(LogLevel.Debug))
                 Logger.Debug<SyncSocketSession>($"Wrote message bytes {len}");

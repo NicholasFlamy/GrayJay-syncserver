@@ -21,7 +21,12 @@ public static class Logger
             logMessage += $"\nException: {ex.Message}\nStack Trace: {ex.StackTrace}";
         Console.WriteLine(logMessage);
     };
+
+#if DEBUG
     public static Func<LogLevel, bool> WillLog = (level) => true;
+#else
+    public static Func<LogLevel, bool> WillLog = (level) => (int)level <= (int)LogLevel.Warning;
+#endif
 
     internal static void Debug<T>(string message, Exception? ex = null) => LogCallback.Invoke(LogLevel.Debug, nameof(T), message, ex);
     internal static void Verbose<T>(string message, Exception? ex = null) => LogCallback.Invoke(LogLevel.Verbose, nameof(T), message, ex);

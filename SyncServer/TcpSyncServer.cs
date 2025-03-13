@@ -130,9 +130,6 @@ public class TcpSyncServer
 
     private void OnReceiveCompleted(SyncSession session, int bytesReceived)
     {
-        if (Logger.WillLog(LogLevel.Debug))
-            Logger.Debug<TcpSyncServer>($"Received {bytesReceived} bytes.");
-
         session.HandleData(bytesReceived);
 
         bool pending = session.Socket!.ReceiveAsync(session.ReadArgs!);

@@ -49,7 +49,7 @@ internal class Program
                 Logger.Info(nameof(Program), $"Received data (opcode: {opcode}, subOpcode: {subOpcode})");
             });
 
-        socketSession.StartAsInitiator("c48kEsdhkvdmSuj7ZpwYem2Em6EHBzqHVRmKjDTWdlA=");
+        socketSession.StartAsInitiator("12rV6GgH3zRDLuHNuCSbfIdnfs2HNm8t31zPorw13zQ=");
 
         CancellationTokenSource cts = new CancellationTokenSource();
         Console.CancelKeyPress += (_, __) => cts.Cancel();

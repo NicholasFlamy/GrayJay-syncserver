@@ -4,6 +4,8 @@ using System.Buffers.Binary;
 using System.Net.Sockets;
 using System.Runtime.CompilerServices;
 using Noise;
+using SyncShared;
+using static System.Runtime.InteropServices.JavaScript.JSType;
 
 namespace SyncServer;
 
@@ -79,6 +81,9 @@ public class SyncSession
     public void HandleData(int bytesReceived)
     {
         var data = ReadArgs.Buffer.AsSpan(0, bytesReceived);
+        if (Logger.WillLog(LogLevel.Debug))
+            Logger.Debug<SyncSession>($"Received {bytesReceived} bytes.\n{Utilities.HexDump(data)}");
+
         int offset = 0;
         if (PrimaryState == SessionPrimaryState.VersionCheck)
         {
@@ -192,7 +197,7 @@ public class SyncSession
 
             try
             {
-                int plen = _transport!.ReadMessage(data, decryptionBuffer);
+                int plen = Decrypt(data, decryptionBuffer);
                 HandleDecryptedPacket(decryptionBuffer.AsSpan().Slice(0, plen));
             }
             finally
@@ -254,12 +259,28 @@ public class SyncSession
         if (Logger.WillLog(LogLevel.Debug))
             Logger.Debug<SyncSession>($"Encrypted message bytes {(data?.Length ?? 0) + HEADER_SIZE}");
 
-        var len = _transport!.WriteMessage(decryptedPacket.AsSpan().Slice(0, (data?.Length ?? 0) + HEADER_SIZE), encryptedPacket.AsSpan().Slice(4));
+        var len = Encrypt(decryptedPacket.AsSpan().Slice(0, (data?.Length ?? 0) + HEADER_SIZE), encryptedPacket.AsSpan().Slice(4));
         BinaryPrimitives.WriteInt32LittleEndian(encryptedPacket.AsSpan().Slice(0, 4), len);
         Send(encryptedPacket);
 
         if (Logger.WillLog(LogLevel.Debug))
             Logger.Debug<SyncSession>($"Wrote message bytes {len}");
+    }
+
+    private int Encrypt(ReadOnlySpan<byte> source, Span<byte> destination)
+    {
+        int encryptedLength = _transport!.WriteMessage(source, destination);
+        if (Logger.WillLog(LogLevel.Debug))
+            Logger.Debug<SyncSession>($"Encrypted message bytes (source size: {source.Length}, destination size: {destination.Length})\n{Utilities.HexDump(source)}");
+        return encryptedLength;
+    }
+
+    private int Decrypt(ReadOnlySpan<byte> source, Span<byte> destination)
+    {
+        int plen = _transport!.ReadMessage(source, destination);
+        if (Logger.WillLog(LogLevel.Debug))
+            Logger.Debug<SyncSession>($"Decrypted message bytes (source size: {source.Length}, destination size: {destination.Length})\n{Utilities.HexDump(destination.Slice(0, plen))}");
+        return plen;
     }
 
     //TODO: Reuse buffer initially set by InitializeBufferPool
@@ -271,7 +292,7 @@ public class SyncSession
             if (!_isBusyWriting)
             {
                 if (Logger.WillLog(LogLevel.Debug))
-                    Logger.Debug<SyncSession>($"Sending {count} bytes.");
+                    Logger.Debug<SyncSession>($"Sending {count} bytes.\n{Utilities.HexDump(data.AsSpan().Slice(offset, count))}");
 
                 WriteArgs.SetBuffer(data, offset, count);
                 bool pending = Socket.SendAsync(WriteArgs!);
@@ -300,7 +321,7 @@ public class SyncSession
             {
                 var (data, offset, count) = SendQueue.Dequeue();
                 if (Logger.WillLog(LogLevel.Debug))
-                    Logger.Debug<SyncSession>($"Sending {count} bytes.");
+                    Logger.Debug<SyncSession>($"Sending {count} bytes from queue.\n{Utilities.HexDump(data.AsSpan().Slice(offset, count))}");
 
                 WriteArgs.SetBuffer(data, offset, count);
                 bool pending = Socket.SendAsync(WriteArgs!);
