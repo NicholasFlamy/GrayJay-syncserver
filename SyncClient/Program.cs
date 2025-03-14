@@ -35,8 +35,8 @@ internal class Program
             WaitForHandshake(socketSession2)
         );
 
-        await socketSession1.PublishConnectionInformationAsync([socketSession2.LocalPublicKey], 1000, true, true);
-        await socketSession2.PublishConnectionInformationAsync([socketSession1.LocalPublicKey], 1000, true, true);
+        await socketSession1.PublishConnectionInformationAsync([socketSession2.LocalPublicKey], 1000, true, true, true, true);
+        await socketSession2.PublishConnectionInformationAsync([socketSession1.LocalPublicKey], 1000, true, true, true, true);
 
         await socketSession1.SendRequestConnectionInfoAsync(publicKey2);
 

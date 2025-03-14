@@ -461,7 +461,7 @@ public class SyncSocketSession : IDisposable
         await SendAsync(Opcode.REQUEST_CONNECTION_INFO, 0, publicKeyBytes, cancellationToken: cancellationToken);
     }
 
-    public async Task PublishConnectionInformationAsync(string[] authorizedKeys, int port, bool allowLocal, bool allowProxy, CancellationToken cancellationToken = default)
+    public async Task PublishConnectionInformationAsync(string[] authorizedKeys, int port, bool allowLocal, bool allowRemoteDirect, bool allowRemoteHolePunched, bool allowRemoteProxied, CancellationToken cancellationToken = default)
     {
         const int MAX_AUTHORIZED_KEYS = 255;
         if (authorizedKeys.Length > MAX_AUTHORIZED_KEYS)
@@ -490,7 +490,7 @@ public class SyncSocketSession : IDisposable
 
         // Serialize connection information
         var nameBytes = Utilities.GetLimitedUtf8Bytes(OSHelper.GetComputerName(), 255);
-        int blobSize = 2 + 1 + nameBytes.Length + 1 + ipv4Addresses.Count * 4 + 1 + ipv6Addresses.Count * 16 + 1 + 1;
+        int blobSize = 2 + 1 + nameBytes.Length + 1 + ipv4Addresses.Count * 4 + 1 + ipv6Addresses.Count * 16 + 1 + 1 + 1 + 1;
         byte[] data = new byte[blobSize];
         using (var stream = new MemoryStream(data))
         using (var writer = new BinaryWriter(stream))
@@ -505,7 +505,9 @@ public class SyncSocketSession : IDisposable
             foreach (var addr in ipv6Addresses)
                 writer.Write(addr.GetAddressBytes());
             writer.Write((byte)(allowLocal ? 1 : 0));
-            writer.Write((byte)(allowProxy ? 1 : 0));
+            writer.Write((byte)(allowRemoteDirect ? 1 : 0));
+            writer.Write((byte)(allowRemoteHolePunched ? 1 : 0));
+            writer.Write((byte)(allowRemoteProxied ? 1 : 0));
         }
 
         // Precalculate total size
@@ -589,6 +591,9 @@ public class SyncSocketSession : IDisposable
         using var reader = new BinaryReader(stream);
 
         var expectedHandshakeSize = 32 + 16;
+        var ipSize = reader.ReadByte();
+        var remoteIpBytes = reader.ReadBytes(ipSize);
+        var remoteIp = new IPAddress(remoteIpBytes);
         byte[] handshakeMessage = reader.ReadBytes(expectedHandshakeSize);
         byte[] ciphertext = reader.ReadBytes(data.Length - expectedHandshakeSize);
         var protocol = new Protocol(HandshakePattern.N, CipherFunction.ChaChaPoly, HashFunction.Blake2b);
@@ -629,13 +634,14 @@ public class SyncSocketSession : IDisposable
         }
 
         bool allowLocal = infoReader.ReadByte() != 0;
-        bool allowProxy = infoReader.ReadByte() != 0;
+        bool allowRemoteDirect = infoReader.ReadByte() != 0;
+        bool allowRemoteHolePunched = infoReader.ReadByte() != 0;
+        bool allowRemoteProxied = infoReader.ReadByte() != 0;
         Logger.Info<SyncSocketSession>(
             $"Received connection info: port={port}, name={name}, " +
-            $"ipv4={string.Join(", ", ipv4Addresses)}, ipv6={string.Join(", ", ipv6Addresses)}, " +
-            $"allowLocal={allowLocal}, allowProxy={allowProxy}"
+            $"remoteIp={remoteIp}, ipv4={string.Join(", ", ipv4Addresses)}, ipv6={string.Join(", ", ipv6Addresses)}, " +
+            $"allowLocal={allowLocal}, allowRemoteDirect={allowRemoteDirect}, allowRemoteHolePunched={allowRemoteHolePunched}, allowRemoteProxied={allowRemoteProxied}"
         );
-
     }
 
     public void Dispose()

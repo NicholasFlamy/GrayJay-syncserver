@@ -2,6 +2,7 @@
 using System.Buffers;
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
+using System.Net;
 using System.Net.Sockets;
 using System.Runtime.CompilerServices;
 using Noise;
@@ -253,6 +254,7 @@ public class SyncSession
         byte numEntries = data[offset];
         offset += 1;
 
+        var remoteIpBytes = ((IPEndPoint)Socket.RemoteEndPoint!).Address.GetAddressBytes();
         for (int i = 0; i < numEntries; i++)
         {
             ReadOnlySpan<byte> publicKeySpan = data.Slice(offset, 32);
@@ -268,9 +270,11 @@ public class SyncSession
             ReadOnlySpan<byte> ciphertextSpan = data.Slice(offset, ciphertextLength);
             offset += ciphertextLength;
 
-            byte[] block = new byte[48 + ciphertextLength];
-            handshakeSpan.CopyTo(block.AsSpan(0, 48));
-            ciphertextSpan.CopyTo(block.AsSpan(48, ciphertextLength));
+            byte[] block = new byte[1 + remoteIpBytes.Length + 48 + ciphertextLength];
+            block[0] = (byte)remoteIpBytes.Length;
+            remoteIpBytes.CopyTo(block.AsSpan(1, remoteIpBytes.Length));
+            handshakeSpan.CopyTo(block.AsSpan(1 + remoteIpBytes.Length, 48));
+            ciphertextSpan.CopyTo(block.AsSpan(1 + remoteIpBytes.Length + 48, ciphertextLength));
 
             _server.StoreConnectionInfo(RemotePublicKey, intendedPublicKey, block);
         }
