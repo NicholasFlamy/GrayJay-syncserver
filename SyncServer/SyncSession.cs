@@ -78,7 +78,7 @@ public class SyncSession
         PrimaryState = SessionPrimaryState.Closed;
         if (_accumulatedBuffer != null)
         {
-            ArrayPool<byte>.Shared.Return(_accumulatedBuffer);
+            Utilities.ReturnBytes(_accumulatedBuffer);
             _accumulatedBuffer = null;
         }
     }
@@ -155,7 +155,7 @@ public class SyncSession
                     offset += needed;
 
                     if (_accumulatedBuffer != null && _accumulatedBuffer != _sessionBuffer)
-                        ArrayPool<byte>.Shared.Return(_accumulatedBuffer);
+                        Utilities.ReturnBytes(_accumulatedBuffer);
 
                     _accumulatedBuffer = null;
                     SecondaryState = SessionSecondaryState.WaitingForSize;
@@ -165,7 +165,7 @@ public class SyncSession
                     if (_messageSize <= _sessionBuffer.Length)
                         _accumulatedBuffer ??= _sessionBuffer;
                     else
-                        _accumulatedBuffer ??= ArrayPool<byte>.Shared.Rent(_messageSize);
+                        _accumulatedBuffer ??= Utilities.RentBytes(_messageSize);
 
                     data.Slice(offset, available).CopyTo(_accumulatedBuffer.AsSpan(_accumulatedBytes));
                     _accumulatedBytes += available;
@@ -198,7 +198,7 @@ public class SyncSession
         {
             int maximumDecryptedSize = data.Length - 16;
             var shouldRent = maximumDecryptedSize > _decryptionBuffer.Length;
-            var decryptionBuffer = shouldRent ? ArrayPool<byte>.Shared.Rent(_decryptionBuffer.Length) : _decryptionBuffer;
+            var decryptionBuffer = shouldRent ? Utilities.RentBytes(_decryptionBuffer.Length) : _decryptionBuffer;
 
             try
             {
@@ -208,7 +208,7 @@ public class SyncSession
             finally
             {
                 if (shouldRent)
-                    ArrayPool<byte>.Shared.Return(decryptionBuffer);
+                    Utilities.ReturnBytes(decryptionBuffer);
             }
         }
     }
@@ -315,8 +315,9 @@ public class SyncSession
     public void Send(Opcode opcode, byte subOpcode = 0, byte[]? data = null)
     {
         var decryptedSize = 4 + 1 + 1 + (data?.Length ?? 0);
-        byte[] decryptedPacket = ArrayPool<byte>.Shared.Rent(decryptedSize);
-        byte[] encryptedPacket = ArrayPool<byte>.Shared.Rent(decryptedSize + 4 + 16);
+        var encryptedSize = decryptedSize + 4 + 16;
+        byte[] decryptedPacket = Utilities.RentBytes(decryptedSize);
+        byte[] encryptedPacket = Utilities.RentBytes(encryptedSize);
 
         try
         {
@@ -327,7 +328,7 @@ public class SyncSession
         }
         finally
         {
-            ArrayPool<byte>.Shared.Return(decryptedPacket);
+            Utilities.ReturnBytes(decryptedPacket);
         }
 
         if (Logger.WillLog(LogLevel.Debug))
@@ -335,7 +336,7 @@ public class SyncSession
 
         var len = Encrypt(decryptedPacket.AsSpan().Slice(0, (data?.Length ?? 0) + HEADER_SIZE), encryptedPacket.AsSpan().Slice(4));
         BinaryPrimitives.WriteInt32LittleEndian(encryptedPacket.AsSpan().Slice(0, 4), len);
-        Send(encryptedPacket);
+        Send(encryptedPacket, 0, encryptedSize, true);
 
         if (Logger.WillLog(LogLevel.Debug))
             Logger.Debug<SyncSession>($"Wrote message bytes {len}");
@@ -381,7 +382,7 @@ public class SyncSession
                     Logger.Debug<SyncSession>($"Sent {count} bytes synchronously.");
 
                     if (returnToPool)
-                        ArrayPool<byte>.Shared.Return(data);
+                        Utilities.ReturnBytes(data);
                 }
             }
             else
@@ -398,7 +399,7 @@ public class SyncSession
         byte[] sentBuffer = WriteArgs.Buffer!;
         var argsPair = (ArgsPair)WriteArgs.UserToken!;
         if (argsPair.ReturnToPool)
-            ArrayPool<byte>.Shared.Return(sentBuffer);
+            Utilities.ReturnBytes(sentBuffer);
 
         lock (SendQueue)
         {
