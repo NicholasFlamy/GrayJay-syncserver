@@ -52,6 +52,7 @@ public class TcpSyncServer
             var args = new SocketAsyncEventArgs();
             args.SetBuffer(new byte[BufferSize], 0, BufferSize);
             args.Completed += IO_Completed;
+            args.UserToken = new ArgsPair();
             _readWritePool.Push(args);
         }
     }
@@ -115,8 +116,8 @@ public class TcpSyncServer
                 WriteArgs = writeArgs,
                 HandshakeState = NoiseProtocol.Create(false, s: _keyPair.PrivateKey)
             };
-            readArgs.UserToken = session;
-            writeArgs.UserToken = session;
+            ((ArgsPair)readArgs.UserToken!).Session = session;
+            ((ArgsPair)writeArgs.UserToken!).Session = session;
             _clients.TryAdd(clientSocket, session);
 
             Logger.Info<TcpSyncServer>($"Client connected: {clientSocket.RemoteEndPoint}");
@@ -160,7 +161,8 @@ public class TcpSyncServer
 
     private void IO_Completed(object? sender, SocketAsyncEventArgs e)
     {
-        var session = e.UserToken as SyncSession;
+        var argsPair = (ArgsPair)e.UserToken!;
+        var session = argsPair.Session;
         if (session == null || session.Socket == null)
         {
             Logger.Info<TcpSyncServer>("Session or socket is null in IO_Completed.");

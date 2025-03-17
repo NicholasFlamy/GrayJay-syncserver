@@ -53,7 +53,7 @@ public class SyncSession
     public SessionPrimaryState PrimaryState { get; set; } = SessionPrimaryState.VersionCheck;
     public SessionSecondaryState SecondaryState { get; set; } = SessionSecondaryState.WaitingForSize;
     public int RemoteVersion { get; private set; } = -1;
-    private Queue<(byte[] data, int offset, int count)> SendQueue = new Queue<(byte[], int, int)>(16);
+    private Queue<(byte[] data, int offset, int count, bool returnToPool)> SendQueue = new Queue<(byte[], int, int, bool)>(16);
     private bool _isBusyWriting = false;
     private int _messageSize = -1;
     private byte[]? _accumulatedBuffer;
@@ -315,8 +315,8 @@ public class SyncSession
     public void Send(Opcode opcode, byte subOpcode = 0, byte[]? data = null)
     {
         var decryptedSize = 4 + 1 + 1 + (data?.Length ?? 0);
-        var decryptedPacket = ArrayPool<byte>.Shared.Rent(decryptedSize);
-        var encryptedPacket = new byte[decryptedSize + 4 + 16];
+        byte[] decryptedPacket = ArrayPool<byte>.Shared.Rent(decryptedSize);
+        byte[] encryptedPacket = ArrayPool<byte>.Shared.Rent(decryptedSize + 4 + 16);
 
         try
         {
@@ -358,8 +358,8 @@ public class SyncSession
     }
 
     //TODO: Reuse buffer initially set by InitializeBufferPool
-    public void Send(byte[] data) => Send(data, 0, data.Length);
-    public void Send(byte[] data, int offset, int count)
+    public void Send(byte[] data, bool returnToPool = false) => Send(data, 0, data.Length);
+    public void Send(byte[] data, int offset, int count, bool returnToPool = false)
     {
         lock (SendQueue)
         {
@@ -369,6 +369,7 @@ public class SyncSession
                     Logger.Debug<SyncSession>($"Sending {count} bytes.\n{Utilities.HexDump(data.AsSpan().Slice(offset, count))}");
 
                 WriteArgs.SetBuffer(data, offset, count);
+                ((ArgsPair)WriteArgs.UserToken!).ReturnToPool = returnToPool;
                 bool pending = Socket.SendAsync(WriteArgs!);
                 if (pending)
                 {
@@ -376,28 +377,39 @@ public class SyncSession
                     _isBusyWriting = true;
                 }
                 else
+                {
                     Logger.Debug<SyncSession>($"Sent {count} bytes synchronously.");
+
+                    if (returnToPool)
+                        ArrayPool<byte>.Shared.Return(data);
+                }
             }
             else
             {
                 if (Logger.WillLog(LogLevel.Debug))
                     Logger.Debug<SyncSession>($"Queued {count} bytes to send.");
-                SendQueue.Enqueue((data, offset, count));
+                SendQueue.Enqueue((data, offset, count, returnToPool));
             }
         }
     }
 
     public void OnWriteCompleted()
     {
+        byte[] sentBuffer = WriteArgs.Buffer!;
+        var argsPair = (ArgsPair)WriteArgs.UserToken!;
+        if (argsPair.ReturnToPool)
+            ArrayPool<byte>.Shared.Return(sentBuffer);
+
         lock (SendQueue)
         {
             if (SendQueue.Count > 0)
             {
-                var (data, offset, count) = SendQueue.Dequeue();
+                var (data, offset, count, returnToPoolNext) = SendQueue.Dequeue();
                 if (Logger.WillLog(LogLevel.Debug))
                     Logger.Debug<SyncSession>($"Sending {count} bytes from queue.\n{Utilities.HexDump(data.AsSpan().Slice(offset, count))}");
 
                 WriteArgs.SetBuffer(data, offset, count);
+                argsPair.ReturnToPool = returnToPoolNext;
                 bool pending = Socket.SendAsync(WriteArgs!);
                 if (!pending)
                 {
