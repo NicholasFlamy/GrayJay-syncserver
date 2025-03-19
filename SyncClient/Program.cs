@@ -4,13 +4,18 @@ using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
 using System.Text.Json;
+using System.Threading.Channels;
+using System.Xml.Linq;
 
 internal class Program
 {
     static ConcurrentBag<string> _handshakeCompleted = new ConcurrentBag<string>();
+    static byte[] TestData = new byte[1000000];
 
     static async Task Main(string[] args)
     {
+        new Random().NextBytes(TestData);
+
         KeyPair keyPair1 = LoadOrGenerateKeyPair("key1.txt");
         KeyPair keyPair2 = LoadOrGenerateKeyPair("key2.txt");
 
@@ -35,16 +40,33 @@ internal class Program
             WaitForHandshake(socketSession2)
         );
 
-        await socketSession1.PublishConnectionInformationAsync([socketSession2.LocalPublicKey], 1000, true, true, true, true);
+        /*await socketSession1.PublishConnectionInformationAsync([socketSession2.LocalPublicKey], 1000, true, true, true, true);
         await socketSession2.PublishConnectionInformationAsync([socketSession1.LocalPublicKey], 1000, true, true, true, true);
 
-        await socketSession1.SendRequestConnectionInfoAsync(publicKey2);
+        var connectionInfo = await socketSession1.RequestConnectionInfoAsync(publicKey2);
+        if (connectionInfo != null)
+        {
+            Logger.Info<SyncSocketSession>(
+                $"Received connection info: port={connectionInfo.Port}, name={connectionInfo.Name}, " +
+                $"remoteIp={connectionInfo.RemoteIp}, ipv4={string.Join(", ", connectionInfo.Ipv4Addresses)}, ipv6={string.Join(", ", connectionInfo.Ipv6Addresses)}, " +
+                $"allowLocal={connectionInfo.AllowLocal}, allowRemoteDirect={connectionInfo.AllowRemoteDirect}, allowRemoteHolePunched={connectionInfo.AllowRemoteHolePunched}, allowRemoteProxied={connectionInfo.AllowRemoteProxied}"
+            );
+        }
+        else
+        {
+            Logger.Info<SyncSocketSession>("Connection info is null");
+        }*/
+
+        var channel = await socketSession1.StartRelayedChannelAsync(publicKey2);
+
+        Logger.Info<Program>($"Channel opened {channel.ConnectionId}");
 
         CancellationTokenSource cts = new CancellationTokenSource();
         Console.CancelKeyPress += (_, __) => cts.Cancel();
         while (!cts.IsCancellationRequested)
         {
             await Task.Delay(TimeSpan.FromSeconds(5), cts.Token);
+            await channel.SendRelayedDataAsync(SyncSocketSession.Opcode.DATA, 0, TestData);
         }
     }
 
@@ -102,6 +124,22 @@ internal class Program
                 {
                     Logger.Info(nameof(Program), $"Received data (opcode: {opcode}, subOpcode: {subOpcode})");
                 }
+            },
+            onNewChannel: (s, c) =>
+            {
+                Logger.Info<Program>($"Channel opened {c.ConnectionId}");
+
+                c.SetDataHandler((s, c, opcode, subOpcode, data) =>
+                {
+                    Logger.Info(nameof(Program), $"Received data via channel (opcode: {opcode}, subOpcode: {subOpcode}, data length: {data.Length})");
+
+                    if (subOpcode == 0)
+                    {
+                        if (!TestData.SequenceEqual(data))
+                            throw new Exception("Data has been corrupted");
+                        c.SendRelayedDataAsync(SyncSocketSession.Opcode.DATA, 1, [4, 5, 6]);
+                    }
+                });
             }
         );
         return socketSession;

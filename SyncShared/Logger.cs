@@ -12,6 +12,9 @@ public static class Logger
 {
     public static Action<LogLevel, string, string, Exception?> LogCallback = (level, tag, message, ex) =>
     {
+        if (!WillLog(level))
+            return;
+
         string timestamp = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff");
         string levelStr = level.ToString().ToUpper();
         string logMessage = $"[{timestamp}] [{levelStr}] [{tag}] {message}";
@@ -19,7 +22,7 @@ public static class Logger
             logMessage += $"\nException: {ex.Message}\nStack Trace: {ex.StackTrace}";
         Console.WriteLine(logMessage);
     };
-    public static Func<LogLevel, bool> WillLog = (level) => true;
+    public static Func<LogLevel, bool> WillLog = (level) => (int)level < (int)LogLevel.Verbose;
 
     public static void Debug<T>(string message, Exception? ex = null) => LogCallback.Invoke(LogLevel.Debug, nameof(T), message, ex);
     public static void Verbose<T>(string message, Exception? ex = null) => LogCallback.Invoke(LogLevel.Verbose, nameof(T), message, ex);
