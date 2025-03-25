@@ -347,8 +347,8 @@ public class SyncSession
                     var connection = _server.GetRelayedConnection(connectionId);
                     if (connection != null)
                     {
-                        var packetToInitiator = new byte[4];
-                        BinaryPrimitives.WriteInt32LittleEndian(packetToInitiator.AsSpan(0, 4), requestId);
+                        Span<byte> packetToInitiator = stackalloc byte[4]; 
+                        BinaryPrimitives.WriteInt32LittleEndian(packetToInitiator, requestId);
                         connection.Initiator.Send(Opcode.RESPONSE_RELAYED_TRANSPORT, subOpcode, packetToInitiator);
                         _server.RemoveRelayedConnection(connectionId);
                     }
@@ -956,12 +956,13 @@ public class SyncSession
             throw new Exception($"Version must be at least {MINIMUM_VERSION}");
     }
 
+    private const int CURRENT_VERSION = 3;
+    private static readonly byte[] VersionBytes = { CURRENT_VERSION, 0, 0, 0 };
     public void SendVersion()
     {
-        const int CURRENT_VERSION = 3;
         lock (_sendLock)
         {
-            Send(new byte[] { CURRENT_VERSION, 0, 0, 0 }, 0, 4);
+            Send(VersionBytes, 0, 4);
         }
     }
 
@@ -969,26 +970,19 @@ public class SyncSession
     {
         var decryptedSize = 4 + 1 + 1;
         var encryptedSize = decryptedSize + 4 + 16;
-        byte[] decryptedPacket = Utilities.RentBytes(decryptedSize);
+        Span<byte> decryptedPacket = stackalloc byte[decryptedSize]; 
         byte[] encryptedPacket = Utilities.RentBytes(encryptedSize);
 
-        try
-        {
-            BinaryPrimitives.WriteInt32LittleEndian(decryptedPacket.AsSpan().Slice(0, 4), decryptedSize - 4);
-            decryptedPacket[4] = (byte)opcode;
-            decryptedPacket[5] = (byte)subOpcode;
-        }
-        finally
-        {
-            Utilities.ReturnBytes(decryptedPacket);
-        }
+        BinaryPrimitives.WriteInt32LittleEndian(decryptedPacket.Slice(0, 4), decryptedSize - 4);
+        decryptedPacket[4] = (byte)opcode;
+        decryptedPacket[5] = (byte)subOpcode;
 
         if (Logger.WillLog(LogLevel.Debug))
             Logger.Debug<SyncSession>($"Encrypted message bytes {HEADER_SIZE}");
 
         lock (_sendLock)
         {
-            var len = Encrypt(decryptedPacket.AsSpan().Slice(0, HEADER_SIZE), encryptedPacket.AsSpan().Slice(4));
+            var len = Encrypt(decryptedPacket.Slice(0, HEADER_SIZE), encryptedPacket.AsSpan().Slice(4));
             BinaryPrimitives.WriteInt32LittleEndian(encryptedPacket.AsSpan().Slice(0, 4), len);
             Send(encryptedPacket, 0, encryptedSize, true);
 
@@ -1147,14 +1141,14 @@ public class SyncSession
 
     private void SendResponse(Opcode opcode, byte subOpcode, int requestId)
     {
-        var responseData = new byte[4];
+        Span<byte> responseData = stackalloc byte[4]; 
         BinaryPrimitives.WriteInt32LittleEndian(responseData, requestId);
         Send(opcode, subOpcode, responseData);
     }
 
     private void SendErrorResponse(Opcode opcode, int requestId, byte errorCode)
     {
-        var responseData = new byte[4];
+        Span<byte> responseData = stackalloc byte[4];
         BinaryPrimitives.WriteInt32LittleEndian(responseData, requestId);
         Send(opcode, errorCode, responseData);
     }
