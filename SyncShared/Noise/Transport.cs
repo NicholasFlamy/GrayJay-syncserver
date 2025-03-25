@@ -85,10 +85,10 @@ namespace Noise
 	{
 		private readonly bool initiator;
 		private readonly CipherState<CipherType> c1;
-		private readonly CipherState<CipherType> c2;
+		private readonly CipherState<CipherType>? c2;
 		private bool disposed;
 
-		public Transport(bool initiator, CipherState<CipherType> c1, CipherState<CipherType> c2)
+		public Transport(bool initiator, CipherState<CipherType> c1, CipherState<CipherType>? c2)
 		{
 			Exceptions.ThrowIfNull(c1, nameof(c1));
 
@@ -126,7 +126,7 @@ namespace Noise
 			}
 
 			var cipher = initiator ? c1 : c2;
-			Debug.Assert(cipher.HasKey());
+			Debug.Assert(cipher!.HasKey());
 
 			return cipher.EncryptWithAd(null, payload, messageBuffer);
 		}
@@ -156,7 +156,7 @@ namespace Noise
 			}
 
 			var cipher = initiator ? c2 : c1;
-			Debug.Assert(cipher.HasKey());
+			Debug.Assert(cipher!.HasKey());
 
 			return cipher.DecryptWithAd(null, message, payloadBuffer);
 		}
@@ -177,7 +177,7 @@ namespace Noise
 				throw new InvalidOperationException("Cannot rekey responder to initiator in a one-way stream.");
 			}
 
-			c2.Rekey();
+			c2!.Rekey();
 		}
 
 		public void Dispose()

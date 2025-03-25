@@ -1,5 +1,6 @@
 ﻿using Noise;
 using SyncClient;
+using SyncShared;
 using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
@@ -57,16 +58,22 @@ internal class Program
             Logger.Info<SyncSocketSession>("Connection info is null");
         }*/
 
-        var channel = await socketSession1.StartRelayedChannelAsync(publicKey2);
+        //var channel = await socketSession1.StartRelayedChannelAsync(publicKey2);
 
-        Logger.Info<Program>($"Channel opened {channel.ConnectionId}");
+        //Logger.Info<Program>($"Channel opened {channel.ConnectionId}");
+
+        bool success = await socketSession1.PublishRecordsAsync([publicKey2], "myKey", [1, 2, 3]);
+        var keys = await socketSession1.ListRecordKeysAsync(publicKey1, publicKey2);
+        var keysShouldBeEmpty = await socketSession1.ListRecordKeysAsync(publicKey2, publicKey1);
+        var keys2 = await socketSession2.ListRecordKeysAsync(publicKey1, publicKey2);
+        var record = await socketSession2.GetRecordsAsync([publicKey1], "myKey");
 
         CancellationTokenSource cts = new CancellationTokenSource();
         Console.CancelKeyPress += (_, __) => cts.Cancel();
         while (!cts.IsCancellationRequested)
         {
             await Task.Delay(TimeSpan.FromSeconds(5), cts.Token);
-            await channel.SendRelayedDataAsync(SyncSocketSession.Opcode.DATA, 0, TestData);
+            //await channel.SendRelayedDataAsync(SyncSocketSession.Opcode.DATA, 0, TestData);
         }
     }
 
@@ -101,7 +108,7 @@ internal class Program
                 var remotePublicKey = s.RemotePublicKey;
                 if (remotePublicKey == null)
                 {
-                    s.Stop();
+                    s.Dispose();
                     return;
                 }
                 Logger.Info(nameof(Program), $"Handshake complete for {publicKey} with server {remotePublicKey}");
@@ -109,7 +116,7 @@ internal class Program
             },
             onData: (s, opcode, subOpcode, data) =>
             {
-                if (opcode == SyncSocketSession.Opcode.RESPONSE_CONNECTION_INFO)
+                if (opcode == Opcode.RESPONSE_CONNECTION_INFO)
                 {
                     if (subOpcode == 0)
                     {
@@ -137,7 +144,7 @@ internal class Program
                     {
                         if (!TestData.SequenceEqual(data))
                             throw new Exception("Data has been corrupted");
-                        c.SendRelayedDataAsync(SyncSocketSession.Opcode.DATA, 1, [4, 5, 6]);
+                        c.SendRelayedDataAsync(Opcode.DATA, 1, [4, 5, 6]);
                     }
                 });
             }

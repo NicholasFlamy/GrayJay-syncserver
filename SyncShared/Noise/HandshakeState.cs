@@ -72,7 +72,7 @@ namespace Noise
 		/// Thrown if the output was greater than <see cref="Protocol.MaxMessageLength"/>
 		/// bytes in length, or if the output buffer did not have enough space to hold the ciphertext.
 		/// </exception>
-		(int BytesWritten, byte[] HandshakeHash, Transport Transport) WriteMessage(
+		(int BytesWritten, byte[]? HandshakeHash, Transport? Transport) WriteMessage(
 			ReadOnlySpan<byte> payload,
 			Span<byte> messageBuffer
 		);
@@ -107,7 +107,7 @@ namespace Noise
 		/// <exception cref="System.Security.Cryptography.CryptographicException">
 		/// Thrown if the decryption of the message has failed.
 		/// </exception>
-		(int BytesRead, byte[] HandshakeHash, Transport Transport) ReadMessage(
+		(int BytesRead, byte[]? HandshakeHash, Transport? Transport) ReadMessage(
 			ReadOnlySpan<byte> message,
 			Span<byte> payloadBuffer
 		);
@@ -120,14 +120,14 @@ namespace Noise
 	{
 		private Dh dh = new DhType();
 		private SymmetricState<CipherType, DhType, HashType> state;
-		private Protocol protocol;
+		private Protocol? protocol;
 		private readonly Role role;
 		private Role initiator;
 		private bool turnToWrite;
-		private KeyPair e;
-		private KeyPair s;
-		private byte[] re;
-		private byte[] rs;
+		private KeyPair? e;
+		private KeyPair? s;
+		private byte[]? re;
+		private byte[]? rs;
 		private bool isPsk;
 		private bool isOneWay;
 		private readonly Queue<MessagePattern> messagePatterns = new Queue<MessagePattern>();
@@ -204,7 +204,7 @@ namespace Noise
 			{
 				if (token == Token.S)
 				{
-					state.MixHash(role == Role.Alice ? s.PublicKey : rs);
+					state.MixHash(role == Role.Alice ? s!.PublicKey : rs);
 				}
 			}
 
@@ -212,7 +212,7 @@ namespace Noise
 			{
 				if (token == Token.S)
 				{
-					state.MixHash(role == Role.Alice ? rs : s.PublicKey);
+					state.MixHash(role == Role.Alice ? rs : s!.PublicKey);
 				}
 			}
 		}
@@ -308,7 +308,7 @@ namespace Noise
 				throw new InvalidOperationException("Fallback cannot be applied to a Bob-initiated pattern.");
 			}
 
-			if (messagePatterns.Count + 1 != this.protocol.HandshakePattern.Patterns.Count())
+			if (messagePatterns.Count + 1 != this.protocol!.HandshakePattern.Patterns.Count())
 			{
 				throw new InvalidOperationException("Fallback can only be applied after the first handshake message.");
 			}
@@ -352,7 +352,7 @@ namespace Noise
 			}
 		}
 
-		public (int, byte[], Transport) WriteMessage(ReadOnlySpan<byte> payload, Span<byte> messageBuffer)
+		public (int, byte[]?, Transport?) WriteMessage(ReadOnlySpan<byte> payload, Span<byte> messageBuffer)
 		{
 			ThrowIfDisposed();
 
@@ -401,8 +401,8 @@ namespace Noise
 
 			Debug.Assert(ciphertextSize == size);
 
-			byte[] handshakeHash = null;
-			Transport transport = null;
+			byte[]? handshakeHash = null;
+			Transport? transport = null;
 
 			if (messagePatterns.Count == 0)
 			{
@@ -437,7 +437,7 @@ namespace Noise
 			return buffer.Slice(bytesWritten);
 		}
 
-		public (int, byte[], Transport) ReadMessage(ReadOnlySpan<byte> message, Span<byte> payloadBuffer)
+		public (int, byte[]?, Transport?) ReadMessage(ReadOnlySpan<byte> message, Span<byte> payloadBuffer)
 		{
 			ThrowIfDisposed();
 
@@ -489,8 +489,8 @@ namespace Noise
 			int bytesRead = state.DecryptAndHash(message, payloadBuffer);
 			Debug.Assert(bytesRead == plaintextSize);
 
-			byte[] handshakeHash = null;
-			Transport transport = null;
+			byte[]? handshakeHash = null;
+			Transport? transport = null;
 
 			if (messagePatterns.Count == 0)
 			{
@@ -580,7 +580,7 @@ namespace Noise
 			return (handshakeHash, transport);
 		}
 
-		private void DhAndMixKey(KeyPair keyPair, ReadOnlySpan<byte> publicKey)
+		private void DhAndMixKey(KeyPair? keyPair, ReadOnlySpan<byte> publicKey)
 		{
 			Debug.Assert(keyPair != null);
 			Debug.Assert(!publicKey.IsEmpty);

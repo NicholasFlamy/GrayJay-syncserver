@@ -7,6 +7,8 @@ public class SocketAsyncEventArgsPool
 {
     private readonly ConcurrentStack<SocketAsyncEventArgs> _pool;
 
+    public bool IsEmpty => _pool.IsEmpty;
+
     public SocketAsyncEventArgsPool(int capacity)
     {
         _pool = new ConcurrentStack<SocketAsyncEventArgs>();

@@ -29,7 +29,7 @@ namespace Noise
 
 		private static readonly Dictionary<string, HandshakePattern> patterns = typeof(HandshakePattern).GetTypeInfo().DeclaredFields
 			.Where(field => field.IsPublic && field.IsStatic && field.FieldType == typeof(HandshakePattern))
-			.ToDictionary(field => field.Name, field => (HandshakePattern)field.GetValue(null));
+			.ToDictionary(field => field.Name, field => (HandshakePattern)field.GetValue(null)!);
 
 		/// <summary>
 		/// Initializes a new instance of the <see cref="Protocol"/>
@@ -135,9 +135,9 @@ namespace Noise
 		public HandshakeState Create(
 			bool initiator,
 			ReadOnlySpan<byte> prologue = default,
-			byte[] s = default,
-			byte[] rs = default,
-			IEnumerable<byte[]> psks = default)
+			byte[]? s = default,
+			byte[]? rs = default,
+			IEnumerable<byte[]>? psks = default)
 		{
 			if (psks == null)
 			{

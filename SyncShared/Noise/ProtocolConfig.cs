@@ -21,10 +21,10 @@ namespace Noise
 		/// <param name="psks">The collection of zero or more 32-byte pre-shared secret keys.</param>
 		public ProtocolConfig(
 			bool initiator = default,
-			byte[] prologue = default,
-			byte[] s = default,
-			byte[] rs = default,
-			IEnumerable<byte[]> psks = default)
+			byte[]? prologue = default,
+			byte[]? s = default,
+			byte[]? rs = default,
+			IEnumerable<byte[]>? psks = default)
 		{
 			Initiator = initiator;
 			Prologue = prologue;
@@ -43,21 +43,21 @@ namespace Noise
 		/// zero-length, or which may contain context information
 		/// that both parties want to confirm is identical).
 		/// </summary>
-		public byte[] Prologue { get; set; }
+		public byte[]? Prologue { get; set; }
 
 		/// <summary>
 		/// Gets or sets the local static private key.
 		/// </summary>
-		public byte[] LocalStatic { get; set; }
+		public byte[]? LocalStatic { get; set; }
 
 		/// <summary>
 		/// Gets or sets the remote party's static public key.
 		/// </summary>
-		public byte[] RemoteStatic { get; set; }
+		public byte[]? RemoteStatic { get; set; }
 
 		/// <summary>
 		/// Gets or sets the collection of zero or more 32-byte pre-shared secret keys.
 		/// </summary>
-		public IEnumerable<byte[]> PreSharedKeys { get; set; }
+		public IEnumerable<byte[]>? PreSharedKeys { get; set; }
 	}
 }

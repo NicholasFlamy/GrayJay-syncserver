@@ -1,11 +1,16 @@
 ﻿using Noise;
+using SyncServer.Repositories;
 using System.Text.Json;
+using System.Threading.Tasks;
 
 namespace SyncServer;
 
 class Program
 {
-    static void Main()
+
+    private const string _dbPath = "records.db";
+
+    static async Task Main()
     {
         KeyPair keyPair;
         try
@@ -26,12 +31,14 @@ class Program
         var publicKey = Convert.ToBase64String(keyPair.PublicKey);
         Console.WriteLine("Public Key: " + publicKey);
 
-        var server = new TcpSyncServer(keyPair);
+        var connectionString = $"Data Source={_dbPath};Pooling=False;";
+        using var recordRepository = new SqliteRecordRepository(connectionString);
+        await recordRepository.InitializeAsync();
+
+        using var server = new TcpSyncServer(9000, keyPair, recordRepository);
         server.Start();
 
         Console.WriteLine("Server running. Press ENTER to stop.");
         Console.ReadLine();
-
-        server.Stop();
     }
 }

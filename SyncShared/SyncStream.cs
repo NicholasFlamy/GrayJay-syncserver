@@ -1,8 +1,6 @@
-using static SyncClient.SyncSocketSession;
+namespace SyncShared;
 
-namespace SyncClient;
-
-public class SyncStream
+public class SyncStream : IDisposable
 {
     public const int MAXIMUM_SIZE = 10_000_000;
 
@@ -22,7 +20,7 @@ public class SyncStream
         Opcode = opcode;
         SubOpcode = subOpcode;
         _expectedSize = expectedSize;
-        _buffer = new byte[expectedSize];
+        _buffer = Utilities.RentBytes(expectedSize);
     }
 
     public void Add(ReadOnlySpan<byte> data)
@@ -36,8 +34,15 @@ public class SyncStream
         IsComplete = BytesReceived == _expectedSize;
     }
 
-    public byte[] GetBytes()
+    public Span<byte> GetBytes()
     {
-        return _buffer;
+        if (!IsComplete)
+            throw new Exception("Data is not complete yet");
+        return _buffer.AsSpan().Slice(0, _expectedSize);
+    }
+
+    public void Dispose()
+    {
+        Utilities.ReturnBytes(_buffer);
     }
 }

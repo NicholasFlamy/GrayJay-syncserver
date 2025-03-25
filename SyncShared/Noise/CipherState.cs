@@ -15,7 +15,7 @@ namespace Noise
 		private static readonly byte[] zeros = new byte[32];
 
 		private readonly CipherType cipher = new CipherType();
-		private byte[] k;
+		private byte[]? k;
 		private ulong n;
 		private bool disposed;
 

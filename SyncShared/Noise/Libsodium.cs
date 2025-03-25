@@ -133,7 +133,7 @@ namespace Noise
 		[DllImport(Name, CallingConvention = CallingConvention.Cdecl)]
 		public static extern int crypto_generichash_blake2b_init(
 			IntPtr state,
-			byte[] key,
+			byte[]? key,
 			UIntPtr keylen,
 			UIntPtr outlen
 		);

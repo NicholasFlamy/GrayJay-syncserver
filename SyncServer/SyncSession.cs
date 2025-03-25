@@ -1,8 +1,12 @@
 ﻿using System.Buffers;
 using System.Buffers.Binary;
 using System.Diagnostics;
+using System.Drawing;
 using System.Net;
 using System.Net.Sockets;
+using System.Reflection.Emit;
+using System.Text;
+using System.Threading;
 using Noise;
 using SyncShared;
 using static System.Runtime.InteropServices.JavaScript.JSType;
@@ -26,26 +30,9 @@ public class SyncSession
         WaitingForData
     }
 
-    public enum Opcode : byte
-    {
-        PING = 0,
-        PONG = 1,
-        NOTIFY_AUTHORIZED = 2,
-        NOTIFY_UNAUTHORIZED = 3,
-        STREAM_START = 4,
-        STREAM_DATA = 5,
-        STREAM_END = 6,
-        DATA = 7,
-        PUBLISH_CONNECTION_INFO = 8,
-        REQUEST_CONNECTION_INFO = 9,
-        RESPONSE_CONNECTION_INFO = 10,
-        REQUEST_RELAYED_TRANSPORT = 11,
-        RESPONSE_RELAYED_TRANSPORT = 12,
-        RELAYED_DATA = 13
-    }
-
     public const int HEADER_SIZE = 6;
-    private const int MaxPacketSizeEncrypted = 65535;
+    public const int MAXIMUM_PACKET_SIZE = 65535 - 16;
+    public const int MAXIMUM_PACKET_SIZE_ENCRYPTED = MAXIMUM_PACKET_SIZE + 16;
 
     public required Socket Socket { get; init; }
     public required SocketAsyncEventArgs ReadArgs { get; init; }
@@ -67,6 +54,9 @@ public class SyncSession
     private readonly TcpSyncServer _server;
     private Transport? _transport;
     private Action<SyncSession> _onHandshakeComplete;
+    private readonly Dictionary<int, SyncStream> _syncStreams = new();
+    private int _streamIdGenerator = 0;
+    private readonly object _sendLock = new object();
 
     public SyncSession(TcpSyncServer server, Action<SyncSession> onHandshakeComplete)
     {
@@ -84,6 +74,12 @@ public class SyncSession
         {
             Utilities.ReturnBytes(_accumulatedBuffer);
             _accumulatedBuffer = null;
+        }
+        lock (_syncStreams)
+        {
+            foreach (var pair in _syncStreams)
+                pair.Value.Dispose();
+            _syncStreams.Clear();
         }
     }
 
@@ -123,7 +119,7 @@ public class SyncSession
                     data.Slice(offset, sizeBytesNeeded).CopyTo(_sizeBuffer.AsSpan(_sizeAccumulatedBytes));
                     _messageSize = BinaryPrimitives.ReadInt32LittleEndian(_sizeBuffer);
 
-                    if (_messageSize <= 0 || _messageSize > MaxPacketSizeEncrypted)
+                    if (_messageSize <= 0 || _messageSize > MAXIMUM_PACKET_SIZE_ENCRYPTED)
                         throw new Exception($"Invalid message size: {_messageSize}");
 
                     offset += sizeBytesNeeded;
@@ -195,7 +191,12 @@ public class SyncSession
 
                 BinaryPrimitives.WriteInt32LittleEndian(_sessionBuffer, bytesWritten);
                 _decryptionBuffer.AsSpan().Slice(0, bytesWritten).CopyTo(_sessionBuffer.AsSpan().Slice(4));
-                Send(_sessionBuffer, 0, bytesWritten + 4);
+
+                lock (_sendLock)
+                {
+                    Send(_sessionBuffer, 0, bytesWritten + 4);
+                }
+
                 Logger.Info<SyncSession>($"HandshakeAsResponder: Wrote message size {bytesWritten}");
 
                 _transport = transport;
@@ -218,49 +219,103 @@ public class SyncSession
         }
     }
 
-    private void HandleDecryptedPacket(Span<byte> data)
+    private void HandleDecryptedPacket(Opcode opcode, byte subOpcode, Span<byte> data)
     {
-        int size = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(0, 4));
-        if (size != data.Length - 4)
-            throw new Exception("Incomplete packet received");
-
-        Opcode opcode = (Opcode)data[4];
-        byte subOpcode = data[5];
-        var packetData = data.Slice(6);
-
-        Logger.Info<SyncSession>($"HandleDecryptedPacket (opcode = {opcode}, subOpcode = {subOpcode}, size = {packetData.Length})");
 
         switch (opcode)
         {
+            case Opcode.STREAM_START:
+                {
+                    ReadOnlySpan<byte> span = data;
+                    int id = BinaryPrimitives.ReadInt32LittleEndian(span);
+                    span = span.Slice(4);
+                    int expectedSize = BinaryPrimitives.ReadInt32LittleEndian(span);
+                    span = span.Slice(4);
+                    byte op = span[0];
+                    span = span.Slice(1);
+                    byte subOp = span[0];
+                    span = span.Slice(1);
+                    var syncStream = new SyncStream(expectedSize, (Opcode)op, subOp);
+                    if (span.Length > 0)
+                        syncStream.Add(span);
+                    lock (_syncStreams)
+                    {
+                        _syncStreams[id] = syncStream;
+                    }
+                    break;
+                }
+
+            case Opcode.STREAM_DATA:
+                {
+                    ReadOnlySpan<byte> span = data;
+                    int id = BinaryPrimitives.ReadInt32LittleEndian(span);
+                    span = span.Slice(4);
+                    int expectedOffset = BinaryPrimitives.ReadInt32LittleEndian(span);
+                    span = span.Slice(4);
+                    SyncStream? syncStream;
+                    lock (_syncStreams)
+                    {
+                        if (!_syncStreams.TryGetValue(id, out syncStream) || syncStream == null)
+                            throw new Exception("Received data for sync stream that does not exist");
+                    }
+                    if (expectedOffset != syncStream.BytesReceived)
+                        throw new Exception("Expected offset not matching with the amount of received bytes");
+                    if (span.Length > 0)
+                        syncStream.Add(span);
+                    break;
+                }
+
+            case Opcode.STREAM_END:
+                {
+                    ReadOnlySpan<byte> span = data;
+                    int id = BinaryPrimitives.ReadInt32LittleEndian(span);
+                    span = span.Slice(4);
+                    int expectedOffset = BinaryPrimitives.ReadInt32LittleEndian(span);
+                    span = span.Slice(4);
+                    SyncStream? syncStream;
+                    lock (_syncStreams)
+                    {
+                        if (!_syncStreams.Remove(id, out syncStream) || syncStream == null)
+                            throw new Exception("Received data for sync stream that does not exist");
+                    }
+                    if (expectedOffset != syncStream.BytesReceived)
+                        throw new Exception("Expected offset not matching with the amount of received bytes");
+                    if (span.Length > 0)
+                        syncStream.Add(span);
+                    if (!syncStream.IsComplete)
+                        throw new Exception("After sync stream end, the stream must be complete");
+                    HandleDecryptedPacket(syncStream.Opcode, syncStream.SubOpcode, syncStream.GetBytes());
+                    break;
+                }
             case Opcode.PING:
                 Send(Opcode.PONG);
                 break;
             case Opcode.PUBLISH_CONNECTION_INFO:
-                HandlePublishConnectionInfo(packetData);
+                HandlePublishConnectionInfo(data);
                 break;
             case Opcode.REQUEST_CONNECTION_INFO:
-                HandleRequestConnectionInfo(packetData);
+                HandleRequestConnectionInfo(data);
                 break;
             case Opcode.REQUEST_RELAYED_TRANSPORT:
-                HandleRequestRelayedTransport(packetData);
+                HandleRequestRelayedTransport(data);
                 break;
             case Opcode.RESPONSE_RELAYED_TRANSPORT:
                 if (subOpcode == 0)
                 {
-                    if (packetData.Length < 16)
+                    if (data.Length < 16)
                     {
                         Logger.Error<SyncSession>("RESPONSE_RELAYED_TRANSPORT packet too short");
                         return;
                     }
-                    long connectionId = BinaryPrimitives.ReadInt64LittleEndian(packetData.Slice(0, 8));
-                    int requestId = BinaryPrimitives.ReadInt32LittleEndian(packetData.Slice(8, 4));
-                    int messageLength = BinaryPrimitives.ReadInt32LittleEndian(packetData.Slice(12, 4));
-                    if (packetData.Length != 16 + messageLength)
+                    long connectionId = BinaryPrimitives.ReadInt64LittleEndian(data.Slice(0, 8));
+                    int requestId = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(8, 4));
+                    int messageLength = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(12, 4));
+                    if (data.Length != 16 + messageLength)
                     {
-                        Logger.Error<SyncSession>($"Invalid RESPONSE_RELAYED_TRANSPORT packet size. Expected {16 + messageLength}, got {packetData.Length}");
+                        Logger.Error<SyncSession>($"Invalid RESPONSE_RELAYED_TRANSPORT packet size. Expected {16 + messageLength}, got {data.Length}");
                         return;
                     }
-                    byte[] responseHandshakeMessage = packetData.Slice(16, messageLength).ToArray();
+                    byte[] responseHandshakeMessage = data.Slice(16, messageLength).ToArray();
 
                     var connection = _server.GetRelayedConnection(connectionId);
                     if (connection != null)
@@ -282,13 +337,13 @@ public class SyncSession
                 }
                 else
                 {
-                    if (packetData.Length < 12)
+                    if (data.Length < 12)
                     {
                         Logger.Error<SyncSession>("RESPONSE_RELAYED_TRANSPORT error packet too short");
                         return;
                     }
-                    long connectionId = BinaryPrimitives.ReadInt64LittleEndian(packetData.Slice(0, 8));
-                    int requestId = BinaryPrimitives.ReadInt32LittleEndian(packetData.Slice(8, 4));
+                    long connectionId = BinaryPrimitives.ReadInt64LittleEndian(data.Slice(0, 8));
+                    int requestId = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(8, 4));
                     var connection = _server.GetRelayedConnection(connectionId);
                     if (connection != null)
                     {
@@ -300,12 +355,154 @@ public class SyncSession
                 }
                 break;
             case Opcode.RELAYED_DATA:
-                HandleRelayedData(packetData);
+                HandleRelayedData(data);
+                break;
+            case Opcode.REQUEST_PUBLISH_RECORD:
+                HandleRequestPublishRecord(data);
+                break;
+            case Opcode.REQUEST_BULK_DELETE_RECORD:
+                HandleRequestBulkDeleteRecord(data);
+                break;
+            case Opcode.REQUEST_DELETE_RECORD:
+                HandleRequestDeleteRecord(data);
+                break;
+            case Opcode.REQUEST_LIST_RECORD_KEYS:
+                HandleRequestListKeys(data);
+                break;
+            case Opcode.REQUEST_GET_RECORD:
+                HandleRequestGetRecord(data);
+                break;
+            case Opcode.REQUEST_BULK_PUBLISH_RECORD:
+                if (data.Length < 10) // Minimum: requestId (4) + keyLength (1) + key (0) + numConsumers (1)
+                {
+                    Logger.Error<SyncSession>("REQUEST_BULK_PUBLISH_RECORD packet too short");
+                    return;
+                }
+                int bulkPublishRequestId = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(0, 4));
+                int keyLength = data[4];
+                if (keyLength > 32 || data.Length < 6 + keyLength)
+                {
+                    SendErrorResponse(Opcode.RESPONSE_BULK_PUBLISH_RECORD, bulkPublishRequestId, 1);
+                    return;
+                }
+                string key = Encoding.UTF8.GetString(data.Slice(5, keyLength));
+                byte numConsumers = data[5 + keyLength];
+                int offset = 6 + keyLength;
+                var records = new List<(byte[] publisherPublicKey, byte[] consumerPublicKey, string key, byte[] encryptedBlob)>(numConsumers);
+
+                byte[] publisherPublicKey = Convert.FromBase64String(RemotePublicKey!);
+                for (int i = 0; i < numConsumers; i++)
+                {
+                    if (offset + 36 > data.Length) // consumerPublicKey (32) + blobLength (4)
+                    {
+                        SendErrorResponse(Opcode.RESPONSE_BULK_PUBLISH_RECORD, bulkPublishRequestId, 1);
+                        return;
+                    }
+                    byte[] consumerPublicKey = data.Slice(offset, 32).ToArray();
+                    offset += 32;
+                    int blobLength = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(offset, 4));
+                    offset += 4;
+                    if (offset + blobLength > data.Length)
+                    {
+                        SendErrorResponse(Opcode.RESPONSE_BULK_PUBLISH_RECORD, bulkPublishRequestId, 1);
+                        return;
+                    }
+                    byte[] encryptedBlob = data.Slice(offset, blobLength).ToArray();
+                    offset += blobLength;
+                    records.Add((publisherPublicKey, consumerPublicKey, key, encryptedBlob));
+                }
+
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        await _server.RecordRepository.BulkInsertOrUpdateAsync(records);
+                        SendResponse(Opcode.RESPONSE_BULK_PUBLISH_RECORD, 0, bulkPublishRequestId);
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.Error<SyncSession>("Error bulk publishing records", ex);
+                        SendErrorResponse(Opcode.RESPONSE_BULK_PUBLISH_RECORD, bulkPublishRequestId, 1);
+                    }
+                });
+                break;
+
+            case Opcode.REQUEST_BULK_GET_RECORD:
+                if (data.Length < 10) // Minimum: requestId (4) + keyLength (1) + key (0) + numPublishers (1)
+                {
+                    Logger.Error<SyncSession>("REQUEST_BULK_GET_RECORD packet too short");
+                    return;
+                }
+                int bulkGetRequestId = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(0, 4));
+                keyLength = data[4];
+                if (keyLength > 32 || data.Length < 6 + keyLength)
+                {
+                    SendErrorResponse(Opcode.RESPONSE_BULK_GET_RECORD, bulkGetRequestId, 1);
+                    return;
+                }
+                key = Encoding.UTF8.GetString(data.Slice(5, keyLength));
+                byte numPublishers = data[5 + keyLength];
+                offset = 6 + keyLength;
+                var publisherPublicKeys = new List<byte[]>(numPublishers);
+
+                for (int i = 0; i < numPublishers; i++)
+                {
+                    if (offset + 32 > data.Length)
+                    {
+                        SendErrorResponse(Opcode.RESPONSE_BULK_GET_RECORD, bulkGetRequestId, 1);
+                        return;
+                    }
+                    publisherPublicKeys.Add(data.Slice(offset, 32).ToArray());
+                    offset += 32;
+                }
+
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        byte[] consumerPublicKey = Convert.FromBase64String(RemotePublicKey!);
+                        var records = await _server.RecordRepository.GetByPublishersAsync(consumerPublicKey, publisherPublicKeys, key);
+                        using var ms = new MemoryStream();
+                        using var writer = new BinaryWriter(ms);
+                        writer.Write(bulkGetRequestId);
+                        writer.Write((byte)records.Count());
+                        foreach (var record in records)
+                        {
+                            writer.Write(record.PublisherPublicKey);
+                            writer.Write(record.EncryptedBlob.Length);
+                            writer.Write(record.EncryptedBlob);
+                            writer.Write(record.Timestamp.ToBinary());
+                        }
+                        Send(Opcode.RESPONSE_BULK_GET_RECORD, 0, ms.ToArray());
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.Error<SyncSession>("Error bulk getting records", ex);
+                        SendErrorResponse(Opcode.RESPONSE_BULK_GET_RECORD, bulkGetRequestId, 1);
+                    }
+                });
+                break;
+            case Opcode.REQUEST_BULK_CONNECTION_INFO:
+                HandleRequestBulkConnectionInfo(data);
                 break;
             default:
                 Logger.Debug<SyncSession>($"Received unhandled opcode: {opcode}");
                 break;
         }
+    }
+
+    private void HandleDecryptedPacket(Span<byte> data)
+    {
+        int size = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(0, 4));
+        if (size != data.Length - 4)
+            throw new Exception("Incomplete packet received");
+
+        Opcode opcode = (Opcode)data[4];
+        byte subOpcode = data[5];
+        var packetData = data.Slice(6);
+
+        Logger.Info<SyncSession>($"HandleDecryptedPacket (opcode = {opcode}, subOpcode = {subOpcode}, size = {packetData.Length})");
+        HandleDecryptedPacket(opcode, subOpcode, packetData);
     }
 
     private void HandleRelayedData(ReadOnlySpan<byte> data)
@@ -349,6 +546,106 @@ public class SyncSession
                 Utilities.ReturnBytes(packet);
             }
         }
+    }
+
+    private void HandleRequestBulkDeleteRecord(ReadOnlySpan<byte> data)
+    {
+        if (data.Length < 69) // Minimum: requestId (4) + publisher (32) + consumer (32) + numKeys (1)
+        {
+            Logger.Error<SyncSession>("REQUEST_BULK_DELETE_RECORD packet too short");
+            return;
+        }
+        int requestId = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(0, 4));
+        byte[] publisherPublicKey = data.Slice(4, 32).ToArray();
+        byte[] consumerPublicKey = data.Slice(36, 32).ToArray();
+        byte numKeys = data[68];
+        int offset = 69;
+        var keys = new List<string>(numKeys);
+
+        for (int i = 0; i < numKeys; i++)
+        {
+            if (offset >= data.Length)
+            {
+                SendErrorResponse(Opcode.RESPONSE_BULK_DELETE_RECORD, requestId, 1);
+                return;
+            }
+            byte keyLength = data[offset];
+            offset += 1;
+            if (offset + keyLength > data.Length || keyLength > 32)
+            {
+                SendErrorResponse(Opcode.RESPONSE_BULK_DELETE_RECORD, requestId, 1);
+                return;
+            }
+            string key = Encoding.UTF8.GetString(data.Slice(offset, keyLength));
+            keys.Add(key);
+            offset += keyLength;
+        }
+        byte[] senderPublicKey = Convert.FromBase64String(RemotePublicKey!);
+
+        // Authorization: Sender must be publisher or consumer
+        if (!senderPublicKey.SequenceEqual(publisherPublicKey) && !senderPublicKey.SequenceEqual(consumerPublicKey))
+        {
+            SendErrorResponse(Opcode.RESPONSE_BULK_DELETE_RECORD, requestId, 1); // Unauthorized
+            return;
+        }
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await _server.RecordRepository.BulkDeleteAsync(publisherPublicKey, consumerPublicKey, keys);
+                SendResponse(Opcode.RESPONSE_BULK_DELETE_RECORD, 0, requestId); // Success
+            }
+            catch (Exception ex)
+            {
+                Logger.Error<SyncSession>("Error bulk deleting records", ex);
+                SendErrorResponse(Opcode.RESPONSE_BULK_DELETE_RECORD, requestId, 1); // Error
+            }
+        });
+    }
+
+    private void HandleRequestBulkConnectionInfo(ReadOnlySpan<byte> data)
+    {
+        if (data.Length < 5)
+        {
+            Logger.Error<SyncSession>("REQUEST_BULK_CONNECTION_INFO packet too short");
+            return;
+        }
+        int requestId = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(0, 4));
+        byte numKeys = data[4];
+        if (data.Length != 5 + numKeys * 32)
+        {
+            Logger.Error<SyncSession>("Invalid REQUEST_BULK_CONNECTION_INFO packet size");
+            return;
+        }
+        var publicKeys = new List<string>(numKeys);
+        for (int i = 0; i < numKeys; i++)
+        {
+            string pk = Convert.ToBase64String(data.Slice(5 + i * 32, 32));
+            publicKeys.Add(pk);
+        }
+        string requestingPublicKey = RemotePublicKey!;
+
+        var responseData = new MemoryStream();
+        using var writer = new BinaryWriter(responseData);
+        writer.Write(requestId); // 4 bytes: Request ID
+        writer.Write(numKeys); // 1 byte: Number of responses
+        foreach (var pk in publicKeys)
+        {
+            var block = _server.RetrieveConnectionInfo(pk, requestingPublicKey);
+            writer.Write(Convert.FromBase64String(pk)); //32 bytes: Public key
+            if (block != null)
+            {
+                writer.Write((byte)0); // 1 byte: Status (success)
+                writer.Write(block.Length); // 4 bytes: Length of connection info
+                writer.Write(block); // Variable: Connection info data
+            }
+            else
+            {
+                writer.Write((byte)1); // 1 byte: Status (not found)
+            }
+        }
+        Send(Opcode.RESPONSE_BULK_CONNECTION_INFO, 0, responseData.ToArray());
     }
 
     private void HandlePublishConnectionInfo(ReadOnlySpan<byte> data)
@@ -465,6 +762,188 @@ public class SyncSession
         targetSession.Send(Opcode.REQUEST_RELAYED_TRANSPORT, 0, packetToTarget);
     }
 
+    private void HandleRequestPublishRecord(ReadOnlySpan<byte> data)
+    {
+        // Parse request: requestId (4), consumerPublicKey (32), keyLength (1), key (variable), blobLength (4), encryptedBlob (variable)
+        if (data.Length < 41) // Minimum size: 4 + 32 + 1 + 0 + 4
+        {
+            Logger.Error<SyncSession>("REQUEST_PUBLISH_RECORD packet too short");
+            return;
+        }
+        int requestId = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(0, 4));
+        byte[] consumerPublicKey = data.Slice(4, 32).ToArray();
+        int keyLength = data[36];
+        if (keyLength > 32)
+        {
+            SendErrorResponse(Opcode.RESPONSE_PUBLISH_RECORD, requestId, 1); // Error: invalid key length
+            return;
+        }
+        string key = Encoding.UTF8.GetString(data.Slice(37, keyLength));
+        int blobLengthOffset = 37 + keyLength;
+        int blobLength = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(blobLengthOffset, 4));
+        if (data.Length < blobLengthOffset + 4 + blobLength)
+        {
+            SendErrorResponse(Opcode.RESPONSE_PUBLISH_RECORD, requestId, 1); // Error: incomplete data
+            return;
+        }
+        byte[] encryptedBlob = data.Slice(blobLengthOffset + 4, blobLength).ToArray();
+        byte[] publisherPublicKey = Convert.FromBase64String(RemotePublicKey!);
+
+        // Authorization: Sender must be the publisher
+        // Since RemotePublicKey is the sender's public key, it’s implicitly checked by using it as publisherPublicKey
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await _server.RecordRepository.InsertOrUpdateAsync(publisherPublicKey, consumerPublicKey, key, encryptedBlob);
+                SendResponse(Opcode.RESPONSE_PUBLISH_RECORD, 0, requestId); // Success
+            }
+            catch (Exception ex)
+            {
+                Logger.Error<SyncSession>("Error publishing record", ex);
+                SendErrorResponse(Opcode.RESPONSE_PUBLISH_RECORD, requestId, 1); // Error
+            }
+        });
+    }
+
+    private void HandleRequestDeleteRecord(ReadOnlySpan<byte> data)
+    {
+        // Parse request: requestId (4), publisherPublicKey (32), consumerPublicKey (32), keyLength (1), key (variable)
+        if (data.Length < 69) // Minimum size: 4 + 32 + 32 + 1 + 0
+        {
+            Logger.Error<SyncSession>("REQUEST_DELETE_RECORD packet too short");
+            return;
+        }
+        int requestId = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(0, 4));
+        byte[] publisherPublicKey = data.Slice(4, 32).ToArray();
+        byte[] consumerPublicKey = data.Slice(36, 32).ToArray();
+        int keyLength = data[68];
+        if (keyLength > 32)
+        {
+            SendErrorResponse(Opcode.RESPONSE_DELETE_RECORD, requestId, 1); // Error: invalid key length
+            return;
+        }
+        string key = Encoding.UTF8.GetString(data.Slice(69, keyLength));
+        byte[] senderPublicKey = Convert.FromBase64String(RemotePublicKey!);
+
+        // Authorization: Sender must be publisher or consumer
+        if (!senderPublicKey.SequenceEqual(publisherPublicKey) && !senderPublicKey.SequenceEqual(consumerPublicKey))
+        {
+            SendErrorResponse(Opcode.RESPONSE_DELETE_RECORD, requestId, 1); // Error: unauthorized
+            return;
+        }
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await _server.RecordRepository.DeleteAsync(publisherPublicKey, consumerPublicKey, key);
+                SendResponse(Opcode.RESPONSE_DELETE_RECORD, 0, requestId); // Success
+            }
+            catch (Exception ex)
+            {
+                Logger.Error<SyncSession>("Error deleting record", ex);
+                SendErrorResponse(Opcode.RESPONSE_DELETE_RECORD, requestId, 1); // Error
+            }
+        });
+    }
+
+    private void HandleRequestListKeys(ReadOnlySpan<byte> data)
+    {
+        // Parse request: requestId (4), publisherPublicKey (32), consumerPublicKey (32)
+        if (data.Length != 68)
+        {
+            Logger.Error<SyncSession>("REQUEST_LIST_KEYS packet invalid size");
+            return;
+        }
+        int requestId = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(0, 4));
+        byte[] publisherPublicKey = data.Slice(4, 32).ToArray();
+        byte[] consumerPublicKey = data.Slice(36, 32).ToArray();
+        byte[] senderPublicKey = Convert.FromBase64String(RemotePublicKey!);
+
+        // Authorization: Sender must be publisher or consumer
+        if (!senderPublicKey.SequenceEqual(publisherPublicKey) && !senderPublicKey.SequenceEqual(consumerPublicKey))
+        {
+            SendErrorResponse(Opcode.RESPONSE_LIST_RECORD_KEYS, requestId, 1); // Error: unauthorized
+            return;
+        }
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                var keys = await _server.RecordRepository.ListKeysAsync(publisherPublicKey, consumerPublicKey);
+                using var ms = new MemoryStream();
+                using var writer = new BinaryWriter(ms);
+                writer.Write(requestId);
+                writer.Write(keys.Count());
+                foreach (var (key, timestamp) in keys)
+                {
+                    byte[] keyBytes = Encoding.UTF8.GetBytes(key);
+                    writer.Write((byte)keyBytes.Length);
+                    writer.Write(keyBytes);
+                    writer.Write(timestamp.ToBinary());
+                }
+                var responseData = ms.ToArray();
+                Send(Opcode.RESPONSE_LIST_RECORD_KEYS, 0, responseData); // Success
+            }
+            catch (Exception ex)
+            {
+                Logger.Error<SyncSession>("Error listing keys", ex);
+                SendErrorResponse(Opcode.RESPONSE_LIST_RECORD_KEYS, requestId, 1); // Error
+            }
+        });
+    }
+
+    private void HandleRequestGetRecord(ReadOnlySpan<byte> data)
+    {
+        // Parse request: requestId (4), publisherPublicKey (32), consumerPublicKey (32), keyLength (1), key (variable)
+        if (data.Length < 37) // Minimum size: 4 + 32 + 1 + 0
+        {
+            Logger.Error<SyncSession>("REQUEST_GET_RECORD packet too short");
+            return;
+        }
+        int requestId = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(0, 4));
+        byte[] publisherPublicKey = data.Slice(4, 32).ToArray();
+        int keyLength = data[36];
+        if (keyLength > 32)
+        {
+            SendErrorResponse(Opcode.RESPONSE_GET_RECORD, requestId, 1);
+            return;
+        }
+        string key = Encoding.UTF8.GetString(data.Slice(37, keyLength));
+        byte[] consumerPublicKey = Convert.FromBase64String(RemotePublicKey!);
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                var record = await _server.RecordRepository.GetAsync(publisherPublicKey, consumerPublicKey, key);
+                if (record != null)
+                {
+                    using var ms = new MemoryStream();
+                    using var writer = new BinaryWriter(ms);
+                    writer.Write(requestId);
+                    writer.Write(record.EncryptedBlob.Length);
+                    writer.Write(record.EncryptedBlob);
+                    writer.Write(record.Timestamp.ToBinary());
+                    var responseData = ms.ToArray();
+                    Send(Opcode.RESPONSE_GET_RECORD, 0, responseData);
+                }
+                else
+                {
+                    SendErrorResponse(Opcode.RESPONSE_GET_RECORD, requestId, 2);
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Error<SyncSession>("Error getting record", ex);
+                SendErrorResponse(Opcode.RESPONSE_GET_RECORD, requestId, 1); 
+            }
+        });
+    }
+
     public void HandleVersionCheck(ReadOnlySpan<byte> data)
     {
         const int MINIMUM_VERSION = 2;
@@ -477,9 +956,18 @@ public class SyncSession
             throw new Exception($"Version must be at least {MINIMUM_VERSION}");
     }
 
-    public void Send(Opcode opcode, byte subOpcode, ReadOnlySpan<byte> data)
+    public void SendVersion()
     {
-        var decryptedSize = 4 + 1 + 1 + data.Length;
+        const int CURRENT_VERSION = 3;
+        lock (_sendLock)
+        {
+            Send(new byte[] { CURRENT_VERSION, 0, 0, 0 }, 0, 4);
+        }
+    }
+
+    public void Send(Opcode opcode, byte subOpcode)
+    {
+        var decryptedSize = 4 + 1 + 1;
         var encryptedSize = decryptedSize + 4 + 16;
         byte[] decryptedPacket = Utilities.RentBytes(decryptedSize);
         byte[] encryptedPacket = Utilities.RentBytes(encryptedSize);
@@ -489,7 +977,6 @@ public class SyncSession
             BinaryPrimitives.WriteInt32LittleEndian(decryptedPacket.AsSpan().Slice(0, 4), decryptedSize - 4);
             decryptedPacket[4] = (byte)opcode;
             decryptedPacket[5] = (byte)subOpcode;
-            data.CopyTo(decryptedPacket.AsSpan().Slice(HEADER_SIZE));
         }
         finally
         {
@@ -497,14 +984,105 @@ public class SyncSession
         }
 
         if (Logger.WillLog(LogLevel.Debug))
-            Logger.Debug<SyncSession>($"Encrypted message bytes {data.Length + HEADER_SIZE}");
+            Logger.Debug<SyncSession>($"Encrypted message bytes {HEADER_SIZE}");
 
-        var len = Encrypt(decryptedPacket.AsSpan().Slice(0, data.Length + HEADER_SIZE), encryptedPacket.AsSpan().Slice(4));
-        BinaryPrimitives.WriteInt32LittleEndian(encryptedPacket.AsSpan().Slice(0, 4), len);
-        Send(encryptedPacket, 0, encryptedSize, true);
+        lock (_sendLock)
+        {
+            var len = Encrypt(decryptedPacket.AsSpan().Slice(0, HEADER_SIZE), encryptedPacket.AsSpan().Slice(4));
+            BinaryPrimitives.WriteInt32LittleEndian(encryptedPacket.AsSpan().Slice(0, 4), len);
+            Send(encryptedPacket, 0, encryptedSize, true);
 
-        if (Logger.WillLog(LogLevel.Debug))
-            Logger.Debug<SyncSession>($"Wrote message bytes {len}");
+            if (Logger.WillLog(LogLevel.Debug))
+                Logger.Debug<SyncSession>($"Wrote message bytes {len}");
+        }
+    }
+
+    public void Send(Opcode opcode, byte subOpcode, ReadOnlySpan<byte> data)
+    {
+        if (data.Length + HEADER_SIZE > MAXIMUM_PACKET_SIZE)
+        {
+            var segmentSize = MAXIMUM_PACKET_SIZE - HEADER_SIZE;
+            var segmentData = new byte[segmentSize];
+            var id = Interlocked.Increment(ref _streamIdGenerator);
+
+            for (var sendOffset = 0; sendOffset < data.Length;)
+            {
+                var bytesRemaining = data.Length - sendOffset;
+                int bytesToSend;
+                int segmentPacketSize;
+
+                Opcode op;
+                if (sendOffset == 0)
+                {
+                    op = Opcode.STREAM_START;
+                    bytesToSend = segmentSize - 4 - 4 - 1 - 1;
+                    segmentPacketSize = bytesToSend + 4 + 4 + 1 + 1;
+                }
+                else
+                {
+                    bytesToSend = Math.Min(segmentSize - 4 - 4, bytesRemaining);
+                    if (bytesToSend >= bytesRemaining)
+                        op = Opcode.STREAM_END;
+                    else
+                        op = Opcode.STREAM_DATA;
+
+                    segmentPacketSize = bytesToSend + 4 + 4;
+                }
+
+                if (op == Opcode.STREAM_START)
+                {
+                    //TODO: replace segmentData.AsSpan() into a local variable once C# 13
+                    BinaryPrimitives.WriteInt32LittleEndian(segmentData.AsSpan().Slice(0, 4), id);
+                    BinaryPrimitives.WriteInt32LittleEndian(segmentData.AsSpan().Slice(4, 4), data.Length);
+                    segmentData[8] = (byte)opcode;
+                    segmentData[9] = (byte)subOpcode;
+                    data.Slice(sendOffset, bytesToSend).CopyTo(segmentData.AsSpan().Slice(10));
+                }
+                else
+                {
+                    //TODO: replace segmentData.AsSpan() into a local variable once C# 13
+                    BinaryPrimitives.WriteInt32LittleEndian(segmentData.AsSpan().Slice(0, 4), id);
+                    BinaryPrimitives.WriteInt32LittleEndian(segmentData.AsSpan().Slice(4, 4), sendOffset);
+                    data.Slice(sendOffset, bytesToSend).CopyTo(segmentData.AsSpan().Slice(8));
+                }
+
+                sendOffset += bytesToSend;
+                Send(op, 0, segmentData.AsSpan().Slice(0, segmentPacketSize).ToArray());
+            }
+        }
+        else
+        {
+            var decryptedSize = 4 + 1 + 1 + data.Length;
+            var encryptedSize = decryptedSize + 4 + 16;
+            byte[] decryptedPacket = Utilities.RentBytes(decryptedSize);
+            byte[] encryptedPacket = Utilities.RentBytes(encryptedSize);
+
+
+            try
+            {
+                BinaryPrimitives.WriteInt32LittleEndian(decryptedPacket.AsSpan().Slice(0, 4), decryptedSize - 4);
+                decryptedPacket[4] = (byte)opcode;
+                decryptedPacket[5] = (byte)subOpcode;
+                data.CopyTo(decryptedPacket.AsSpan().Slice(HEADER_SIZE));
+            }
+            finally
+            {
+                Utilities.ReturnBytes(decryptedPacket);
+            }
+
+            if (Logger.WillLog(LogLevel.Debug))
+                Logger.Debug<SyncSession>($"Encrypted message bytes {data.Length + HEADER_SIZE}");
+
+            lock (_sendLock)
+            {
+                var len = Encrypt(decryptedPacket.AsSpan().Slice(0, data.Length + HEADER_SIZE), encryptedPacket.AsSpan().Slice(4));
+                BinaryPrimitives.WriteInt32LittleEndian(encryptedPacket.AsSpan().Slice(0, 4), len);
+                Send(encryptedPacket, 0, encryptedSize, true);
+
+                if (Logger.WillLog(LogLevel.Debug))
+                    Logger.Debug<SyncSession>($"Wrote message bytes {len}");
+            }
+        }
     }
 
     public void Send(Opcode opcode, byte subOpcode = 0, byte[]? data = null, int offset = 0, int count = -1)
@@ -512,32 +1090,10 @@ public class SyncSession
         if (count == -1)
             count = data?.Length ?? 0;
 
-        var decryptedSize = 4 + 1 + 1 + count;
-        var encryptedSize = decryptedSize + 4 + 16;
-        byte[] decryptedPacket = Utilities.RentBytes(decryptedSize);
-        byte[] encryptedPacket = Utilities.RentBytes(encryptedSize);
-
-        try
-        {
-            BinaryPrimitives.WriteInt32LittleEndian(decryptedPacket.AsSpan().Slice(0, 4), decryptedSize - 4);
-            decryptedPacket[4] = (byte)opcode;
-            decryptedPacket[5] = (byte)subOpcode;
-            data?.AsSpan().Slice(offset, count).CopyTo(decryptedPacket.AsSpan().Slice(HEADER_SIZE));
-        }
-        finally
-        {
-            Utilities.ReturnBytes(decryptedPacket);
-        }
-
-        if (Logger.WillLog(LogLevel.Debug))
-            Logger.Debug<SyncSession>($"Encrypted message bytes {count + HEADER_SIZE}");
-
-        var len = Encrypt(decryptedPacket.AsSpan().Slice(0, count + HEADER_SIZE), encryptedPacket.AsSpan().Slice(4));
-        BinaryPrimitives.WriteInt32LittleEndian(encryptedPacket.AsSpan().Slice(0, 4), len);
-        Send(encryptedPacket, 0, encryptedSize, true);
-
-        if (Logger.WillLog(LogLevel.Debug))
-            Logger.Debug<SyncSession>($"Wrote message bytes {len}");
+        if (data != null)
+            Send(opcode, subOpcode, data.AsSpan(offset, count));
+        else
+            Send(opcode, subOpcode);
     }
 
     private int Encrypt(ReadOnlySpan<byte> source, Span<byte> destination)
@@ -557,40 +1113,50 @@ public class SyncSession
     }
 
     //TODO: Reuse buffer initially set by InitializeBufferPool
-    public void Send(byte[] data, bool returnToPool = false) => Send(data, 0, data.Length);
-    public void Send(byte[] data, int offset, int count, bool returnToPool = false)
+    private void Send(byte[] data, int offset, int count, bool returnToPool = false)
     {
-        lock (SendQueue)
+        if (!_isBusyWriting)
         {
-            if (!_isBusyWriting)
+            if (Logger.WillLog(LogLevel.Debug))
+                Logger.Debug<SyncSession>($"Sending {count} bytes.\n{Utilities.HexDump(data.AsSpan().Slice(offset, count))}");
+
+            WriteArgs.SetBuffer(data, offset, count);
+            ((ArgsPair)WriteArgs.UserToken!).ReturnToPool = returnToPool;
+            bool pending = Socket.SendAsync(WriteArgs!);
+            if (pending)
             {
-                if (Logger.WillLog(LogLevel.Debug))
-                    Logger.Debug<SyncSession>($"Sending {count} bytes.\n{Utilities.HexDump(data.AsSpan().Slice(offset, count))}");
-
-                WriteArgs.SetBuffer(data, offset, count);
-                ((ArgsPair)WriteArgs.UserToken!).ReturnToPool = returnToPool;
-                bool pending = Socket.SendAsync(WriteArgs!);
-                if (pending)
-                {
-                    Logger.Debug<SyncSession>($"Write not synchronously completed. Set isBusyWriting to true.");
-                    _isBusyWriting = true;
-                }
-                else
-                {
-                    if (Logger.WillLog(LogLevel.Debug))
-                        Logger.Debug<SyncSession>($"Sent {count} bytes synchronously.");
-
-                    if (returnToPool)
-                        Utilities.ReturnBytes(data);
-                }
+                Logger.Debug<SyncSession>($"Write not synchronously completed. Set isBusyWriting to true.");
+                _isBusyWriting = true;
             }
             else
             {
                 if (Logger.WillLog(LogLevel.Debug))
-                    Logger.Debug<SyncSession>($"Queued {count} bytes to send.");
-                SendQueue.Enqueue((data, offset, count, returnToPool));
+                    Logger.Debug<SyncSession>($"Sent {count} bytes synchronously.");
+
+                if (returnToPool)
+                    Utilities.ReturnBytes(data);
             }
         }
+        else
+        {
+            if (Logger.WillLog(LogLevel.Debug))
+                Logger.Debug<SyncSession>($"Queued {count} bytes to send.");
+            SendQueue.Enqueue((data, offset, count, returnToPool));
+        }
+    }
+
+    private void SendResponse(Opcode opcode, byte subOpcode, int requestId)
+    {
+        var responseData = new byte[4];
+        BinaryPrimitives.WriteInt32LittleEndian(responseData, requestId);
+        Send(opcode, subOpcode, responseData);
+    }
+
+    private void SendErrorResponse(Opcode opcode, int requestId, byte errorCode)
+    {
+        var responseData = new byte[4];
+        BinaryPrimitives.WriteInt32LittleEndian(responseData, requestId);
+        Send(opcode, errorCode, responseData);
     }
 
     public void OnWriteCompleted()
@@ -600,7 +1166,7 @@ public class SyncSession
         if (argsPair.ReturnToPool)
             Utilities.ReturnBytes(sentBuffer);
 
-        lock (SendQueue)
+        lock (_sendLock)
         {
             if (SendQueue.Count > 0)
             {

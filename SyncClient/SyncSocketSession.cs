@@ -7,6 +7,7 @@ using SyncShared;
 using System.Text;
 using System.Collections.Concurrent;
 using System.Security.Cryptography;
+using System.Buffers;
 
 namespace SyncClient;
 
@@ -85,24 +86,6 @@ public class SyncSocketSession : IDisposable
             => _session.SendRelayedDataAsync(this, opcode, subOpcode, data, offset, count, cancellationToken);
     }
 
-    public enum Opcode : byte
-    {
-        PING = 0,
-        PONG = 1,
-        NOTIFY_AUTHORIZED = 2,
-        NOTIFY_UNAUTHORIZED = 3,
-        STREAM_START = 4,
-        STREAM_DATA = 5,
-        STREAM_END = 6,
-        DATA = 7,
-        PUBLISH_CONNECTION_INFO = 8,
-        REQUEST_CONNECTION_INFO = 9,
-        RESPONSE_CONNECTION_INFO = 10,
-        REQUEST_RELAYED_TRANSPORT = 11,
-        RESPONSE_RELAYED_TRANSPORT = 12,
-        RELAYED_DATA = 13
-    }
-
     private readonly Stream _inputStream;
     private readonly Stream _outputStream;
     private readonly SemaphoreSlim _sendSemaphore = new SemaphoreSlim(1);
@@ -128,9 +111,18 @@ public class SyncSocketSession : IDisposable
     private readonly ConcurrentDictionary<long, Channel> _channels = new();
     private readonly ConcurrentDictionary<int, (Channel Channel, TaskCompletionSource<Channel> Tcs)> _pendingChannels = new();
     private readonly ConcurrentDictionary<int, TaskCompletionSource<ConnectionInfo?>> _pendingConnectionInfoRequests = new();
+    private readonly ConcurrentDictionary<int, TaskCompletionSource<bool>> _pendingPublishRequests = new();
+    private readonly ConcurrentDictionary<int, TaskCompletionSource<bool>> _pendingDeleteRequests = new();
+    private readonly ConcurrentDictionary<int, TaskCompletionSource<List<(string Key, DateTime Timestamp)>>> _pendingListKeysRequests = new();
+    private readonly ConcurrentDictionary<int, TaskCompletionSource<(byte[] EncryptedBlob, DateTime Timestamp)?>> _pendingGetRecordRequests = new();
+    private readonly ConcurrentDictionary<int, TaskCompletionSource<Dictionary<string, (byte[] Data, DateTime Timestamp)>>> _pendingBulkGetRecordRequests = new();
+    private readonly ConcurrentDictionary<int, TaskCompletionSource<Dictionary<string, ConnectionInfo?>>> _pendingBulkConnectionInfoRequests = new();
     private int _requestIdGenerator = 0;
 
+    //TODO: Can this be cleaner?
     public IAuthorizable? Authorizable { get; set; }
+    public bool IsTrusted { get; set; }
+    public bool IsAuthorized => (Authorizable?.IsAuthorized ?? false) || IsTrusted;
 
 
     public SyncSocketSession(string remoteAddress, KeyPair localKeyPair, Stream inputStream, Stream outputStream,
@@ -165,7 +157,7 @@ public class SyncSocketSession : IDisposable
             }
             finally
             {
-                Stop();
+                Dispose();
             }
         });
         _thread.Start();
@@ -188,7 +180,7 @@ public class SyncSocketSession : IDisposable
             }
             finally
             {
-                Stop();
+                Dispose();
             }
         });
         _thread.Start();
@@ -201,7 +193,8 @@ public class SyncSocketSession : IDisposable
             try
             {
                 byte[] messageSizeBytes = new byte[4];
-                Read(messageSizeBytes, 0, 4);
+                if (Read(messageSizeBytes, 0, 4) != 4)
+                    throw new Exception("Expected exactly 4 bytes");
                 int messageSize = BitConverter.ToInt32(messageSizeBytes, 0);
                 if (messageSize == 0)
                     throw new Exception("Disconnected.");
@@ -216,7 +209,7 @@ public class SyncSocketSession : IDisposable
                 while (bytesRead < messageSize)
                 {
                     int read = Read(_buffer, bytesRead, messageSize - bytesRead);
-                    if (read == -1)
+                    if (read <= 0)
                         throw new Exception("Stream closed");
                     bytesRead += read;
                 }
@@ -236,17 +229,6 @@ public class SyncSocketSession : IDisposable
                 break;
             }
         }
-    }
-
-    public void Stop()
-    {
-        _started = false;
-        _onClose(this);
-        _inputStream.Close();
-        _outputStream.Close();
-        _transport?.Dispose();
-        _thread = null;
-        Logger.Info<SyncSocketSession>("Session closed");
     }
 
     private void HandshakeAsInitiator(string remotePublicKey)
@@ -522,9 +504,9 @@ public class SyncSocketSession : IDisposable
         HandlePacket((Opcode)opcode, subOpcode, packetData, sourceChannel);
     }
 
-    public Task<ConnectionInfo> RequestConnectionInfoAsync(string publicKey, CancellationToken cancellationToken = default)
+    public Task<ConnectionInfo?> RequestConnectionInfoAsync(string publicKey, CancellationToken cancellationToken = default)
     {
-        var tcs = new TaskCompletionSource<ConnectionInfo>();
+        var tcs = new TaskCompletionSource<ConnectionInfo?>();
         var requestId = Interlocked.Increment(ref _requestIdGenerator);
         _pendingConnectionInfoRequests[requestId] = tcs;
         cancellationToken.Register(() =>
@@ -564,6 +546,50 @@ public class SyncSocketSession : IDisposable
         }
 
         return tcs.Task;
+    }
+
+    public async Task<Dictionary<string, ConnectionInfo?>> RequestBulkConnectionInfoAsync(IEnumerable<string> publicKeys, CancellationToken cancellationToken = default)
+    {
+        var tcs = new TaskCompletionSource<Dictionary<string, ConnectionInfo?>>();
+        var requestId = Interlocked.Increment(ref _requestIdGenerator);
+        _pendingBulkConnectionInfoRequests[requestId] = tcs;
+
+        cancellationToken.Register(() =>
+        {
+            if (_pendingBulkConnectionInfoRequests.TryRemove(requestId, out var cancelledTcs))
+            {
+                cancelledTcs.TrySetCanceled();
+            }
+        });
+
+        try
+        {
+            var publicKeyList = publicKeys.ToList();
+            var numKeys = publicKeyList.Count;
+            using var ms = new MemoryStream();
+            using var writer = new BinaryWriter(ms);
+            writer.Write(requestId); // 4 bytes: Request ID
+            writer.Write((byte)numKeys); // 1 byte: Number of public keys
+            foreach (var pk in publicKeyList)
+            {
+                byte[] pkBytes = Convert.FromBase64String(pk);
+                if (pkBytes.Length != 32)
+                    throw new ArgumentException($"Invalid public key length for {pk}; must be 32 bytes.");
+                writer.Write(pkBytes); // 32 bytes per public key
+            }
+            var packet = ms.ToArray();
+            await SendAsync(Opcode.REQUEST_BULK_CONNECTION_INFO, 0, packet, cancellationToken: cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            if (_pendingBulkConnectionInfoRequests.TryRemove(requestId, out var errorTcs))
+            {
+                errorTcs.TrySetException(ex);
+            }
+            throw;
+        }
+
+        return await tcs.Task;
     }
 
     public Task<Channel> StartRelayedChannelAsync(string publicKey, CancellationToken cancellationToken = default)
@@ -698,7 +724,7 @@ public class SyncSocketSession : IDisposable
                 writer.Write(handshakeMessage, 0, expectedHandshakeSize);
 
                 var ciphertext = new byte[data.Length + 16];
-                var ciphertextBytesWritten = transport.WriteMessage(data, ciphertext);
+                var ciphertextBytesWritten = transport!.WriteMessage(data, ciphertext);
                 if (ciphertextBytesWritten != data.Length + 16)
                     throw new InvalidOperationException("Ciphertext size mismatch.");
                 writer.Write(data.Length + 16);
@@ -715,7 +741,7 @@ public class SyncSocketSession : IDisposable
         switch (opcode)
         {
             case Opcode.PING:
-                Task.Run(async () => 
+                Task.Run(async () =>
                 {
                     try
                     {
@@ -804,7 +830,7 @@ public class SyncSocketSession : IDisposable
                         channel.ConnectionId = connectionId;
                         var plaintext = new byte[1024];
                         var (_, _, transport) = channel.HandshakeState!.ReadMessage(handshakeMessage, plaintext);
-                        channel.CompleteHandshake(transport);
+                        channel.CompleteHandshake(transport!);
                         _channels[connectionId] = channel;
                         tcs.SetResult(channel);
                     }
@@ -832,9 +858,385 @@ public class SyncSocketSession : IDisposable
             case Opcode.RELAYED_DATA:
                 HandleRelayedData(subOpcode, data);
                 return;
+            case Opcode.RESPONSE_PUBLISH_RECORD:
+                {
+                    if (data.Length < 4)
+                    {
+                        Logger.Error<SyncSocketSession>("RESPONSE_PUBLISH_RECORD packet too short");
+                        return;
+                    }
+                    int requestId = BinaryPrimitives.ReadInt32LittleEndian(data.AsSpan(0, 4));
+                    if (_pendingPublishRequests.TryRemove(requestId, out var tcs))
+                    {
+                        if (subOpcode == 0)
+                        {
+                            tcs.SetResult(true); // Success
+                        }
+                        else
+                        {
+                            tcs.SetResult(false); // Error
+                        }
+                    }
+                    else
+                    {
+                        Logger.Error<SyncSocketSession>($"No pending publish request for requestId {requestId}");
+                    }
+                    return;
+                }
+
+            case Opcode.RESPONSE_DELETE_RECORD:
+                {
+                    if (data.Length < 4)
+                    {
+                        Logger.Error<SyncSocketSession>("RESPONSE_DELETE_RECORD packet too short");
+                        return;
+                    }
+                    int requestId = BinaryPrimitives.ReadInt32LittleEndian(data.AsSpan(0, 4));
+                    if (_pendingDeleteRequests.TryRemove(requestId, out var tcs))
+                    {
+                        if (subOpcode == 0)
+                        {
+                            tcs.SetResult(true); // Success
+                        }
+                        else
+                        {
+                            tcs.SetResult(false); // Error
+                        }
+                    }
+                    else
+                    {
+                        Logger.Error<SyncSocketSession>($"No pending delete request for requestId {requestId}");
+                    }
+                    return;
+                }
+            case Opcode.RESPONSE_BULK_DELETE_RECORD:
+                {
+                    if (data.Length < 4)
+                    {
+                        Logger.Error<SyncSocketSession>("RESPONSE_BULK_DELETE_RECORD packet too short");
+                        return;
+                    }
+                    int requestId = BinaryPrimitives.ReadInt32LittleEndian(data.AsSpan(0, 4));
+                    if (_pendingDeleteRequests.TryRemove(requestId, out var tcs))
+                    {
+                        if (subOpcode == 0)
+                            tcs.SetResult(true); // Success
+                        else
+                            tcs.SetResult(false); // Error
+                    }
+                    else
+                    {
+                        Logger.Error<SyncSocketSession>($"No pending bulk delete request for requestId {requestId}");
+                    }
+                    return;
+                }
+            case Opcode.RESPONSE_LIST_RECORD_KEYS:
+                {
+                    if (data.Length < 4)
+                    {
+                        Logger.Error<SyncSocketSession>("RESPONSE_LIST_RECORD_KEYS packet too short");
+                        return;
+                    }
+                    int requestId = BinaryPrimitives.ReadInt32LittleEndian(data.AsSpan(0, 4));
+                    if (_pendingListKeysRequests.TryRemove(requestId, out var tcs))
+                    {
+                        if (subOpcode == 0)
+                        {
+                            try
+                            {
+                                var keys = new List<(string Key, DateTime Timestamp)>();
+                                using var ms = new MemoryStream(data, 4, data.Length - 4);
+                                using var reader = new BinaryReader(ms);
+                                int keyCount = reader.ReadInt32();
+                                for (int i = 0; i < keyCount; i++)
+                                {
+                                    byte keyLength = reader.ReadByte();
+                                    byte[] keyBytes = reader.ReadBytes(keyLength);
+                                    string key = Encoding.UTF8.GetString(keyBytes);
+                                    long timestampBinary = reader.ReadInt64();
+                                    DateTime timestamp = DateTime.FromBinary(timestampBinary);
+                                    keys.Add((key, timestamp));
+                                }
+                                tcs.SetResult(keys);
+                            }
+                            catch (Exception ex)
+                            {
+                                tcs.SetException(ex);
+                            }
+                        }
+                        else
+                        {
+                            tcs.SetException(new Exception($"Error listing keys: subOpcode {subOpcode}"));
+                        }
+                    }
+                    else
+                    {
+                        Logger.Error<SyncSocketSession>($"No pending list keys request for requestId {requestId}");
+                    }
+                    return;
+                }
+            case Opcode.RESPONSE_BULK_GET_RECORD:
+                {
+                    if (data.Length < 5)
+                    {
+                        Logger.Error<SyncSocketSession>("RESPONSE_BULK_GET_RECORD packet too short");
+                        return;
+                    }
+                    int getRequestId = BinaryPrimitives.ReadInt32LittleEndian(data.AsSpan(0, 4));
+                    if (_pendingBulkGetRecordRequests.TryRemove(getRequestId, out var getTcs))
+                    {
+                        if (subOpcode == 0)
+                        {
+                            try
+                            {
+                                int offset = 4;
+                                byte recordCount = data[offset];
+                                offset += 1;
+                                var records = new Dictionary<string, (byte[], DateTime)>(recordCount);
+                                for (int i = 0; i < recordCount; i++)
+                                {
+                                    byte[] publisherBytes = data.AsSpan(offset, 32).ToArray();
+                                    string publisher = Convert.ToBase64String(publisherBytes);
+                                    offset += 32;
+
+                                    int blobLength = BinaryPrimitives.ReadInt32LittleEndian(data.AsSpan(offset, 4));
+                                    offset += 4;
+                                    byte[] encryptedBlob = data.AsSpan(offset, blobLength).ToArray();
+                                    offset += blobLength;
+
+                                    long timestampBinary = BinaryPrimitives.ReadInt64LittleEndian(data.AsSpan(offset, 8));
+                                    DateTime timestamp = DateTime.FromBinary(timestampBinary);
+                                    offset += 8;
+
+                                    // Decrypt the blob
+                                    var protocol = new Protocol(HandshakePattern.N, CipherFunction.ChaChaPoly, HashFunction.Blake2b);
+                                    using var handshakeState = protocol.Create(false, s: _localKeyPair.PrivateKey);
+                                    var handshakeMessage = new byte[48];
+                                    encryptedBlob.AsSpan(0, 48).CopyTo(handshakeMessage);
+                                    var (_, _, transport) = handshakeState.ReadMessage(handshakeMessage, new byte[0]);
+
+                                    // First pass: Calculate total decrypted size
+                                    int blobOffset = 48;
+                                    int totalDecryptedSize = 0;
+                                    int chunkCount = 0;
+                                    while (blobOffset + 4 <= encryptedBlob.Length)
+                                    {
+                                        int chunkLength = BinaryPrimitives.ReadInt32LittleEndian(encryptedBlob.AsSpan(blobOffset, 4));
+                                        if (chunkLength <= 16 || blobOffset + 4 + chunkLength > encryptedBlob.Length)
+                                        {
+                                            throw new InvalidDataException("Invalid encrypted chunk length");
+                                        }
+                                        totalDecryptedSize += chunkLength - 16; // Subtract 16-byte tag
+                                        blobOffset += 4 + chunkLength;
+                                        chunkCount++;
+                                    }
+
+                                    if (chunkCount == 0)
+                                    {
+                                        throw new Exception("No valid chunks decrypted");
+                                    }
+
+                                    // Allocate a single buffer for decrypted data
+                                    var dataResult = new byte[totalDecryptedSize];
+                                    int dataOffset = 0;
+                                    blobOffset = 48;
+
+                                    // Second pass: Decrypt directly into the buffer
+                                    for (int j = 0; j < chunkCount; j++)
+                                    {
+                                        int chunkLength = BinaryPrimitives.ReadInt32LittleEndian(encryptedBlob.AsSpan(blobOffset, 4));
+                                        blobOffset += 4;
+                                        var encryptedChunk = encryptedBlob.AsSpan(blobOffset, chunkLength);
+                                        var decryptedSpan = dataResult.AsSpan(dataOffset, chunkLength - 16);
+                                        int decryptedLength = transport!.ReadMessage(encryptedChunk, decryptedSpan);
+                                        dataOffset += decryptedLength;
+                                        blobOffset += chunkLength;
+                                    }
+
+                                    records[publisher] = (dataResult, timestamp);
+                                }
+                                getTcs.SetResult(records);
+                            }
+                            catch (Exception ex)
+                            {
+                                Logger.Error<SyncSocketSession>("Error processing RESPONSE_BULK_GET_RECORD: {Exception}", ex);
+                                getTcs.SetException(ex);
+                            }
+                        }
+                        else
+                        {
+                            getTcs.SetException(new Exception($"Error getting bulk records: subOpcode {subOpcode}"));
+                        }
+                    }
+                    return;
+                }
+            case Opcode.RESPONSE_GET_RECORD:
+                {
+                    if (data.Length < 4)
+                    {
+                        Logger.Error<SyncSocketSession>("RESPONSE_GET_RECORD packet too short");
+                        return;
+                    }
+                    int requestId = BinaryPrimitives.ReadInt32LittleEndian(data.AsSpan(0, 4));
+                    if (_pendingGetRecordRequests.TryRemove(requestId, out var tcs))
+                    {
+                        if (subOpcode == 0)
+                        {
+                            try
+                            {
+                                int offset = 4;
+                                int blobLength = BinaryPrimitives.ReadInt32LittleEndian(data.AsSpan(offset, 4));
+                                offset += 4;
+                                byte[] encryptedBlob = data.AsSpan(offset, blobLength).ToArray();
+                                offset += blobLength;
+                                long timestampBinary = BinaryPrimitives.ReadInt64LittleEndian(data.AsSpan(offset, 8));
+                                DateTime timestamp = DateTime.FromBinary(timestampBinary);
+
+                                // Initialize Noise protocol for decryption
+                                var protocol = new Protocol(HandshakePattern.N, CipherFunction.ChaChaPoly, HashFunction.Blake2b);
+                                using var handshakeState = protocol.Create(false, s: _localKeyPair.PrivateKey);
+                                var handshakeMessage = new byte[48];
+                                encryptedBlob.AsSpan(0, 48).CopyTo(handshakeMessage);
+                                var (_, _, transport) = handshakeState.ReadMessage(handshakeMessage, new byte[0]);
+
+                                // First pass: Calculate total decrypted size
+                                int blobOffset = 48;
+                                int totalDecryptedSize = 0;
+                                int chunkCount = 0;
+                                while (blobOffset + 4 <= encryptedBlob.Length)
+                                {
+                                    int chunkLength = BinaryPrimitives.ReadInt32LittleEndian(encryptedBlob.AsSpan(blobOffset, 4));
+                                    if (chunkLength <= 16 || blobOffset + 4 + chunkLength > encryptedBlob.Length)
+                                    {
+                                        throw new InvalidDataException("Invalid encrypted chunk length");
+                                    }
+                                    totalDecryptedSize += chunkLength - 16; // Subtract 16-byte tag
+                                    blobOffset += 4 + chunkLength;
+                                    chunkCount++;
+                                }
+
+                                if (chunkCount == 0)
+                                {
+                                    throw new Exception("No valid chunks decrypted");
+                                }
+
+                                // Allocate a single buffer for all decrypted data
+                                var dataResult = new byte[totalDecryptedSize];
+                                int dataOffset = 0;
+                                blobOffset = 48;
+
+                                // Second pass: Decrypt directly into the buffer
+                                for (int i = 0; i < chunkCount; i++)
+                                {
+                                    int chunkLength = BinaryPrimitives.ReadInt32LittleEndian(encryptedBlob.AsSpan(blobOffset, 4));
+                                    blobOffset += 4;
+                                    var encryptedChunk = encryptedBlob.AsSpan(blobOffset, chunkLength);
+                                    var decryptedSpan = dataResult.AsSpan(dataOffset, chunkLength - 16);
+                                    int decryptedLength = transport!.ReadMessage(encryptedChunk, decryptedSpan);
+                                    dataOffset += decryptedLength;
+                                    blobOffset += chunkLength;
+                                }
+
+                                tcs.SetResult((dataResult, timestamp));
+                            }
+                            catch (Exception ex)
+                            {
+                                Logger.Error<SyncSocketSession>("Error processing RESPONSE_GET_RECORD: {Exception}", ex);
+                                tcs.SetException(ex);
+                            }
+                        }
+                        else if (subOpcode == 2)
+                        {
+                            tcs.SetResult(null); // Record not found
+                        }
+                        else
+                        {
+                            tcs.SetException(new Exception($"Error getting record: subOpcode {subOpcode}"));
+                        }
+                    }
+                    return;
+                }
+            case Opcode.RESPONSE_BULK_PUBLISH_RECORD:
+                {
+                    if (data.Length < 4)
+                    {
+                        Logger.Error<SyncSocketSession>("RESPONSE_BULK_PUBLISH_RECORD packet too short");
+                        return;
+                    }
+                    int publishRequestId = BinaryPrimitives.ReadInt32LittleEndian(data.AsSpan(0, 4));
+                    if (_pendingPublishRequests.TryRemove(publishRequestId, out var publishTcs))
+                    {
+                        publishTcs.SetResult(subOpcode == 0);
+                    }
+                    else
+                    {
+                        Logger.Error<SyncSocketSession>($"No pending bulk publish request for requestId {publishRequestId}");
+                    }
+                    return;
+                }
+            case Opcode.RESPONSE_BULK_CONNECTION_INFO:
+                {
+                    if (data.Length < 5)
+                    {
+                        Logger.Error<SyncSocketSession>("RESPONSE_BULK_CONNECTION_INFO packet too short");
+                        return;
+                    }
+                    int requestId = BinaryPrimitives.ReadInt32LittleEndian(data.AsSpan(0, 4));
+                    if (_pendingBulkConnectionInfoRequests.TryRemove(requestId, out var tcs))
+                    {
+                        try
+                        {
+                            var result = new Dictionary<string, ConnectionInfo?>();
+                            int offset = 4;
+                            byte numResponses = data[offset];
+                            offset += 1;
+                            for (int i = 0; i < numResponses; i++)
+                            {
+                                if (offset + 32 + 1 > data.Length)
+                                {
+                                    throw new Exception("Invalid RESPONSE_BULK_CONNECTION_INFO packet: insufficient data");
+                                }
+                                string publicKey = Convert.ToBase64String(data.AsSpan(offset, 32));
+                                offset += 32;
+                                byte status = data[offset];
+                                offset += 1;
+                                if (status == 0) // Success
+                                {
+                                    if (offset + 4 > data.Length)
+                                    {
+                                        throw new Exception("Invalid RESPONSE_BULK_CONNECTION_INFO packet: missing length");
+                                    }
+                                    int infoSize = BinaryPrimitives.ReadInt32LittleEndian(data.AsSpan(offset, 4));
+                                    offset += 4;
+                                    if (offset + infoSize > data.Length)
+                                    {
+                                        throw new Exception("Invalid RESPONSE_BULK_CONNECTION_INFO packet: data truncated");
+                                    }
+                                    var connectionInfo = ParseConnectionInfo(data.AsSpan(offset, infoSize));
+                                    result[publicKey] = connectionInfo;
+                                    offset += infoSize;
+                                }
+                                else // Not found
+                                {
+                                    result[publicKey] = null;
+                                }
+                            }
+                            tcs.SetResult(result);
+                        }
+                        catch (Exception ex)
+                        {
+                            tcs.SetException(ex);
+                        }
+                    }
+                    else
+                    {
+                        Logger.Error<SyncSocketSession>($"No pending bulk request for requestId {requestId}");
+                    }
+                    return;
+                }
         }
 
-        var isAuthorized = Authorizable?.IsAuthorized != true || sourceChannel != null;
+        var isAuthorized = IsAuthorized || sourceChannel != null;
         if (!isAuthorized)
         {
             Logger.Warning<SyncSocketSession>($"Ignored message due to lack of authorization (opcode: {opcode}, subOpcode: {subOpcode}) because ");
@@ -890,23 +1292,31 @@ public class SyncSocketSession : IDisposable
                     var id = reader.ReadInt32();
                     var expectedOffset = reader.ReadInt32();
 
-                    SyncStream? syncStream;
-                    lock (_syncStreams)
+                    SyncStream? syncStream = null;
+                    try
                     {
-                        if (!_syncStreams.Remove(id, out syncStream) || syncStream == null)
-                            throw new Exception("Received data for sync stream that does not exist");
+                        lock (_syncStreams)
+                        {
+                            if (!_syncStreams.Remove(id, out syncStream) || syncStream == null)
+                                throw new Exception("Received data for sync stream that does not exist");
+                        }
+
+                        if (expectedOffset != syncStream.BytesReceived)
+                            throw new Exception("Expected offset not matching with the amount of received bytes");
+
+                        if (stream.Position < stream.Length)
+                            syncStream.Add(data.AsSpan().Slice((int)stream.Position));
+
+                        if (!syncStream.IsComplete)
+                            throw new Exception("After sync stream end, the stream must be complete");
+
+                        //TODO: Can ToArray be prevented here?
+                        HandlePacket(syncStream.Opcode, syncStream.SubOpcode, syncStream.GetBytes().ToArray(), sourceChannel);
                     }
-
-                    if (expectedOffset != syncStream.BytesReceived)
-                        throw new Exception("Expected offset not matching with the amount of received bytes");
-
-                    if (stream.Position < stream.Length)
-                        syncStream.Add(data.AsSpan().Slice((int)stream.Position));
-
-                    if (!syncStream.IsComplete)
-                        throw new Exception("After sync stream end, the stream must be complete");
-
-                    HandlePacket(syncStream.Opcode, syncStream.SubOpcode, syncStream.GetBytes(), sourceChannel);
+                    finally
+                    {
+                        syncStream?.Dispose();
+                    }
                     break;
                 }
             case Opcode.DATA:
@@ -1113,7 +1523,7 @@ public class SyncSocketSession : IDisposable
             }
         });
 
-        channel.CompleteHandshake(transport);
+        channel.CompleteHandshake(transport!);
     }
 
     private ConnectionInfo ParseConnectionInfo(ReadOnlySpan<byte> data)
@@ -1134,7 +1544,7 @@ public class SyncSocketSession : IDisposable
         var (_, _, transport) = handshakeState.ReadMessage(handshakeMessage, plaintextBuffer);
 
         var decryptedData = new byte[ciphertext.Length - 16];
-        var decryptedLength = transport.ReadMessage(ciphertext, decryptedData);
+        var decryptedLength = transport!.ReadMessage(ciphertext, decryptedData);
         if (decryptedLength != decryptedData.Length)
         {
             throw new Exception("Decryption failed: incomplete data");
@@ -1188,10 +1598,498 @@ public class SyncSocketSession : IDisposable
         );
     }
 
+    //TODO: Not return bool?
+    public async Task<bool> PublishRecordsAsync(IEnumerable<string> consumerPublicKeys, string key, byte[] data, CancellationToken cancellationToken = default)
+    {
+        var keyBytes = Encoding.UTF8.GetBytes(key);
+        if (string.IsNullOrEmpty(key) || keyBytes.Length > 32)
+            throw new ArgumentException("Key must be non-empty and at most 32 bytes.", nameof(key));
+
+        var consumerList = consumerPublicKeys.ToList();
+        if (consumerList.Count == 0)
+            throw new ArgumentException("At least one consumer is required.");
+
+        var requestId = Interlocked.Increment(ref _requestIdGenerator);
+        var tcs = new TaskCompletionSource<bool>();
+        _pendingPublishRequests[requestId] = tcs;
+
+        cancellationToken.Register(() =>
+        {
+            if (_pendingPublishRequests.TryRemove(requestId, out var cancelledTcs))
+                cancelledTcs.TrySetCanceled();
+        });
+
+        const int MaxPlaintextSize = 65535;
+        const int HandshakeSize = 48;
+        const int LengthSize = 4;
+        const int TagSize = 16;
+
+        try
+        {
+            // Precalculate blob size (same for all consumers)
+            int chunkCount = (data.Length + MaxPlaintextSize - 1) / MaxPlaintextSize;
+            int blobSize = HandshakeSize;
+            for (int i = 0; i < chunkCount; i++)
+            {
+                int chunkSize = Math.Min(MaxPlaintextSize, data.Length - i * MaxPlaintextSize);
+                blobSize += LengthSize + (chunkSize + TagSize);
+            }
+
+            // Calculate total packet size
+            int totalPacketSize = 4 + 1 + keyBytes.Length + 1 + consumerList.Count * (32 + 4 + blobSize);
+            var packet = new byte[totalPacketSize];
+            int offset = 0;
+
+            // Write packet header
+            BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(offset, 4), requestId);
+            offset += 4;
+            packet[offset] = (byte)keyBytes.Length;
+            offset += 1;
+            keyBytes.CopyTo(packet.AsSpan(offset, keyBytes.Length));
+            offset += keyBytes.Length;
+            packet[offset] = (byte)consumerList.Count;
+            offset += 1;
+
+            // Buffer for encrypted chunks (reused across consumers)
+            var encryptedChunkBuffer = ArrayPool<byte>.Shared.Rent(MaxPlaintextSize + TagSize);
+
+            foreach (var consumerPublicKey in consumerList)
+            {
+                byte[] consumerPublicKeyBytes = Convert.FromBase64String(consumerPublicKey);
+                if (consumerPublicKeyBytes.Length != 32)
+                    throw new ArgumentException($"Consumer public key must be 32 bytes: {consumerPublicKey}");
+
+                var protocol = new Protocol(HandshakePattern.N, CipherFunction.ChaChaPoly, HashFunction.Blake2b);
+                using var handshakeState = protocol.Create(true, rs: consumerPublicKeyBytes);
+                var handshakeMessage = new byte[HandshakeSize];
+                var (handshakeBytesWritten, _, transport) = handshakeState.WriteMessage(null, handshakeMessage);
+
+                // Write consumer public key
+                consumerPublicKeyBytes.CopyTo(packet.AsSpan(offset, 32));
+                offset += 32;
+                BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(offset, 4), blobSize);
+                offset += 4;
+
+                // Write handshake
+                handshakeMessage.CopyTo(packet.AsSpan(offset, HandshakeSize));
+                offset += HandshakeSize;
+
+                // Encrypt and write chunks
+                int dataOffset = 0;
+                for (int i = 0; i < chunkCount; i++)
+                {
+                    int chunkSize = Math.Min(MaxPlaintextSize, data.Length - dataOffset);
+                    var plaintextSpan = data.AsSpan(dataOffset, chunkSize);
+                    transport!.WriteMessage(plaintextSpan, encryptedChunkBuffer.AsSpan(0, chunkSize + TagSize));
+                    BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(offset, 4), chunkSize + TagSize);
+                    offset += 4;
+                    encryptedChunkBuffer.AsSpan(0, chunkSize + TagSize).CopyTo(packet.AsSpan(offset));
+                    offset += chunkSize + TagSize;
+                    dataOffset += chunkSize;
+                }
+            }
+
+            ArrayPool<byte>.Shared.Return(encryptedChunkBuffer);
+            await SendAsync(Opcode.REQUEST_BULK_PUBLISH_RECORD, 0, packet, cancellationToken: cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            if (_pendingPublishRequests.TryRemove(requestId, out var errorTcs))
+                errorTcs.TrySetException(ex);
+            throw;
+        }
+
+        return await tcs.Task;
+    }
+
+    public async Task<bool> PublishRecordAsync(string consumerPublicKey, string key, byte[] data, CancellationToken cancellationToken = default)
+    {
+        var keyBytes = Encoding.UTF8.GetBytes(key);
+        if (string.IsNullOrEmpty(key) || keyBytes.Length > 32)
+            throw new ArgumentException("Key must be non-empty and at most 32 bytes.", nameof(key));
+
+        var requestId = Interlocked.Increment(ref _requestIdGenerator);
+        var tcs = new TaskCompletionSource<bool>();
+        _pendingPublishRequests[requestId] = tcs;
+
+        cancellationToken.Register(() =>
+        {
+            if (_pendingPublishRequests.TryRemove(requestId, out var cancelledTcs))
+                cancelledTcs.TrySetCanceled();
+        });
+
+        const int HandshakeSize = 48;
+        const int LengthSize = 4;
+        const int TagSize = 16;
+        const int MaxPlaintextSize = 65535 - TagSize;
+
+        try
+        {
+            byte[] consumerPublicKeyBytes = Convert.FromBase64String(consumerPublicKey);
+            if (consumerPublicKeyBytes.Length != 32)
+                throw new ArgumentException("Consumer public key must be 32 bytes.", nameof(consumerPublicKey));
+
+            // Calculate blob size
+            int chunkCount = (data.Length + MaxPlaintextSize - 1) / MaxPlaintextSize;
+            int blobSize = HandshakeSize;
+            for (int i = 0; i < chunkCount; i++)
+            {
+                int chunkSize = Math.Min(MaxPlaintextSize, data.Length - i * MaxPlaintextSize);
+                blobSize += LengthSize + (chunkSize + TagSize);
+            }
+
+            // Construct packet
+            int packetSize = 4 + 32 + 1 + keyBytes.Length + 4 + blobSize;
+            var packet = new byte[packetSize];
+            int offset = 0;
+
+            BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(offset, 4), requestId);
+            offset += 4;
+            consumerPublicKeyBytes.CopyTo(packet.AsSpan(offset, 32));
+            offset += 32;
+            packet[offset] = (byte)keyBytes.Length;
+            offset += 1;
+            keyBytes.CopyTo(packet.AsSpan(offset, keyBytes.Length));
+            offset += keyBytes.Length;
+            BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(offset, 4), blobSize);
+            offset += 4;
+
+            // Encrypt data
+            var protocol = new Protocol(HandshakePattern.N, CipherFunction.ChaChaPoly, HashFunction.Blake2b);
+            using var handshakeState = protocol.Create(true, rs: consumerPublicKeyBytes);
+            var handshakeMessage = new byte[HandshakeSize];
+            var (handshakeBytesWritten, _, transport) = handshakeState.WriteMessage(null, handshakeMessage);
+            handshakeMessage.CopyTo(packet.AsSpan(offset, HandshakeSize));
+            offset += HandshakeSize;
+
+            var encryptedChunkBuffer = ArrayPool<byte>.Shared.Rent(MaxPlaintextSize + TagSize);
+            int dataOffset = 0;
+            for (int i = 0; i < chunkCount; i++)
+            {
+                int chunkSize = Math.Min(MaxPlaintextSize, data.Length - dataOffset);
+                var plaintextSpan = data.AsSpan(dataOffset, chunkSize);
+                transport!.WriteMessage(plaintextSpan, encryptedChunkBuffer.AsSpan(0, chunkSize + TagSize));
+                BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(offset, 4), chunkSize + TagSize);
+                offset += 4;
+                encryptedChunkBuffer.AsSpan(0, chunkSize + TagSize).CopyTo(packet.AsSpan(offset));
+                offset += chunkSize + TagSize;
+                dataOffset += chunkSize;
+            }
+
+            ArrayPool<byte>.Shared.Return(encryptedChunkBuffer);
+            await SendAsync(Opcode.REQUEST_PUBLISH_RECORD, 0, packet, cancellationToken: cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            if (_pendingPublishRequests.TryRemove(requestId, out var errorTcs))
+                errorTcs.TrySetException(ex);
+            throw;
+        }
+
+        return await tcs.Task;
+    }
+
+    public async Task<(byte[] Data, DateTime Timestamp)?> GetRecordAsync(string publisherPublicKey, string key, CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrEmpty(key) || key.Length > 32)
+            throw new ArgumentException("Key must be non-empty and at most 32 bytes.", nameof(key));
+
+        var tcs = new TaskCompletionSource<(byte[] Data, DateTime Timestamp)?>();
+        var requestId = Interlocked.Increment(ref _requestIdGenerator);
+        _pendingGetRecordRequests[requestId] = tcs;
+
+        cancellationToken.Register(() =>
+        {
+            if (_pendingGetRecordRequests.TryRemove(requestId, out var cancelledTcs))
+                cancelledTcs.TrySetCanceled();
+        });
+
+        try
+        {
+            byte[] publisherPublicKeyBytes = Convert.FromBase64String(publisherPublicKey);
+            if (publisherPublicKeyBytes.Length != 32)
+                throw new ArgumentException("Publisher public key must be 32 bytes.", nameof(publisherPublicKey));
+
+            byte[] keyBytes = Encoding.UTF8.GetBytes(key);
+            int packetSize = 4 + 32 + 1 + keyBytes.Length;
+            var packet = new byte[packetSize];
+            int offset = 0;
+            BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(offset, 4), requestId);
+            offset += 4;
+            publisherPublicKeyBytes.CopyTo(packet.AsSpan(offset, 32));
+            offset += 32;
+            packet[offset] = (byte)keyBytes.Length;
+            offset += 1;
+            keyBytes.CopyTo(packet.AsSpan(offset, keyBytes.Length));
+
+            await SendAsync(Opcode.REQUEST_GET_RECORD, 0, packet, cancellationToken: cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            if (_pendingGetRecordRequests.TryRemove(requestId, out var errorTcs))
+                errorTcs.TrySetException(ex);
+            throw;
+        }
+
+        return await tcs.Task;
+    }
+
+    public async Task<Dictionary<string, (byte[] Data, DateTime Timestamp)>> GetRecordsAsync(IEnumerable<string> publisherPublicKeys, string key, CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrEmpty(key) || key.Length > 32)
+            throw new ArgumentException("Key must be non-empty and at most 32 bytes.", nameof(key));
+
+        var publishers = publisherPublicKeys.ToList();
+        if (publishers.Count == 0)
+            return new Dictionary<string, (byte[], DateTime)>();
+
+        var requestId = Interlocked.Increment(ref _requestIdGenerator);
+        var tcs = new TaskCompletionSource<Dictionary<string, (byte[], DateTime)>>();
+        _pendingBulkGetRecordRequests[requestId] = tcs;
+
+        cancellationToken.Register(() =>
+        {
+            if (_pendingBulkGetRecordRequests.TryRemove(requestId, out var cancelledTcs))
+                cancelledTcs.TrySetCanceled();
+        });
+
+        try
+        {
+            byte[] keyBytes = Encoding.UTF8.GetBytes(key);
+            int packetSize = 4 + 1 + keyBytes.Length + 1 + publishers.Count * 32;
+            var packet = new byte[packetSize];
+            int offset = 0;
+            BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(offset, 4), requestId);
+            offset += 4;
+            packet[offset] = (byte)keyBytes.Length;
+            offset += 1;
+            keyBytes.CopyTo(packet.AsSpan(offset, keyBytes.Length));
+            offset += keyBytes.Length;
+            packet[offset] = (byte)publishers.Count;
+            offset += 1;
+            foreach (var publisher in publishers)
+            {
+                byte[] publisherPublicKeyBytes = Convert.FromBase64String(publisher);
+                if (publisherPublicKeyBytes.Length != 32)
+                    throw new ArgumentException($"Publisher public key must be 32 bytes: {publisher}");
+                publisherPublicKeyBytes.CopyTo(packet.AsSpan(offset, 32));
+                offset += 32;
+            }
+
+            await SendAsync(Opcode.REQUEST_BULK_GET_RECORD, 0, packet, cancellationToken: cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            if (_pendingBulkGetRecordRequests.TryRemove(requestId, out var errorTcs))
+                errorTcs.TrySetException(ex);
+            throw;
+        }
+
+        return await tcs.Task;
+    }
+
+    public async Task<bool> DeleteRecordsAsync(string publisherPublicKey, string consumerPublicKey, IEnumerable<string> keys, CancellationToken cancellationToken = default)
+    {
+        var keyList = keys.ToList();
+        if (keyList.Any(k => Encoding.UTF8.GetByteCount(k) > 32))
+            throw new ArgumentException("Keys must be at most 32 bytes.", nameof(keys));
+
+        var tcs = new TaskCompletionSource<bool>();
+        var requestId = Interlocked.Increment(ref _requestIdGenerator);
+        _pendingDeleteRequests[requestId] = tcs;
+
+        cancellationToken.Register(() =>
+        {
+            if (_pendingDeleteRequests.TryRemove(requestId, out var cancelledTcs))
+                cancelledTcs.TrySetCanceled();
+        });
+
+        try
+        {
+            byte[] publisherPublicKeyBytes = Convert.FromBase64String(publisherPublicKey);
+            if (publisherPublicKeyBytes.Length != 32)
+                throw new ArgumentException("Publisher public key must be 32 bytes.", nameof(publisherPublicKey));
+
+            byte[] consumerPublicKeyBytes = Convert.FromBase64String(consumerPublicKey);
+            if (consumerPublicKeyBytes.Length != 32)
+                throw new ArgumentException("Consumer public key must be 32 bytes.", nameof(consumerPublicKey));
+
+            using var ms = new MemoryStream();
+            using var writer = new BinaryWriter(ms);
+            writer.Write(requestId); // 4 bytes: Request ID
+            writer.Write(publisherPublicKeyBytes); // 32 bytes: Publisher public key
+            writer.Write(consumerPublicKeyBytes); // 32 bytes: Consumer public key
+            writer.Write((byte)keyList.Count); // 1 byte: Number of keys (max 255)
+            foreach (var key in keyList)
+            {
+                byte[] keyBytes = Encoding.UTF8.GetBytes(key);
+                writer.Write((byte)keyBytes.Length); // 1 byte: Key length
+                writer.Write(keyBytes); // Variable: Key bytes
+            }
+            var packet = ms.ToArray();
+            await SendAsync(Opcode.REQUEST_BULK_DELETE_RECORD, 0, packet, cancellationToken: cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            if (_pendingDeleteRequests.TryRemove(requestId, out var errorTcs))
+                errorTcs.TrySetException(ex);
+            throw;
+        }
+
+        return await tcs.Task;
+    }
+
+    public Task<bool> DeleteRecordAsync(string publisherPublicKey, string consumerPublicKey, string key, CancellationToken cancellationToken = default)
+    {
+        if (key.Length > 32)
+            throw new ArgumentException("Key must be at most 32 bytes.", nameof(key));
+
+        var tcs = new TaskCompletionSource<bool>();
+        var requestId = Interlocked.Increment(ref _requestIdGenerator);
+        _pendingDeleteRequests[requestId] = tcs;
+
+        cancellationToken.Register(() =>
+        {
+            if (_pendingDeleteRequests.TryRemove(requestId, out var cancelledTcs))
+            {
+                cancelledTcs.TrySetCanceled();
+            }
+        });
+
+        try
+        {
+            byte[] publisherPublicKeyBytes = Convert.FromBase64String(publisherPublicKey);
+            if (publisherPublicKeyBytes.Length != 32)
+                throw new ArgumentException("Publisher public key must be 32 bytes.", nameof(publisherPublicKey));
+
+            byte[] consumerPublicKeyBytes = Convert.FromBase64String(consumerPublicKey);
+            if (consumerPublicKeyBytes.Length != 32)
+                throw new ArgumentException("Consumer public key must be 32 bytes.", nameof(consumerPublicKey));
+
+            byte[] keyBytes = Encoding.UTF8.GetBytes(key);
+            if (keyBytes.Length > 32)
+                throw new ArgumentException("Key must be at most 32 bytes.", nameof(key));
+
+            var packet = new byte[4 + 32 + 32 + 1 + keyBytes.Length];
+            int offset = 0;
+            BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(offset, 4), requestId);
+            offset += 4;
+            publisherPublicKeyBytes.CopyTo(packet.AsSpan(offset, 32));
+            offset += 32;
+            consumerPublicKeyBytes.CopyTo(packet.AsSpan(offset, 32));
+            offset += 32;
+            packet[offset] = (byte)keyBytes.Length;
+            offset += 1;
+            keyBytes.CopyTo(packet.AsSpan(offset, keyBytes.Length));
+
+            _ = SendAsync(Opcode.REQUEST_DELETE_RECORD, 0, packet, cancellationToken: cancellationToken)
+                .ContinueWith(t =>
+                {
+                    if (t.IsFaulted && _pendingDeleteRequests.TryRemove(requestId, out var failedTcs))
+                    {
+                        failedTcs.TrySetException(t.Exception!.InnerException!);
+                    }
+                });
+        }
+        catch (Exception ex)
+        {
+            if (_pendingDeleteRequests.TryRemove(requestId, out var errorTcs))
+            {
+                errorTcs.TrySetException(ex);
+            }
+            throw;
+        }
+
+        return tcs.Task;
+    }
+
+    public Task<List<(string Key, DateTime Timestamp)>> ListRecordKeysAsync(string publisherPublicKey, string consumerPublicKey, CancellationToken cancellationToken = default)
+    {
+        var tcs = new TaskCompletionSource<List<(string Key, DateTime Timestamp)>>();
+        var requestId = Interlocked.Increment(ref _requestIdGenerator);
+        _pendingListKeysRequests[requestId] = tcs;
+
+        cancellationToken.Register(() =>
+        {
+            if (_pendingListKeysRequests.TryRemove(requestId, out var cancelledTcs))
+            {
+                cancelledTcs.TrySetCanceled();
+            }
+        });
+
+        try
+        {
+            byte[] publisherPublicKeyBytes = Convert.FromBase64String(publisherPublicKey);
+            if (publisherPublicKeyBytes.Length != 32)
+                throw new ArgumentException("Publisher public key must be 32 bytes.", nameof(publisherPublicKey));
+
+            byte[] consumerPublicKeyBytes = Convert.FromBase64String(consumerPublicKey);
+            if (consumerPublicKeyBytes.Length != 32)
+                throw new ArgumentException("Consumer public key must be 32 bytes.", nameof(consumerPublicKey));
+
+            var packet = new byte[4 + 32 + 32];
+            BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(0, 4), requestId);
+            publisherPublicKeyBytes.CopyTo(packet.AsSpan(4, 32));
+            consumerPublicKeyBytes.CopyTo(packet.AsSpan(36, 32));
+
+            _ = SendAsync(Opcode.REQUEST_LIST_RECORD_KEYS, 0, packet, cancellationToken: cancellationToken)
+                .ContinueWith(t =>
+                {
+                    if (t.IsFaulted && _pendingListKeysRequests.TryRemove(requestId, out var failedTcs))
+                    {
+                        failedTcs.TrySetException(t.Exception!.InnerException!);
+                    }
+                });
+        }
+        catch (Exception ex)
+        {
+            if (_pendingListKeysRequests.TryRemove(requestId, out var errorTcs))
+            {
+                errorTcs.TrySetException(ex);
+            }
+            throw;
+        }
+
+        return tcs.Task;
+    }
+
     public void Dispose()
     {
+        foreach (var kvp in _pendingConnectionInfoRequests)
+            kvp.Value.TrySetCanceled();
+        _pendingConnectionInfoRequests.Clear();
+
+        foreach (var kvp in _pendingPublishRequests)
+            kvp.Value.TrySetCanceled();
+        _pendingPublishRequests.Clear();
+
+        foreach (var kvp in _pendingDeleteRequests)
+            kvp.Value.TrySetCanceled();
+        _pendingDeleteRequests.Clear();
+
+        foreach (var kvp in _pendingListKeysRequests)
+            kvp.Value.TrySetCanceled();
+        _pendingListKeysRequests.Clear();
+
+        foreach (var kvp in _pendingGetRecordRequests)
+            kvp.Value.TrySetCanceled();
+        _pendingGetRecordRequests.Clear();
+
+        foreach (var kvp in _pendingBulkConnectionInfoRequests)
+            kvp.Value.TrySetCanceled();
+        _pendingBulkConnectionInfoRequests.Clear();
+
+        foreach (var kvp in _pendingChannels)
+        {
+            kvp.Value.Tcs.TrySetCanceled();
+            kvp.Value.Channel.Dispose();
+        }
+        _pendingChannels.Clear();
+
         lock (_syncStreams)
         {
+            foreach (var pair in _syncStreams)
+                pair.Value.Dispose();
             _syncStreams.Clear();
         }
 
@@ -1203,7 +2101,13 @@ public class SyncSocketSession : IDisposable
             pair.Channel.Dispose();
         _pendingChannels.Clear();
 
-        Stop();
+        _started = false;
+        _onClose(this);
+        _inputStream.Close();
+        _outputStream.Close();
+        _transport?.Dispose();
+        _thread = null;
+        Logger.Info<SyncSocketSession>("Session closed");
     }
 
     public const int MAXIMUM_PACKET_SIZE = 65535 - 16;
