@@ -877,6 +877,7 @@ public class SyncSession
                 using var ms = new MemoryStream();
                 using var writer = new BinaryWriter(ms);
                 writer.Write(requestId);
+                writer.Write((byte)0);
                 writer.Write(keys.Count());
                 foreach (var (key, timestamp) in keys)
                 {

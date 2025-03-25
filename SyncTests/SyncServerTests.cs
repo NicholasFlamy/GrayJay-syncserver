@@ -32,7 +32,7 @@ namespace SyncServerTests
             int port,
             string serverPublicKey,
             Action<SyncSocketSession>? onHandshakeComplete = null,
-            Action<SyncSocketSession, Opcode, byte, byte[]>? onData = null,
+            Action<SyncSocketSession, Opcode, byte, ReadOnlySpan<byte>>? onData = null,
             Action<SyncSocketSession, Channel>? onNewChannel = null)
         {
             var keyPair = KeyPair.Generate();
@@ -208,11 +208,11 @@ namespace SyncServerTests
                 await channelTask;
 
                 var tcsDataB = new TaskCompletionSource<byte[]>();
-                channelB.SetDataHandler((s, c, o, so, d) => tcsDataB.SetResult(d));
+                channelB.SetDataHandler((s, c, o, so, d) => tcsDataB.SetResult(d.ToArray()));
                 await channelA.SendRelayedDataAsync(Opcode.DATA, 0, new byte[] { 1, 2, 3 });
 
                 var tcsDataA = new TaskCompletionSource<byte[]>();
-                channelA.SetDataHandler((s, c, o, so, d) => tcsDataA.SetResult(d));
+                channelA.SetDataHandler((s, c, o, so, d) => tcsDataA.SetResult(d.ToArray()));
                 await channelB.SendRelayedDataAsync(Opcode.DATA, 0, new byte[] { 4, 5, 6 });
 
                 var receivedB = await tcsDataB.Task.WithTimeout(5000, "Data to B timed out");
@@ -241,7 +241,7 @@ namespace SyncServerTests
                 await channelTask;
 
                 var tcsDataB = new TaskCompletionSource<byte[]>();
-                channelB.SetDataHandler((s, c, o, so, d) => tcsDataB.SetResult(d));
+                channelB.SetDataHandler((s, c, o, so, d) => tcsDataB.SetResult(d.ToArray()));
                 await channelA.SendRelayedDataAsync(Opcode.DATA, 0, maxSizeData);
                 var receivedData = await tcsDataB.Task.WithTimeout(5000, "Max size data timed out");
                 CollectionAssert.AreEqual(maxSizeData, receivedData);
@@ -264,7 +264,7 @@ namespace SyncServerTests
                 await channelTask;
 
                 var tcsDataB = new TaskCompletionSource<byte[]>();
-                channelB.SetDataHandler((s, c, o, so, d) => tcsDataB.SetResult(d));
+                channelB.SetDataHandler((s, c, o, so, d) => tcsDataB.SetResult(d.ToArray()));
                 await channelA.SendRelayedDataAsync(Opcode.DATA, 0, Array.Empty<byte>());
                 var receivedData = await tcsDataB.Task.WithTimeout(5000, "Zero-byte data timed out");
                 Assert.AreEqual(0, receivedData.Length);
@@ -303,9 +303,9 @@ namespace SyncServerTests
                 await channelTask2;
 
                 var tcsDataB1 = new TaskCompletionSource<byte[]>();
-                channelB1.SetDataHandler((s, c, o, so, d) => tcsDataB1.SetResult(d));
+                channelB1.SetDataHandler((s, c, o, so, d) => tcsDataB1.SetResult(d.ToArray()));
                 var tcsDataB2 = new TaskCompletionSource<byte[]>();
-                channelB2.SetDataHandler((s, c, o, so, d) => tcsDataB2.SetResult(d));
+                channelB2.SetDataHandler((s, c, o, so, d) => tcsDataB2.SetResult(d.ToArray()));
 
                 await channelA1.SendRelayedDataAsync(Opcode.DATA, 0, new byte[] { 1 });
                 await channelA2.SendRelayedDataAsync(Opcode.DATA, 0, new byte[] { 2 });
@@ -545,7 +545,7 @@ namespace SyncServerTests
                 await channelTask;
 
                 var tcsDataB = new TaskCompletionSource<byte[]>();
-                channelB.SetDataHandler((s, c, o, so, d) => tcsDataB.SetResult(d));
+                channelB.SetDataHandler((s, c, o, so, d) => tcsDataB.SetResult(d.ToArray()));
                 await channelA.SendRelayedDataAsync(Opcode.DATA, 0, largeData);
                 var receivedData = await tcsDataB.Task.WithTimeout(10000, "Receiving large data timed out");
                 CollectionAssert.AreEqual(largeData, receivedData);
@@ -577,9 +577,9 @@ namespace SyncServerTests
                 channelB.SetDataHandler((s, c, o, so, d) =>
                 {
                     if (Interlocked.Increment(ref receivedCount) == 1)
-                        tcsDataB1.SetResult(d);
+                        tcsDataB1.SetResult(d.ToArray());
                     else
-                        tcsDataB2.SetResult(d);
+                        tcsDataB2.SetResult(d.ToArray());
                 });
 
                 var sendTask1 = channelA.SendRelayedDataAsync(Opcode.DATA, 0, largeData1);
@@ -618,7 +618,7 @@ namespace SyncServerTests
                 {
                     lock (receivedMessages)
                     {
-                        receivedMessages.Add(d);
+                        receivedMessages.Add(d.ToArray());
                         if (receivedMessages.Count == 3)
                             tcsAllReceived.SetResult(true);
                     }
@@ -655,7 +655,7 @@ namespace SyncServerTests
                 {
                     c.SetDataHandler((s, c, o, so, d) =>
                     {
-                        if (o == Opcode.DATA && so == 0) tcsLargeReceived.SetResult(d);
+                        if (o == Opcode.DATA && so == 0) tcsLargeReceived.SetResult(d.ToArray());
                         else if (o == Opcode.DATA && so == 1) tcsCustomPingReceived.SetResult(true);
                     });
                 });

@@ -142,7 +142,7 @@ internal class Program
 
                     if (subOpcode == 0)
                     {
-                        if (!TestData.SequenceEqual(data))
+                        if (!TestData.AsSpan().SequenceEqual(data))
                             throw new Exception("Data has been corrupted");
                         c.SendRelayedDataAsync(Opcode.DATA, 1, [4, 5, 6]);
                     }

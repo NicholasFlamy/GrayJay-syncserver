@@ -108,6 +108,136 @@ namespace SyncServer.Tests
             Assert.IsTrue(keyList.Contains("key1"));
             Assert.IsTrue(keyList.Contains("key2"));
         }
+
+        [TestMethod]
+        public async Task DeleteAsync_RemovesExistingRecord()
+        {
+            // Arrange
+            using var repo = await CreateRepositoryAsync();
+            var publisherKey = new byte[] { 1, 2, 3 };
+            var consumerKey = new byte[] { 4, 5, 6 };
+            var key = "testKey";
+            var blob = new byte[] { 7, 8, 9 };
+            await repo.InsertOrUpdateAsync(publisherKey, consumerKey, key, blob);
+            var recordBefore = await repo.GetAsync(publisherKey, consumerKey, key);
+            Assert.IsNotNull(recordBefore, "Record should exist before deletion.");
+
+            // Act
+            await repo.DeleteAsync(publisherKey, consumerKey, key);
+
+            // Assert
+            var recordAfter = await repo.GetAsync(publisherKey, consumerKey, key);
+            Assert.IsNull(recordAfter, "Record should be null after deletion.");
+        }
+
+        [TestMethod]
+        public async Task DeleteAsync_NonExistentRecord_DoesNothing()
+        {
+            // Arrange
+            using var repo = await CreateRepositoryAsync();
+            var publisherKey = new byte[] { 1, 2, 3 };
+            var consumerKey = new byte[] { 4, 5, 6 };
+            var key = "nonExistentKey";
+
+            // Act
+            await repo.DeleteAsync(publisherKey, consumerKey, key);
+
+            // Assert
+            var anotherKey = "anotherKey";
+            var blob = new byte[] { 7, 8, 9 };
+            await repo.InsertOrUpdateAsync(publisherKey, consumerKey, anotherKey, blob);
+            var record = await repo.GetAsync(publisherKey, consumerKey, anotherKey);
+            Assert.IsNotNull(record, "Other records should remain unaffected.");
+        }
+
+        [TestMethod]
+        public async Task GetByPublishersAsync_ReturnsCorrectRecords()
+        {
+            // Arrange
+            using var repo = await CreateRepositoryAsync();
+            var consumerKey = new byte[] { 4, 5, 6 };
+            var publisherKey1 = new byte[] { 1, 2, 3 };
+            var publisherKey2 = new byte[] { 7, 8, 9 };
+            var key = "testKey";
+            var blob1 = new byte[] { 10, 11, 12 };
+            var blob2 = new byte[] { 13, 14, 15 };
+            await repo.InsertOrUpdateAsync(publisherKey1, consumerKey, key, blob1);
+            await repo.InsertOrUpdateAsync(publisherKey2, consumerKey, key, blob2);
+
+            // Act
+            var records = await repo.GetByPublishersAsync(consumerKey, new[] { publisherKey1, publisherKey2 }, key);
+
+            // Assert
+            var recordList = records.ToList();
+            Assert.AreEqual(2, recordList.Count, "Should return exactly 2 records.");
+            var record1 = recordList.FirstOrDefault(r => r.PublisherPublicKey.SequenceEqual(publisherKey1));
+            var record2 = recordList.FirstOrDefault(r => r.PublisherPublicKey.SequenceEqual(publisherKey2));
+            Assert.IsNotNull(record1, "Record for publisherKey1 should exist.");
+            Assert.IsNotNull(record2, "Record for publisherKey2 should exist.");
+            Assert.IsTrue(record1.EncryptedBlob.SequenceEqual(blob1), "Blob for publisherKey1 should match.");
+            Assert.IsTrue(record2.EncryptedBlob.SequenceEqual(blob2), "Blob for publisherKey2 should match.");
+        }
+
+        [TestMethod]
+        public async Task GetByPublishersAsync_NoRecords_ReturnsEmpty()
+        {
+            // Arrange
+            using var repo = await CreateRepositoryAsync();
+            var consumerKey = new byte[] { 4, 5, 6 };
+            var publisherKeys = new[] { new byte[] { 1, 2, 3 }, new byte[] { 7, 8, 9 } };
+            var key = "testKey";
+
+            // Act
+            var records = await repo.GetByPublishersAsync(consumerKey, publisherKeys, key);
+
+            // Assert
+            Assert.AreEqual(0, records.Count(), "Should return an empty collection when no records exist.");
+        }
+
+        [TestMethod]
+        public async Task BulkDeleteAsync_DeletesSpecifiedRecords()
+        {
+            // Arrange
+            using var repo = await CreateRepositoryAsync();
+            var publisherKey = new byte[] { 1, 2, 3 };
+            var consumerKey = new byte[] { 4, 5, 6 };
+            var keys = new[] { "key1", "key2", "key3" };
+            var blobs = new[] { new byte[] { 7, 8, 9 }, new byte[] { 10, 11, 12 }, new byte[] { 13, 14, 15 } };
+            for (int i = 0; i < keys.Length; i++)
+            {
+                await repo.InsertOrUpdateAsync(publisherKey, consumerKey, keys[i], blobs[i]);
+            }
+
+            // Act
+            await repo.BulkDeleteAsync(publisherKey, consumerKey, new[] { "key1", "key3" });
+
+            // Assert
+            var record1 = await repo.GetAsync(publisherKey, consumerKey, "key1");
+            var record2 = await repo.GetAsync(publisherKey, consumerKey, "key2");
+            var record3 = await repo.GetAsync(publisherKey, consumerKey, "key3");
+            Assert.IsNull(record1, "key1 should be deleted.");
+            Assert.IsNotNull(record2, "key2 should remain.");
+            Assert.IsNull(record3, "key3 should be deleted.");
+        }
+
+        [TestMethod]
+        public async Task BulkDeleteAsync_NonExistentKeys_DoesNothing()
+        {
+            // Arrange
+            using var repo = await CreateRepositoryAsync();
+            var publisherKey = new byte[] { 1, 2, 3 };
+            var consumerKey = new byte[] { 4, 5, 6 };
+            var existingKey = "existingKey";
+            var blob = new byte[] { 7, 8, 9 };
+            await repo.InsertOrUpdateAsync(publisherKey, consumerKey, existingKey, blob);
+
+            // Act
+            await repo.BulkDeleteAsync(publisherKey, consumerKey, new[] { "nonExistentKey1", "nonExistentKey2" });
+
+            // Assert
+            var record = await repo.GetAsync(publisherKey, consumerKey, existingKey);
+            Assert.IsNotNull(record, "Existing record should remain unaffected.");
+        }
     }
 
     [TestClass]
