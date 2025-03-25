@@ -92,7 +92,7 @@ public class SyncSocketSession : IDisposable
     private readonly byte[] _buffer = new byte[MAXIMUM_PACKET_SIZE_ENCRYPTED];
     private readonly byte[] _bufferDecrypted = new byte[MAXIMUM_PACKET_SIZE];
     private readonly byte[] _sendBuffer = new byte[MAXIMUM_PACKET_SIZE];
-    private readonly byte[] _sendBufferEncrypted = new byte[MAXIMUM_PACKET_SIZE_ENCRYPTED];
+    private readonly byte[] _sendBufferEncrypted = new byte[MAXIMUM_PACKET_SIZE_ENCRYPTED + 4]; //+4 to leave room for size prefix
     private readonly Dictionary<int, SyncStream> _syncStreams = new();
     private int _streamIdGenerator = 0;
     private readonly Action<SyncSocketSession> _onClose;
@@ -188,14 +188,15 @@ public class SyncSocketSession : IDisposable
 
     private void ReceiveLoop()
     {
+        byte[] messageSizeBytes = new byte[4];
         while (_started)
         {
             try
             {
-                byte[] messageSizeBytes = new byte[4];
                 if (Read(messageSizeBytes, 0, 4) != 4)
                     throw new Exception("Expected exactly 4 bytes");
-                int messageSize = BitConverter.ToInt32(messageSizeBytes, 0);
+
+                int messageSize = BinaryPrimitives.ReadInt32LittleEndian(messageSizeBytes.AsSpan(0, 4));
                 if (messageSize == 0)
                     throw new Exception("Disconnected.");
 
@@ -235,13 +236,13 @@ public class SyncSocketSession : IDisposable
     {
         PerformVersionCheck();
 
-        var message = new byte[Protocol.MaxMessageLength];
-        var plaintext = new byte[Protocol.MaxMessageLength];
+        var message = new byte[512];
+        var plaintext = new byte[512];
         using (var handshakeState = _protocol.Create(true, s: _localKeyPair.PrivateKey, rs: Convert.FromBase64String(remotePublicKey)))
         {
-            var (bytesWritten, _, _) = handshakeState.WriteMessage(null, message);
-            Send(BitConverter.GetBytes(bytesWritten));
-            Send(message, 0, bytesWritten);
+            var (bytesWritten, _, _) = handshakeState.WriteMessage(null, message.AsSpan(4));
+            BinaryPrimitives.WriteInt32LittleEndian(message.AsSpan(0, 4), bytesWritten);
+            Send(message, 0, bytesWritten + 4);
             Logger.Info<SyncSocketSession>($"HandshakeAsInitiator: Wrote message size {bytesWritten}");
 
             var bytesRead = Read(message, 0, 4);
@@ -270,15 +271,15 @@ public class SyncSocketSession : IDisposable
     {
         PerformVersionCheck();
 
-        var message = new byte[Protocol.MaxMessageLength];
-        var plaintext = new byte[Protocol.MaxMessageLength];
+        var message = new byte[512];
+        var plaintext = new byte[512];
         using (var handshakeState = _protocol.Create(false, s: _localKeyPair.PrivateKey))
         {
             var bytesRead = Read(message, 0, 4);
             if (bytesRead != 4)
                 throw new Exception($"Expected exactly 4 bytes (message size), read {bytesRead}");
 
-            var messageSize = BitConverter.ToInt32(message);
+            var messageSize = BinaryPrimitives.ReadInt32LittleEndian(message.AsSpan(0, 4));
             Logger.Info<SyncSocketSession>($"HandshakeAsResponder: Read message size {messageSize}");
 
             bytesRead = 0;
@@ -292,9 +293,9 @@ public class SyncSocketSession : IDisposable
 
             var (_, _, _) = handshakeState.ReadMessage(message.AsSpan().Slice(0, messageSize), plaintext);
 
-            var (bytesWritten, _, transport) = handshakeState.WriteMessage(null, message);
-            Send(BitConverter.GetBytes(bytesWritten));
-            Send(message, 0, bytesWritten);
+            var (bytesWritten, _, transport) = handshakeState.WriteMessage(null, message.AsSpan(4));
+            BinaryPrimitives.WriteInt32LittleEndian(message.AsSpan(0, 4), bytesWritten);
+            Send(message, 0, bytesWritten + 4);
             Logger.Info<SyncSocketSession>($"HandshakeAsResponder: Wrote message size {bytesWritten}");
 
             _transport = transport;
@@ -303,16 +304,17 @@ public class SyncSocketSession : IDisposable
         }
     }
 
+    private const int CURRENT_VERSION = 3;
+    private static readonly byte[] VERSION_BYTES = BitConverter.GetBytes(CURRENT_VERSION);
     private void PerformVersionCheck()
     {
-        const int CURRENT_VERSION = 3;
         const int MINIMUM_VERSION = 2;
-        Send(BitConverter.GetBytes(CURRENT_VERSION), 0, 4);
+        Send(VERSION_BYTES, 0, 4);
         byte[] versionBytes = new byte[4];
         int bytesRead = Read(versionBytes, 0, 4);
         if (bytesRead != 4)
             throw new Exception($"Expected 4 bytes to be read, read {bytesRead}");
-        RemoteVersion = BitConverter.ToInt32(versionBytes, 0);
+        RemoteVersion = BinaryPrimitives.ReadInt32LittleEndian(versionBytes.AsSpan(0, 4));
         Logger.Info(nameof(SyncSocketSession), $"PerformVersionCheck {RemoteVersion}");
         if (RemoteVersion < MINIMUM_VERSION)
             throw new Exception("Invalid version");
@@ -376,52 +378,59 @@ public class SyncSocketSession : IDisposable
         if (size + HEADER_SIZE > MAXIMUM_PACKET_SIZE)
         {
             var segmentSize = MAXIMUM_PACKET_SIZE - HEADER_SIZE;
-            var segmentData = new byte[segmentSize];
             var id = Interlocked.Increment(ref _streamIdGenerator);
+            var segmentData = Utilities.RentBytes(segmentSize);
 
-            for (var sendOffset = 0; sendOffset < size;)
+            try
             {
-                var bytesRemaining = size - sendOffset;
-                int bytesToSend;
-                int segmentPacketSize;
+                for (var sendOffset = 0; sendOffset < size;)
+                {
+                    var bytesRemaining = size - sendOffset;
+                    int bytesToSend;
+                    int segmentPacketSize;
 
-                Opcode op;
-                if (sendOffset == 0)
-                {
-                    op = Opcode.STREAM_START;
-                    bytesToSend = segmentSize - 4 - 4 - 1 - 1;
-                    segmentPacketSize = bytesToSend + 4 + 4 + 1 + 1;
-                }
-                else
-                {
-                    bytesToSend = Math.Min(segmentSize - 4 - 4, bytesRemaining);
-                    if (bytesToSend >= bytesRemaining)
-                        op = Opcode.STREAM_END;
+                    Opcode op;
+                    if (sendOffset == 0)
+                    {
+                        op = Opcode.STREAM_START;
+                        bytesToSend = segmentSize - 4 - 4 - 1 - 1;
+                        segmentPacketSize = bytesToSend + 4 + 4 + 1 + 1;
+                    }
                     else
-                        op = Opcode.STREAM_DATA;
+                    {
+                        bytesToSend = Math.Min(segmentSize - 4 - 4, bytesRemaining);
+                        if (bytesToSend >= bytesRemaining)
+                            op = Opcode.STREAM_END;
+                        else
+                            op = Opcode.STREAM_DATA;
 
-                    segmentPacketSize = bytesToSend + 4 + 4;
-                }
+                        segmentPacketSize = bytesToSend + 4 + 4;
+                    }
 
-                if (op == Opcode.STREAM_START)
-                {
-                    //TODO: replace segmentData.AsSpan() into a local variable once C# 13
-                    BinaryPrimitives.WriteInt32LittleEndian(segmentData.AsSpan().Slice(0, 4), id);
-                    BinaryPrimitives.WriteInt32LittleEndian(segmentData.AsSpan().Slice(4, 4), size);
-                    segmentData[8] = (byte)opcode;
-                    segmentData[9] = (byte)subOpcode;
-                    data.AsSpan(offset, size).Slice(sendOffset, bytesToSend).CopyTo(segmentData.AsSpan().Slice(10));
-                }
-                else
-                {
-                    //TODO: replace segmentData.AsSpan() into a local variable once C# 13
-                    BinaryPrimitives.WriteInt32LittleEndian(segmentData.AsSpan().Slice(0, 4), id);
-                    BinaryPrimitives.WriteInt32LittleEndian(segmentData.AsSpan().Slice(4, 4), sendOffset);
-                    data.AsSpan(offset, size).Slice(sendOffset, bytesToSend).CopyTo(segmentData.AsSpan().Slice(8));
-                }
+                    if (op == Opcode.STREAM_START)
+                    {
+                        //TODO: replace segmentData.AsSpan() into a local variable once C# 13
+                        BinaryPrimitives.WriteInt32LittleEndian(segmentData.AsSpan().Slice(0, 4), id);
+                        BinaryPrimitives.WriteInt32LittleEndian(segmentData.AsSpan().Slice(4, 4), size);
+                        segmentData[8] = (byte)opcode;
+                        segmentData[9] = (byte)subOpcode;
+                        data.AsSpan(offset, size).Slice(sendOffset, bytesToSend).CopyTo(segmentData.AsSpan().Slice(10));
+                    }
+                    else
+                    {
+                        //TODO: replace segmentData.AsSpan() into a local variable once C# 13
+                        BinaryPrimitives.WriteInt32LittleEndian(segmentData.AsSpan().Slice(0, 4), id);
+                        BinaryPrimitives.WriteInt32LittleEndian(segmentData.AsSpan().Slice(4, 4), sendOffset);
+                        data.AsSpan(offset, size).Slice(sendOffset, bytesToSend).CopyTo(segmentData.AsSpan().Slice(8));
+                    }
 
-                sendOffset += bytesToSend;
-                await SendAsync((byte)op, 0, segmentData.AsSpan().Slice(0, segmentPacketSize).ToArray(), cancellationToken: cancellationToken);
+                    sendOffset += bytesToSend;
+                    await SendAsync((byte)op, 0, segmentData.AsSpan().Slice(0, segmentPacketSize).ToArray(), cancellationToken: cancellationToken);
+                }
+            }
+            finally
+            {
+                Utilities.ReturnBytes(segmentData);
             }
         }
         else
@@ -430,7 +439,7 @@ public class SyncSocketSession : IDisposable
             {
                 await _sendSemaphore.WaitAsync();
 
-                Array.Copy(BitConverter.GetBytes(data.Length + 2), 0, _sendBuffer, 0, 4);
+                BinaryPrimitives.WriteInt32LittleEndian(_sendBuffer.AsSpan(0, 4), data.Length + 2);
                 _sendBuffer[4] = (byte)opcode;
                 _sendBuffer[5] = (byte)subOpcode;
                 data.CopyTo(_sendBuffer.AsSpan().Slice(HEADER_SIZE));
@@ -438,15 +447,10 @@ public class SyncSocketSession : IDisposable
                 if (Logger.WillLog(LogLevel.Debug))
                     Logger.Debug<SyncSocketSession>($"Encrypted message bytes {data.Length + HEADER_SIZE}");
 
-                var len = Encrypt(_sendBuffer.AsSpan().Slice(0, data.Length + HEADER_SIZE), _sendBufferEncrypted);
+                var len = Encrypt(_sendBuffer.AsSpan().Slice(0, data.Length + HEADER_SIZE), _sendBufferEncrypted.AsSpan(4));
 
-                Send(BitConverter.GetBytes(len), 0, 4);
-
-                if (Logger.WillLog(LogLevel.Debug))
-                    Logger.Debug<SyncSocketSession>($"Wrote message size {len}");
-
-                Send(_sendBufferEncrypted, 0, len);
-
+                BinaryPrimitives.WriteInt32LittleEndian(_sendBufferEncrypted.AsSpan(0, 4), len);
+                Send(_sendBufferEncrypted, 0, len + 4);
                 if (Logger.WillLog(LogLevel.Debug))
                     Logger.Debug<SyncSocketSession>($"Wrote message bytes {len}");
             }
@@ -498,9 +502,7 @@ public class SyncSocketSession : IDisposable
 
         byte opcode = data[4];
         byte subOpcode = data[5];
-        byte[] packetData = new byte[size - 2];
-        Array.Copy(data, HEADER_SIZE, packetData, 0, size - 2);
-
+        ReadOnlySpan<byte> packetData = data.AsSpan(HEADER_SIZE, size - 2);
         HandlePacket((Opcode)opcode, subOpcode, packetData, sourceChannel);
     }
 
