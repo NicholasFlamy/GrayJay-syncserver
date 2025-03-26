@@ -375,6 +375,9 @@ public class SyncSocketSession : IDisposable
         if (size == -1)
             size = data.Length;
 
+        if (Logger.WillLog(LogLevel.Verbose))
+            Logger.Verbose<SyncSocketSession>($"SendAsync (opcode = {opcode}, subOpcode = {subOpcode}, size = {size})");
+
         if (size + HEADER_SIZE > MAXIMUM_PACKET_SIZE)
         {
             var segmentSize = MAXIMUM_PACKET_SIZE - HEADER_SIZE;
@@ -463,6 +466,9 @@ public class SyncSocketSession : IDisposable
 
     public async Task SendAsync(Opcode opcode, byte subOpcode = 0, CancellationToken cancellationToken = default)
     {
+        if (Logger.WillLog(LogLevel.Verbose))
+            Logger.Verbose<SyncSocketSession>($"SendAsync (opcode = {opcode}, subOpcode = {subOpcode}, size = 0)");
+
         try
         {
             await _sendSemaphore.WaitAsync(cancellationToken);
@@ -740,6 +746,9 @@ public class SyncSocketSession : IDisposable
 
     private void HandlePacket(Opcode opcode, byte subOpcode, ReadOnlySpan<byte> data, Channel? sourceChannel = null)
     {
+        if (Logger.WillLog(LogLevel.Verbose))
+            Logger.Verbose<SyncSocketSession>($"HandlePacket (opcode = {opcode}, subOpcode = {subOpcode}, data.length = {data.Length}, sourceChannel.ConnectionId = {sourceChannel?.ConnectionId})");
+
         switch (opcode)
         {
             case Opcode.PING:

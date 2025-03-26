@@ -5,8 +5,8 @@ namespace SyncShared;
 
 public static class Utilities
 {
-    private static long _totalRented = 0;
-    public static long _totalReturned = 0;
+    public static long TotalRented = 0;
+    public static long TotalReturned = 0;
 
     public static string HexDump(this ReadOnlySpan<byte> data)
     {
@@ -58,20 +58,18 @@ public static class Utilities
     {
         var rentedBytes = ArrayPool<byte>.Shared.Rent(minimumSize);
         if (Logger.WillLog(LogLevel.Debug))
-        {
-            _totalRented += rentedBytes.Length;
-            Logger.Debug(nameof(Utilities), $"Rented {rentedBytes.Length} bytes (requested: {minimumSize}, total rented: {_totalRented}, total returned: {_totalReturned})");
-        }
+            Logger.Debug(nameof(Utilities), $"Rented {rentedBytes.Length} bytes (requested: {minimumSize}, total rented: {TotalRented}, total returned: {TotalReturned})");
+
+        Interlocked.Add(ref TotalRented, rentedBytes.Length);
         return rentedBytes;
     }
 
     public static void ReturnBytes(byte[] rentedBytes, bool clearArray = false)
     {
         if (Logger.WillLog(LogLevel.Debug))
-        {
-            _totalReturned += rentedBytes.Length;
-            Logger.Debug(nameof(Utilities), $"Returned {rentedBytes.Length} bytes (total rented: {_totalRented}, total returned: {_totalReturned})");
-        }
+            Logger.Debug(nameof(Utilities), $"Returned {rentedBytes.Length} bytes (total rented: {TotalRented}, total returned: {TotalReturned})");
+
+        Interlocked.Add(ref TotalReturned, rentedBytes.Length);
         ArrayPool<byte>.Shared.Return(rentedBytes, clearArray);
     }
 }

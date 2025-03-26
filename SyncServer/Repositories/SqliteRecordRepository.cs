@@ -38,25 +38,26 @@ public class SqliteRecordRepository : IRecordRepository
 
     private readonly string _connectionString;
     private readonly MemoryCache _recordCache;
-    private readonly MemoryCacheOptions _cacheOptions;
     private readonly ConcurrentQueue<SqliteConnection> _connectionPool;
     private readonly SemaphoreSlim _connectionSemaphore;
     private readonly int _poolSize;
-    private readonly ConcurrentDictionary<byte[], long> _userIdCache;
+    private readonly MemoryCache _userIdCache;
 
     public SqliteRecordRepository(
         string connectionString,
-        int maxCacheSize = 10000,
-        int poolSize = 10,
-        int maxConnections = 20)
+        int maxCacheSize = 50000,
+        int userIdCacheSize = 100000,
+        int poolSize = 20,
+        int maxConnections = 50)
     {
         _connectionString = connectionString ?? throw new ArgumentNullException(nameof(connectionString));
         _poolSize = poolSize;
         _connectionPool = new ConcurrentQueue<SqliteConnection>();
         _connectionSemaphore = new SemaphoreSlim(poolSize, maxConnections);
-        _userIdCache = new ConcurrentDictionary<byte[], long>(new ByteArrayComparer());
-        _cacheOptions = new MemoryCacheOptions { SizeLimit = maxCacheSize };
-        _recordCache = new MemoryCache(_cacheOptions);
+        var userIdCacheOptions = new MemoryCacheOptions { SizeLimit = userIdCacheSize };
+        _userIdCache = new MemoryCache(userIdCacheOptions); 
+        var recordCacheOptions = new MemoryCacheOptions { SizeLimit = maxCacheSize };
+        _recordCache = new MemoryCache(recordCacheOptions);
     }
 
     public async Task InitializeAsync()
@@ -71,21 +72,23 @@ public class SqliteRecordRepository : IRecordRepository
         await connection.OpenAsync();
         using var command = connection.CreateCommand();
         command.CommandText = @"
-                CREATE TABLE IF NOT EXISTS users (
-                    user_id INTEGER PRIMARY KEY,
-                    public_key BLOB UNIQUE
-                );
-                CREATE TABLE IF NOT EXISTS records (
-                    publisher_id INTEGER NOT NULL,
-                    consumer_id INTEGER NOT NULL,
-                    key TEXT NOT NULL,
-                    encrypted_blob BLOB NOT NULL,
-                    timestamp DATETIME NOT NULL,
-                    PRIMARY KEY (publisher_id, consumer_id, key),
-                    FOREIGN KEY (publisher_id) REFERENCES users(user_id),
-                    FOREIGN KEY (consumer_id) REFERENCES users(user_id)
-                );
-                PRAGMA journal_mode=WAL;";
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                public_key BLOB UNIQUE
+            );
+            CREATE TABLE IF NOT EXISTS records (
+                publisher_id INTEGER NOT NULL,
+                consumer_id INTEGER NOT NULL,
+                key TEXT NOT NULL,
+                encrypted_blob BLOB NOT NULL,
+                timestamp DATETIME NOT NULL,
+                PRIMARY KEY (publisher_id, consumer_id, key),
+                FOREIGN KEY (publisher_id) REFERENCES users(user_id),
+                FOREIGN KEY (consumer_id) REFERENCES users(user_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_records_publisher_id ON records (publisher_id);
+            CREATE INDEX IF NOT EXISTS idx_records_consumer_id ON records (consumer_id);
+            PRAGMA journal_mode=WAL;";
         await command.ExecuteNonQueryAsync();
     }
 
@@ -125,6 +128,27 @@ public class SqliteRecordRepository : IRecordRepository
         _connectionSemaphore.Release();
     }
 
+    public async Task<long> GetTotalSizeAsync(byte[] publisherPublicKey)
+    {
+        var connection = await GetConnectionAsync();
+        try
+        {
+            var publisherId = await GetOrCreateUserIdAsync(publisherPublicKey, connection);
+            using var command = connection.CreateCommand();
+            command.CommandText = @"
+                SELECT SUM(LENGTH(encrypted_blob)) 
+                FROM records 
+                WHERE publisher_id = @publisherId";
+            command.Parameters.AddWithValue("@publisherId", publisherId);
+            var result = await command.ExecuteScalarAsync();
+            return result is long totalSize ? totalSize : 0;
+        }
+        finally
+        {
+            ReleaseConnection(connection);
+        }
+    }
+
     private async Task<long> GetOrCreateUserIdAsync(byte[] publicKey, SqliteConnection connection)
     {
         if (_userIdCache.TryGetValue(publicKey, out long userId))
@@ -149,7 +173,8 @@ public class SqliteRecordRepository : IRecordRepository
                 throw new InvalidOperationException("Failed to insert user and retrieve user ID.");
             userId = (long)insertResult;
         }
-        _userIdCache[publicKey] = userId;
+        var cacheEntryOptions = new MemoryCacheEntryOptions().SetSize(1);
+        _userIdCache.Set(publicKey, userId, cacheEntryOptions);
         return userId;
     }
 
@@ -180,7 +205,7 @@ public class SqliteRecordRepository : IRecordRepository
                 .SetSlidingExpiration(TimeSpan.FromMinutes(10));
             _recordCache.Set(recordKey, recordValue, cacheEntryOptions);
 
-            // TODO: In a distributed system, consider using a shared cache or invalidation mechanism to maintain consistency across instances.
+            // TODO: In a distributed system make a shared cache or invalidation mechanism to maintain consistency across instances.
         }
         catch (SqliteException ex) when (ex.SqliteErrorCode == SQLitePCL.raw.SQLITE_BUSY)
         {
@@ -385,6 +410,8 @@ public class SqliteRecordRepository : IRecordRepository
 
     public async Task<IEnumerable<Record>> GetByPublishersAsync(byte[] consumerPublicKey, IEnumerable<byte[]> publisherPublicKeys, string key)
     {
+        const int PublisherChunkSize = 100;
+
         var connection = await GetConnectionAsync();
         try
         {
@@ -396,29 +423,35 @@ public class SqliteRecordRepository : IRecordRepository
                 publisherIds.Add(pubId);
             }
 
-            using var command = connection.CreateCommand();
-            command.CommandText = @"
-                SELECT u.public_key, r.encrypted_blob, r.timestamp
-                FROM records r
-                JOIN users u ON r.publisher_id = u.user_id
-                WHERE r.consumer_id = @consumerId 
-                  AND r.publisher_id IN (" + string.Join(",", publisherIds) + @") 
-                  AND r.key = @key";
-            command.Parameters.AddWithValue("@consumerId", consumerId);
-            command.Parameters.AddWithValue("@key", key);
-
-            using var reader = await command.ExecuteReaderAsync();
             var records = new List<Record>();
-            while (await reader.ReadAsync())
+            for (int i = 0; i < publisherIds.Count; i += PublisherChunkSize)
             {
-                records.Add(new Record
+                var chunk = publisherIds.Skip(i).Take(PublisherChunkSize).ToList();
+                using var command = connection.CreateCommand();
+                command.CommandText = @"
+                    SELECT u.public_key, r.encrypted_blob, r.timestamp
+                    FROM records r
+                    JOIN users u ON r.publisher_id = u.user_id
+                    WHERE r.consumer_id = @consumerId 
+                      AND r.publisher_id IN (" + string.Join(",", chunk.Select((_, j) => $"@pubId{j}")) + @") 
+                      AND r.key = @key";
+                command.Parameters.AddWithValue("@consumerId", consumerId);
+                command.Parameters.AddWithValue("@key", key);
+                for (int j = 0; j < chunk.Count; j++)
+                    command.Parameters.AddWithValue($"@pubId{j}", chunk[j]);
+
+                using var reader = await command.ExecuteReaderAsync();
+                while (await reader.ReadAsync())
                 {
-                    PublisherPublicKey = (byte[])reader["public_key"],
-                    ConsumerPublicKey = consumerPublicKey,
-                    Key = key,
-                    EncryptedBlob = (byte[])reader["encrypted_blob"],
-                    Timestamp = reader.GetDateTime(reader.GetOrdinal("timestamp"))
-                });
+                    records.Add(new Record
+                    {
+                        PublisherPublicKey = (byte[])reader["public_key"],
+                        ConsumerPublicKey = consumerPublicKey,
+                        Key = key,
+                        EncryptedBlob = (byte[])reader["encrypted_blob"],
+                        Timestamp = reader.GetDateTime(reader.GetOrdinal("timestamp"))
+                    });
+                }
             }
             return records;
         }

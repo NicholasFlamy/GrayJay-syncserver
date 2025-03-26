@@ -5,12 +5,6 @@ using SyncServer.Repositories;
 using SyncShared;
 using System.Net.Sockets;
 using static SyncClient.SyncSocketSession;
-using System.Threading.Tasks;
-using Microsoft.VisualStudio.TestTools.UnitTesting;
-using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Threading;
 
 namespace SyncServerTests
 {
@@ -392,6 +386,26 @@ namespace SyncServerTests
         }
 
         [TestMethod]
+        public async Task PublishRecord_RateLimited()
+        {
+            var (server, serverPublicKey, port) = SetupServer();
+            using (server)
+            {
+                using var clientA = await CreateClientAsync(port, serverPublicKey);
+                using var clientB = await CreateClientAsync(port, serverPublicKey);
+                var data = new byte[5 * 1024 * 1024];
+                bool success1 = await clientA.PublishRecordAsync(clientB.LocalPublicKey, "testA", data);
+                bool success2 = await clientA.PublishRecordAsync(clientB.LocalPublicKey, "testB", data);
+                var record1 = await clientB.GetRecordAsync(clientA.LocalPublicKey, "testA").WithTimeout(5000, "Get record A timed out");
+                var record2 = await clientB.GetRecordAsync(clientA.LocalPublicKey, "testB").WithTimeout(5000, "Get record B timed out");
+                Assert.IsTrue(success1);
+                Assert.IsFalse(success2);
+                Assert.IsNotNull(record1);
+                Assert.IsNull(record2);
+            }
+        }
+
+        [TestMethod]
         public async Task PublishRecord_InvalidKey_Fails()
         {
             var (server, serverPublicKey, port) = SetupServer();
@@ -549,6 +563,24 @@ namespace SyncServerTests
                 await channelA.SendRelayedDataAsync(Opcode.DATA, 0, largeData);
                 var receivedData = await tcsDataB.Task.WithTimeout(10000, "Receiving large data timed out");
                 CollectionAssert.AreEqual(largeData, receivedData);
+            }
+        }
+
+
+        [TestMethod]
+        public async Task SingleLargeMessageViaRelayedChannel_RateLimited()
+        {
+            var (server, serverPublicKey, port) = SetupServer();
+            using (server)
+            {
+                var largeData = new byte[10000000];
+                new Random().NextBytes(largeData);
+                using var clientA = await CreateClientAsync(port, serverPublicKey);
+                using var clientB = await CreateClientAsync(port, serverPublicKey);
+                var channelA = await clientA.StartRelayedChannelAsync(clientB.LocalPublicKey);
+                await channelA.SendRelayedDataAsync(Opcode.DATA, 0, largeData);
+                await Task.Delay(TimeSpan.FromMilliseconds(300));
+                Assert.ThrowsException<NullReferenceException>(async () => await channelA.SendRelayedDataAsync(Opcode.DATA, 0, largeData));
             }
         }
 

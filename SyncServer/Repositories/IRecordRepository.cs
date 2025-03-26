@@ -9,4 +9,5 @@ public interface IRecordRepository : IDisposable
     Task DeleteAsync(byte[] publisherPublicKey, byte[] consumerPublicKey, string key);
     Task<IEnumerable<Record>> GetByPublishersAsync(byte[] consumerPublicKey, IEnumerable<byte[]> publisherPublicKeys, string key);
     Task BulkDeleteAsync(byte[] publisherPublicKey, byte[] consumerPublicKey, IEnumerable<string> keys);
+    Task<long> GetTotalSizeAsync(byte[] publisherPublicKey);
 }

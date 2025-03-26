@@ -5,10 +5,78 @@ using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
-using System.Security.Cryptography.X509Certificates;
 using static SyncServer.SyncSession;
 
 namespace SyncServer;
+
+public class TcpSyncServerMetrics
+{
+    private readonly TcpSyncServer _server;
+
+    public TcpSyncServerMetrics(TcpSyncServer server)
+    {
+        _server = server;
+    }
+
+    public long ActiveConnections;
+    public long TotalConnectionsAccepted;
+    public long TotalConnectionsClosed;
+    public long TotalHandshakeAttempts;
+    public long TotalHandshakeSuccesses;
+
+    public long TotalRelayedConnectionsRequested;
+    public long TotalRelayedConnectionsEstablished;
+    public long TotalRelayedConnectionsFailed;
+    public long TotalRelayedDataBytes;
+
+    public long TotalRateLimitExceedances;
+
+    public long TotalPublishRecordRequests;
+    public long TotalDeleteRecordRequests;
+    public long TotalListKeysRequests;
+    public long TotalGetRecordRequests;
+    public long TotalPublishRecordSuccesses;
+    public long TotalDeleteRecordSuccesses;
+    public long TotalListKeysSuccesses;
+    public long TotalGetRecordSuccesses;
+    public long TotalPublishRecordFailures;
+    public long TotalDeleteRecordFailures;
+    public long TotalListKeysFailures;
+    public long TotalGetRecordFailures;
+
+    public long TotalStorageLimitExceedances;
+
+    public long TotalPublishRecordTimeMs;
+    public long PublishRecordCount;
+    public long TotalDeleteRecordTimeMs;
+    public long DeleteRecordCount;
+    public long TotalListKeysTimeMs;
+    public long ListKeysCount;
+    public long TotalGetRecordTimeMs;
+    public long GetRecordCount;
+
+    public long TotalRented => Utilities.TotalRented;
+    public long TotalReturned => Utilities.TotalReturned;
+
+    public int BufferPoolAvailable => _server.ReadWritePool.Available;
+
+    public long MemoryUsage => GC.GetTotalMemory(false);
+    public int ActiveRelayedConnections => _server.RelayedConnections.Values.Count(conn => conn.IsActive);
+
+    public int[] GCCounts
+    {
+        get
+        {
+            int maxGen = GC.MaxGeneration;
+            int[] counts = new int[maxGen + 1];
+            for (int i = 0; i <= maxGen; i++)
+            {
+                counts[i] = GC.CollectionCount(i);
+            }
+            return counts;
+        }
+    }
+}
 
 public class TcpSyncServer : IDisposable
 {
@@ -31,29 +99,36 @@ public class TcpSyncServer : IDisposable
         HashFunction.Blake2b
     );
 
-    private const int MaxConnections = 1000;
-    private const int BufferSize = 1024;
+    private const int MAX_CONNECTIONS = 1000;
+    private const int BUFFER_SIZE = 1024;
+    private const long MAX_BYTES_PER_SECOND = 1_000_000;
 
     private Socket? _listenSocket;
     private readonly SemaphoreSlim _maxConnections;
     private readonly int _maxConnectionCount;
-    private readonly SocketAsyncEventArgsPool _readWritePool;
+    public readonly SocketAsyncEventArgsPool ReadWritePool;
     private readonly ConcurrentDictionary<Socket, SyncSession> _clients = new();
     private readonly ConcurrentDictionary<string, SyncSession> _sessions = new();
     private readonly KeyPair _keyPair;
     private readonly ConcurrentDictionary<(string, string), byte[]> _connectionInfoStore = new();
-    private readonly ConcurrentDictionary<long, RelayedConnection> _relayedConnections = new();
+    public readonly ConcurrentDictionary<long, RelayedConnection> RelayedConnections = new();
+    private ConcurrentDictionary<(string, string), DateTime> _relayBlacklist = new ConcurrentDictionary<(string, string), DateTime>();
+    private readonly ConcurrentDictionary<long, RateInfo> _rateInfos = new();
+
     private readonly int _port;
     public int Port => (_listenSocket?.LocalEndPoint as IPEndPoint)?.Port ?? _port;
     private int _nextConnectionId = 0;
     public IRecordRepository RecordRepository { get; }
 
-    public TcpSyncServer(int port, KeyPair keyPair, IRecordRepository recordRepository, int maxConnections = MaxConnections)
+    public readonly TcpSyncServerMetrics Metrics;
+
+    public TcpSyncServer(int port, KeyPair keyPair, IRecordRepository recordRepository, int maxConnections = MAX_CONNECTIONS)
     {
+        Metrics = new TcpSyncServerMetrics(this);
         _port = port;
         _maxConnectionCount = maxConnections;
         _maxConnections = new SemaphoreSlim(maxConnections, maxConnections);
-        _readWritePool = new SocketAsyncEventArgsPool(2 * maxConnections);
+        ReadWritePool = new SocketAsyncEventArgsPool(2 * maxConnections);
         _keyPair = keyPair;
         RecordRepository = recordRepository;
         InitializeBufferPool();
@@ -62,7 +137,7 @@ public class TcpSyncServer : IDisposable
     public int GetNextConnectionId() => Interlocked.Increment(ref _nextConnectionId);
     public void SetRelayedConnection(long connectionId, SyncSession initiator, SyncSession? target = null, bool isActive = false)
     {
-        _relayedConnections[connectionId] = new RelayedConnection
+        RelayedConnections[connectionId] = new RelayedConnection
         {
             Initiator = initiator,
             Target = target,
@@ -71,23 +146,29 @@ public class TcpSyncServer : IDisposable
     }
     public void RemoveRelayedConnection(long connectionId)
     {
-        _relayedConnections.TryRemove(connectionId, out _);
+        RelayedConnections.TryRemove(connectionId, out _);
+        _rateInfos.TryRemove(connectionId, out _);
     }
 
     public RelayedConnection? GetRelayedConnection(long connectionId)
     {
-        _relayedConnections.TryGetValue(connectionId, out var connection);
+        RelayedConnections.TryGetValue(connectionId, out var connection);
         return connection;
+    }
+
+    public int GetActiveRelayedConnectionsCount(string publicKey)
+    {
+        return RelayedConnections.Values.Count(conn => conn.IsActive && conn.Initiator.RemotePublicKey == publicKey);
     }
 
     public void OnSessionClosed(SyncSession session)
     {
-        foreach (var kvp in _relayedConnections.ToArray())
+        foreach (var kvp in RelayedConnections.ToArray())
         {
             var connection = kvp.Value;
             if (connection.Initiator == session || connection.Target == session)
             {
-                _relayedConnections.TryRemove(kvp.Key, out _);
+                RelayedConnections.TryRemove(kvp.Key, out _);
                 var otherSession = connection.Initiator == session ? connection.Target : connection.Initiator;
                 if (otherSession != null)
                 {
@@ -104,11 +185,11 @@ public class TcpSyncServer : IDisposable
         var remotePublicKey = session.RemotePublicKey;
         if (remotePublicKey != null && _sessions.TryRemove(remotePublicKey, out _))
         {
-            foreach (var kvp in _relayedConnections.ToArray())
+            foreach (var kvp in RelayedConnections.ToArray())
             {
                 if (kvp.Value.Initiator == session || kvp.Value.Target == session)
                 {
-                    _relayedConnections.TryRemove(kvp.Key, out _);
+                    RelayedConnections.TryRemove(kvp.Key, out _);
                 }
             }
         }
@@ -138,10 +219,10 @@ public class TcpSyncServer : IDisposable
         for (int i = 0; i < 2 * _maxConnectionCount; i++)
         {
             var args = new SocketAsyncEventArgs();
-            args.SetBuffer(new byte[BufferSize], 0, BufferSize);
+            args.SetBuffer(new byte[BUFFER_SIZE], 0, BUFFER_SIZE);
             args.Completed += IO_Completed;
             args.UserToken = new ArgsPair();
-            _readWritePool.Push(args);
+            ReadWritePool.Push(args);
         }
     }
 
@@ -150,8 +231,8 @@ public class TcpSyncServer : IDisposable
         _listenSocket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
         _listenSocket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
         _listenSocket.NoDelay = true;
-        _listenSocket.ReceiveBufferSize = BufferSize;
-        _listenSocket.SendBufferSize = BufferSize;
+        _listenSocket.ReceiveBufferSize = BUFFER_SIZE;
+        _listenSocket.SendBufferSize = BUFFER_SIZE;
         _listenSocket.Bind(new IPEndPoint(IPAddress.Any, _port));
         _listenSocket.Listen(1000);
 
@@ -193,11 +274,11 @@ public class TcpSyncServer : IDisposable
                 return;
             }
 
-            if (_readWritePool.IsEmpty)
+            if (ReadWritePool.IsEmpty)
                 throw new Exception("Read write pool should never be empty because maxConnections should block");
 
-            var readArgs = _readWritePool.Pop();
-            var writeArgs = _readWritePool.Pop();
+            var readArgs = ReadWritePool.Pop();
+            var writeArgs = ReadWritePool.Pop();
             var session = new SyncSession(this, (s) => _sessions[s.RemotePublicKey!] = s)
             {
                 Socket = clientSocket,
@@ -208,6 +289,8 @@ public class TcpSyncServer : IDisposable
             ((ArgsPair)readArgs.UserToken!).Session = session;
             ((ArgsPair)writeArgs.UserToken!).Session = session;
             _clients.TryAdd(clientSocket, session);
+            Interlocked.Increment(ref Metrics.TotalConnectionsAccepted);
+            Interlocked.Increment(ref Metrics.ActiveConnections);
 
             Logger.Info<TcpSyncServer>($"Client connected: {clientSocket.RemoteEndPoint}");
 
@@ -263,8 +346,8 @@ public class TcpSyncServer : IDisposable
     {
         try
         {
-            if (Logger.WillLog(LogLevel.Debug))
-                Logger.Debug<TcpSyncServer>($"Sent {bytesSent} bytes.");
+            if (Logger.WillLog(LogLevel.Verbose))
+                Logger.Verbose<TcpSyncServer>($"Sent {bytesSent} bytes.");
 
             if (bytesSent == 0)
             {
@@ -357,12 +440,12 @@ public class TcpSyncServer : IDisposable
                 _connectionInfoStore.TryRemove(key, out _);
         }
 
-        foreach (var kvp in _relayedConnections.ToArray())
+        foreach (var kvp in RelayedConnections.ToArray())
         {
             var connection = kvp.Value;
             if (connection.Initiator == session || connection.Target == session)
             {
-                if (_relayedConnections.TryRemove(kvp.Key, out _))
+                if (RelayedConnections.TryRemove(kvp.Key, out _))
                 {
                     var otherSession = connection.Initiator == session ? connection.Target : connection.Initiator;
                     if (otherSession != null && otherSession.PrimaryState != SessionPrimaryState.Closed)
@@ -376,15 +459,19 @@ public class TcpSyncServer : IDisposable
         }
 
         if (session?.ReadArgs != null)
-            _readWritePool.Push(session.ReadArgs);
+            ReadWritePool.Push(session.ReadArgs);
         if (session?.WriteArgs != null)
-            _readWritePool.Push(session.WriteArgs);
+            ReadWritePool.Push(session.WriteArgs);
         session?.Dispose();
 
         try
         {
             if (removed)
+            {
+                Interlocked.Increment(ref Metrics.TotalConnectionsClosed);
+                Interlocked.Decrement(ref Metrics.ActiveConnections);
                 _maxConnections.Release();
+            }
         }
         catch (Exception e)
         {
@@ -392,6 +479,36 @@ public class TcpSyncServer : IDisposable
         }
 
         Logger.Info<TcpSyncServer>($"Client disconnected");
+    }
+
+    public bool IsBlacklisted(string initiator, string target)
+    {
+        if (_relayBlacklist.TryGetValue((initiator, target), out DateTime expiration))
+        {
+            if (DateTime.UtcNow < expiration)
+            {
+                return true; // Still blacklisted
+            }
+            else
+            {
+                // Expired, remove from blacklist
+                _relayBlacklist.TryRemove((initiator, target), out _);
+                return false;
+            }
+        }
+        return false; // Not blacklisted
+    }
+
+    public void AddToBlacklist(string initiator, string target, TimeSpan duration)
+    {
+        DateTime expiration = DateTime.UtcNow + duration;
+        _relayBlacklist[(initiator, target)] = expiration;
+    }
+
+    public bool RateLimitExceeded(long connectionId, long bytes)
+    {
+        var rateInfo = _rateInfos.GetOrAdd(connectionId, _ => new RateInfo(MAX_BYTES_PER_SECOND));
+        return rateInfo.Update(bytes, DateTime.UtcNow);
     }
 
     public void Dispose()

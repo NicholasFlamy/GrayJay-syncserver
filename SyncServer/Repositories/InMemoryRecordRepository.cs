@@ -5,6 +5,7 @@ namespace SyncServer.Repositories;
 public class InMemoryRecordRepository : IRecordRepository
 {
     private readonly ConcurrentDictionary<RecordKey, RecordValue> _store = new();
+    private readonly ConcurrentDictionary<byte[], long> _totalSizes = new(new ByteArrayComparer());
 
     public class RecordKey : IEquatable<RecordKey>
     {
@@ -48,15 +49,28 @@ public class InMemoryRecordRepository : IRecordRepository
         public DateTime Timestamp { get; init; }
     }
 
+    public Task<long> GetTotalSizeAsync(byte[] publisherPublicKey)
+    {
+        _totalSizes.TryGetValue(publisherPublicKey, out long totalSize);
+        return Task.FromResult(totalSize);
+    }
+
     public void InsertOrUpdate(byte[] publisherPublicKey, byte[] consumerPublicKey, string key, byte[] encryptedBlob)
     {
         var recordKey = new RecordKey(publisherPublicKey, consumerPublicKey, key);
-        var recordValue = new RecordValue
+        var newRecordValue = new RecordValue { EncryptedBlob = encryptedBlob, Timestamp = DateTime.UtcNow };
+
+        if (_store.TryGetValue(recordKey, out var existingRecord))
         {
-            EncryptedBlob = encryptedBlob,
-            Timestamp = DateTime.UtcNow
-        };
-        _store[recordKey] = recordValue;
+            long sizeDifference = encryptedBlob.Length - existingRecord.EncryptedBlob.Length;
+            _totalSizes.AddOrUpdate(publisherPublicKey, sizeDifference, (_, current) => current + sizeDifference);
+        }
+        else
+        {
+            _totalSizes.AddOrUpdate(publisherPublicKey, encryptedBlob.Length, (_, current) => current + encryptedBlob.Length);
+        }
+
+        _store[recordKey] = newRecordValue;
     }
 
     public void BulkInsertOrUpdate(IEnumerable<(byte[] publisherPublicKey, byte[] consumerPublicKey, string key, byte[] encryptedBlob)> records)
@@ -70,7 +84,10 @@ public class InMemoryRecordRepository : IRecordRepository
     public void Delete(byte[] publisherPublicKey, byte[] consumerPublicKey, string key)
     {
         var recordKey = new RecordKey(publisherPublicKey, consumerPublicKey, key);
-        _store.TryRemove(recordKey, out _);
+        if (_store.TryRemove(recordKey, out var removedRecord))
+        {
+            _totalSizes.AddOrUpdate(publisherPublicKey, -removedRecord.EncryptedBlob.Length, (_, current) => current - removedRecord.EncryptedBlob.Length);
+        }
     }
 
     public Record? Get(byte[] publisherPublicKey, byte[] consumerPublicKey, string key)
@@ -148,11 +165,8 @@ public class InMemoryRecordRepository : IRecordRepository
 
     public async Task BulkDeleteAsync(byte[] publisherPublicKey, byte[] consumerPublicKey, IEnumerable<string> keys)
     {
-        var recordKeys = keys.Select(key => new RecordKey(publisherPublicKey, consumerPublicKey, key)).ToList();
-        foreach (var recordKey in recordKeys)
-        {
-            _store.TryRemove(recordKey, out _);
-        }
+        foreach (var key in keys)
+            Delete(publisherPublicKey, consumerPublicKey, key);
         await Task.CompletedTask;
     }
 

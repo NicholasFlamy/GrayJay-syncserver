@@ -25,7 +25,7 @@ internal class Program
         Console.WriteLine("Client 1 Public Key: " + publicKey1);
         Console.WriteLine("Client 2 Public Key: " + publicKey2);
 
-        string serverPublicKey = "12rV6GgH3zRDLuHNuCSbfIdnfs2HNm8t31zPorw13zQ=";
+        string serverPublicKey = "9+sK/wU1MckxyexCaeyjyxgRhr67zgYLnuFR/4Mytno=";
 
         var socket1 = new TcpClient("127.0.0.1", 9000);
         var socketSession1 = CreateSocketSession(socket1, keyPair1, serverPublicKey);
