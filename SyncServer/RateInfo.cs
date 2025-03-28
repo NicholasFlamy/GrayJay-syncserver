@@ -22,19 +22,22 @@ public class RateInfo
             TimeSpan elapsed = now - _lastUpdate;
             long refill = (long)(elapsed.TotalSeconds * _maxBytesPerSecond);
             _tokens = Math.Min(_maxBytesPerSecond, _tokens + refill);
-            Logger.Info<RateInfo>($"Tokens after refill: {_tokens}");
+            if (Logger.WillLog(LogLevel.Debug))
+                Logger.Debug<RateInfo>($"Tokens after refill: {_tokens}");
             _lastUpdate = now;
 
             // Check if we have enough tokens to allow this transmission
             if (_tokens >= bytes)
             {
-                Logger.Info<RateInfo>($"Tokens after consumption: {_tokens}");
+                if (Logger.WillLog(LogLevel.Debug))
+                    Logger.Debug<RateInfo>($"Tokens after consumption: {_tokens}");
                 _tokens -= bytes;
                 return false; // Not over the limit
             }
             else
             {
-                Logger.Info<RateInfo>($"Tokens depleted: {_tokens}");
+                if (Logger.WillLog(LogLevel.Warning))
+                    Logger.Warning<RateInfo>($"Tokens depleted: {_tokens}");
                 return true; // Over the limit
             }
         }

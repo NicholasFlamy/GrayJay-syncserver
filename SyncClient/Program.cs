@@ -14,8 +14,8 @@ namespace ServerLoadTest
     internal class Program
     {
         // Server configuration
-        private static readonly string ServerPublicKey = "j4c6+ORwifCF941mUhOYUUCQZsp9drYoSoJPyYOe5DY=";
-        private static int NumPairs = 1000; // Number of client pairs; adjust to scale load
+        private static readonly string ServerPublicKey = "xGbHRzDOvE6plRbQaFgSen82eijF+gxS0yeUaeEErkw=";
+        private static int NumPairs = 500; // Number of client pairs; adjust to scale load
         private static readonly ConcurrentBag<string> HandshakeCompleted = new ConcurrentBag<string>();
         private static int ActiveClients = 0;
 
@@ -49,7 +49,7 @@ namespace ServerLoadTest
             {
                 KeyPair keyPair = KeyPair.Generate(); // Generate in-memory key pair
                 keyPairs.Add(keyPair);
-                var socket = new TcpClient("127.0.0.1", 9000); // Connect to server
+                var socket = new TcpClient(/*"relay.grayjay.app"*/"178.156.173.80", 9000); // Connect to server
                 var session = CreateSocketSession(socket, keyPair, ServerPublicKey, sessionToPeer);
                 sessions.Add(session);
                 _ = session.StartAsInitiatorAsync(ServerPublicKey); // Initiate handshake
