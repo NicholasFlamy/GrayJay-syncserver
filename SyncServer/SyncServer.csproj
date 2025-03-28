@@ -8,6 +8,7 @@
 	<ServerGarbageCollection>true</ServerGarbageCollection>
 	<PublishTrimmed>true</PublishTrimmed>
 	<PublishAot>true</PublishAot>
+	<SelfContained>true</SelfContained>
   </PropertyGroup>
 
   <ItemGroup>
