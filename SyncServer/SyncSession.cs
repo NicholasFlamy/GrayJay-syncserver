@@ -98,10 +98,10 @@ public class SyncSession
         int offset = 0;
         if (PrimaryState == SessionPrimaryState.VersionCheck)
         {
-            if (data.Length != 4)
+            if (data.Length < 4)
                 throw new Exception("Expected exactly 4 bytes for version.");
 
-            HandleVersionCheck(data);
+            HandleVersionCheck(data.Slice(0, 4));
             PrimaryState = SessionPrimaryState.Handshake;
             offset = 4;
         }

@@ -48,7 +48,7 @@ namespace SyncServerTests
                 onNewChannel: onNewChannel ?? ((s, c) => { })
             )
             { IsTrusted = true };
-            socketSession.StartAsInitiator(serverPublicKey);
+            _ = socketSession.StartAsInitiatorAsync(serverPublicKey);
             await tcs.Task.WithTimeout(5000, "Handshake timed out");
             return socketSession;
         }
@@ -90,7 +90,7 @@ namespace SyncServerTests
                     onData: (s, o, so, d) => { },
                     onNewChannel: (s, c) => { }
                 );
-                socketSession.StartAsInitiator(incorrectPublicKey);
+                _ = socketSession.StartAsInitiatorAsync(incorrectPublicKey);
                 await tcs.Task.WithTimeout(5000, "Connection close timed out");
                 Assert.IsNull(socketSession.RemotePublicKey, "Handshake should fail with incorrect public key");
                 socketSession.Dispose();
@@ -573,13 +573,12 @@ namespace SyncServerTests
             var (server, serverPublicKey, port) = SetupServer();
             using (server)
             {
-                var largeData = new byte[10000000];
+                var largeData = new byte[10_000_000];
                 new Random().NextBytes(largeData);
                 using var clientA = await CreateClientAsync(port, serverPublicKey);
                 using var clientB = await CreateClientAsync(port, serverPublicKey);
                 var channelA = await clientA.StartRelayedChannelAsync(clientB.LocalPublicKey);
                 await channelA.SendRelayedDataAsync(Opcode.DATA, 0, largeData);
-                await Task.Delay(TimeSpan.FromMilliseconds(300));
                 Assert.ThrowsException<NullReferenceException>(async () => await channelA.SendRelayedDataAsync(Opcode.DATA, 0, largeData));
             }
         }

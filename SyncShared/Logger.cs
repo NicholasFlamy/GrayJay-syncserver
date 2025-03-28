@@ -24,7 +24,8 @@ public static class Logger
     };
 
     public const LogLevel DefaultLogLevel = LogLevel.Verbose;
-    public static Func<LogLevel, bool> WillLog = (level) => (int)level <= (int)DefaultLogLevel;
+    //public static Func<LogLevel, bool> WillLog = (level) => (int)level <= (int)DefaultLogLevel;
+    public static Func<LogLevel, bool> WillLog = (level) => false;
 
     public static void Debug<T>(string message, Exception? ex = null) => LogCallback.Invoke(LogLevel.Debug, typeof(T).Name, message, ex);
     public static void Verbose<T>(string message, Exception? ex = null) => LogCallback.Invoke(LogLevel.Verbose, typeof(T).Name, message, ex);

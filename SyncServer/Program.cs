@@ -20,7 +20,7 @@ class Program
         KeyPair keyPair;
         try
         {
-            var syncKeyPair = System.Text.Json.JsonSerializer.Deserialize<SyncKeyPair>(File.ReadAllText("key.txt"));
+            var syncKeyPair = System.Text.Json.JsonSerializer.Deserialize(File.ReadAllText("key.txt"), SyncKeyPairContext.Default.SyncKeyPair);
             keyPair = new KeyPair(Convert.FromBase64String(syncKeyPair!.PrivateKey), Convert.FromBase64String(syncKeyPair!.PublicKey));
         }
         catch (Exception ex)
@@ -28,7 +28,7 @@ class Program
             // Key pair non-existing, invalid or lost
             var p = KeyPair.Generate();
             var syncKeyPair = new SyncKeyPair(1, Convert.ToBase64String(p.PublicKey), Convert.ToBase64String(p.PrivateKey));
-            File.WriteAllText("key.txt", System.Text.Json.JsonSerializer.Serialize(syncKeyPair));
+            File.WriteAllText("key.txt", System.Text.Json.JsonSerializer.Serialize(syncKeyPair, SyncKeyPairContext.Default.SyncKeyPair));
             Logger.Error(nameof(Program), "Failed to load existing key pair", ex);
             keyPair = p;
         }

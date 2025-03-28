@@ -8,6 +8,7 @@ using System.Text;
 using System.Collections.Concurrent;
 using System.Security.Cryptography;
 using System.Buffers;
+using System.Threading;
 
 namespace SyncClient;
 
@@ -28,6 +29,7 @@ public record ConnectionInfo(
     bool AllowRemoteProxied
 );
 
+//TODO: Cancellation token source and cancel on dispose
 public class SyncSocketSession : IDisposable
 {
     private static readonly Protocol _protocol = new Protocol(
@@ -98,7 +100,6 @@ public class SyncSocketSession : IDisposable
     private readonly Action<SyncSocketSession> _onClose;
     private readonly Action<SyncSocketSession> _onHandshakeComplete;
     private readonly Action<SyncSocketSession, Channel> _onNewChannel;
-    private Thread? _thread = null;
     private Transport? _transport = null;
     public string? RemotePublicKey { get; private set; } = null;
     private bool _started;
@@ -140,60 +141,52 @@ public class SyncSocketSession : IDisposable
         RemoteAddress = remoteAddress;
     }
 
-    public void StartAsInitiator(string remotePublicKey)
+    public async Task StartAsInitiatorAsync(string remotePublicKey)
     {
         _started = true;
-        _thread = new Thread(() =>
+        try
         {
-            try
-            {
-                HandshakeAsInitiator(remotePublicKey);
-                _onHandshakeComplete(this);
-                ReceiveLoop();
-            }
-            catch (Exception e)
-            {
-                Logger.Error<SyncSocketSession>($"Failed to run as initiator: {e}");
-            }
-            finally
-            {
-                Dispose();
-            }
-        });
-        _thread.Start();
+            await HandshakeAsInitiatorAsync(remotePublicKey);
+            _onHandshakeComplete(this);
+            await ReceiveLoopAsync();
+        }
+        catch (Exception e)
+        {
+            Logger.Error<SyncSocketSession>($"Failed to run as initiator: {e}");
+        }
+        finally
+        {
+            Dispose();
+        }
     }
 
-    public void StartAsResponder()
+    public async Task StartAsResponderAsync()
     {
         _started = true;
-        _thread = new Thread(() =>
+        try
         {
-            try
-            {
-                HandshakeAsResponder();
-                _onHandshakeComplete(this);
-                ReceiveLoop();
-            }
-            catch (Exception e)
-            {
-                Logger.Error<SyncSocketSession>($"Failed to run as responder: {e}");
-            }
-            finally
-            {
-                Dispose();
-            }
-        });
-        _thread.Start();
+            await HandshakeAsResponderAsync();
+            _onHandshakeComplete(this);
+            await ReceiveLoopAsync();
+        }
+        catch (Exception e)
+        {
+            Logger.Error<SyncSocketSession>($"Failed to run as responder: {e}");
+        }
+        finally
+        {
+            Dispose();
+        }
     }
 
-    private void ReceiveLoop()
+    private async Task ReceiveLoopAsync(CancellationToken cancellationToken = default)
     {
         byte[] messageSizeBytes = new byte[4];
         while (_started)
         {
             try
             {
-                if (Read(messageSizeBytes, 0, 4) != 4)
+                if (await ReadAsync(messageSizeBytes, 0, 4, cancellationToken: cancellationToken) != 4)
                     throw new Exception("Expected exactly 4 bytes");
 
                 int messageSize = BinaryPrimitives.ReadInt32LittleEndian(messageSizeBytes.AsSpan(0, 4));
@@ -209,7 +202,7 @@ public class SyncSocketSession : IDisposable
                 int bytesRead = 0;
                 while (bytesRead < messageSize)
                 {
-                    int read = Read(_buffer, bytesRead, messageSize - bytesRead);
+                    int read = await ReadAsync(_buffer, bytesRead, messageSize - bytesRead, cancellationToken: cancellationToken);
                     if (read <= 0)
                         throw new Exception("Stream closed");
                     bytesRead += read;
@@ -232,9 +225,9 @@ public class SyncSocketSession : IDisposable
         }
     }
 
-    private void HandshakeAsInitiator(string remotePublicKey)
+    private async ValueTask HandshakeAsInitiatorAsync(string remotePublicKey, CancellationToken cancellationToken = default)
     {
-        PerformVersionCheck();
+        await PerformVersionCheckAsync();
 
         var message = new byte[512];
         var plaintext = new byte[512];
@@ -242,10 +235,10 @@ public class SyncSocketSession : IDisposable
         {
             var (bytesWritten, _, _) = handshakeState.WriteMessage(null, message.AsSpan(4));
             BinaryPrimitives.WriteInt32LittleEndian(message.AsSpan(0, 4), bytesWritten);
-            Send(message, 0, bytesWritten + 4);
+            await SendAsync(message, 0, bytesWritten + 4, cancellationToken: cancellationToken);
             Logger.Info<SyncSocketSession>($"HandshakeAsInitiator: Wrote message size {bytesWritten}");
 
-            var bytesRead = Read(message, 0, 4);
+            var bytesRead = await ReadAsync(message, 0, 4);
             if (bytesRead != 4)
                 throw new Exception("Expected exactly 4 bytes (message size)");
 
@@ -254,7 +247,7 @@ public class SyncSocketSession : IDisposable
             bytesRead = 0;
             while (bytesRead < messageSize)
             {
-                var read = Read(message, bytesRead, messageSize - bytesRead);
+                var read = await ReadAsync(message, bytesRead, messageSize - bytesRead);
                 if (read == 0)
                     throw new Exception("Stream closed.");
                 bytesRead += read;
@@ -267,15 +260,15 @@ public class SyncSocketSession : IDisposable
         }
     }
 
-    private void HandshakeAsResponder()
+    private async ValueTask HandshakeAsResponderAsync(CancellationToken cancellationToken = default)
     {
-        PerformVersionCheck();
+        await PerformVersionCheckAsync();
 
         var message = new byte[512];
         var plaintext = new byte[512];
         using (var handshakeState = _protocol.Create(false, s: _localKeyPair.PrivateKey))
         {
-            var bytesRead = Read(message, 0, 4);
+            var bytesRead = await ReadAsync(message, 0, 4);
             if (bytesRead != 4)
                 throw new Exception($"Expected exactly 4 bytes (message size), read {bytesRead}");
 
@@ -285,7 +278,7 @@ public class SyncSocketSession : IDisposable
             bytesRead = 0;
             while (bytesRead < messageSize)
             {
-                var read = Read(message, bytesRead, messageSize - bytesRead);
+                var read = await ReadAsync(message, bytesRead, messageSize - bytesRead);
                 if (read == 0)
                     throw new Exception("Stream closed.");
                 bytesRead += read;
@@ -295,7 +288,7 @@ public class SyncSocketSession : IDisposable
 
             var (bytesWritten, _, transport) = handshakeState.WriteMessage(null, message.AsSpan(4));
             BinaryPrimitives.WriteInt32LittleEndian(message.AsSpan(0, 4), bytesWritten);
-            Send(message, 0, bytesWritten + 4);
+            await SendAsync(message, 0, bytesWritten + 4, cancellationToken: cancellationToken);
             Logger.Info<SyncSocketSession>($"HandshakeAsResponder: Wrote message size {bytesWritten}");
 
             _transport = transport;
@@ -306,12 +299,12 @@ public class SyncSocketSession : IDisposable
 
     private const int CURRENT_VERSION = 3;
     private static readonly byte[] VERSION_BYTES = BitConverter.GetBytes(CURRENT_VERSION);
-    private void PerformVersionCheck()
+    private async ValueTask PerformVersionCheckAsync(CancellationToken cancellationToken = default)
     {
         const int MINIMUM_VERSION = 2;
-        Send(VERSION_BYTES, 0, 4);
+        await SendAsync(VERSION_BYTES, 0, 4, cancellationToken: cancellationToken);
         byte[] versionBytes = new byte[4];
-        int bytesRead = Read(versionBytes, 0, 4);
+        int bytesRead = await ReadAsync(versionBytes, 0, 4);
         if (bytesRead != 4)
             throw new Exception($"Expected 4 bytes to be read, read {bytesRead}");
         RemoteVersion = BinaryPrimitives.ReadInt32LittleEndian(versionBytes.AsSpan(0, 4));
@@ -336,9 +329,9 @@ public class SyncSocketSession : IDisposable
         return plen;
     }
 
-    private int Read(byte[] buffer, int offset, int size)
+    private async ValueTask<int> ReadAsync(byte[] buffer, int offset, int size, CancellationToken cancellationToken = default)
     {
-        int bytesRead = _inputStream.Read(buffer, offset, size);
+        int bytesRead = await _inputStream.ReadAsync(buffer, offset, size, cancellationToken: cancellationToken);
         if (Logger.WillLog(LogLevel.Debug))
             Logger.Debug<SyncSocketSession>($"Read {bytesRead} bytes.\n{Utilities.HexDump(buffer.AsSpan().Slice(offset, bytesRead))}");
         return bytesRead;
@@ -352,20 +345,6 @@ public class SyncSocketSession : IDisposable
         if (size == -1)
             size = data.Length;
         await _outputStream.WriteAsync(data, offset, size, cancellationToken);
-    }
-
-    private void Send(byte[] data, int offset = 0, int size = -1)
-    {
-        if (size == -1)
-            size = data.Length;
-        Send(data.AsSpan().Slice(0, size));
-    }
-
-    private void Send(ReadOnlySpan<byte> data)
-    {
-        if (Logger.WillLog(LogLevel.Debug))
-            Logger.Debug<SyncSocketSession>($"Sending {data.Length} bytes.\n{Utilities.HexDump(data)}");
-        _outputStream.Write(data);
     }
 
     public async Task SendAsync(Opcode opcode, byte subOpcode, byte[] data, int offset = 0, int size = -1, CancellationToken cancellationToken = default) =>
@@ -453,7 +432,7 @@ public class SyncSocketSession : IDisposable
                 var len = Encrypt(_sendBuffer.AsSpan().Slice(0, data.Length + HEADER_SIZE), _sendBufferEncrypted.AsSpan(4));
 
                 BinaryPrimitives.WriteInt32LittleEndian(_sendBufferEncrypted.AsSpan(0, 4), len);
-                Send(_sendBufferEncrypted, 0, len + 4);
+                await SendAsync(_sendBufferEncrypted, 0, len + 4, cancellationToken: cancellationToken);
                 if (Logger.WillLog(LogLevel.Debug))
                     Logger.Debug<SyncSocketSession>($"Wrote message bytes {len}");
             }
@@ -2133,7 +2112,6 @@ public class SyncSocketSession : IDisposable
         _inputStream.Close();
         _outputStream.Close();
         _transport?.Dispose();
-        _thread = null;
         Logger.Info<SyncSocketSession>("Session closed");
     }
 

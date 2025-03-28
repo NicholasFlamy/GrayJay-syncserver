@@ -99,9 +99,9 @@ public class TcpSyncServer : IDisposable
         HashFunction.Blake2b
     );
 
-    private const int MAX_CONNECTIONS = 1000;
+    private const int MAX_CONNECTIONS = 100000;
     private const int BUFFER_SIZE = 1024;
-    private const long MAX_BYTES_PER_SECOND = 1_000_000;
+    private const long MAX_BYTES_PER_SECOND = 10_000_000;
 
     private Socket? _listenSocket;
     private readonly SemaphoreSlim _maxConnections;
@@ -299,7 +299,7 @@ public class TcpSyncServer : IDisposable
             readArgs.SetBuffer(new byte[1024], 0, 1024);
             bool pending = clientSocket.ReceiveAsync(readArgs);
             if (!pending)
-                ThreadPool.QueueUserWorkItem((_) => OnReceiveCompleted(session, readArgs.BytesTransferred));
+                ThreadPool.QueueUserWorkItem((_) => OnReceiveCompleted(session));
         }
         catch (Exception ex)
         {
@@ -315,29 +315,32 @@ public class TcpSyncServer : IDisposable
         }
     }
 
-    private void OnReceiveCompleted(SyncSession session, int bytesReceived)
+    private void OnReceiveCompleted(SyncSession session)
     {
         try
         {
-            if (Logger.WillLog(LogLevel.Debug))
-                Logger.Debug<TcpSyncServer>($"Received {bytesReceived} bytes.");
-
-            if (bytesReceived == 0)
+            while (true)
             {
-                Logger.Info<TcpSyncServer>($"OnReceiveCompleted (bytesReceived = {bytesReceived}) soft disconnect.");
-                CloseConnection(session);
-                return;
+                if (Logger.WillLog(LogLevel.Debug))
+                    Logger.Debug<TcpSyncServer>($"Received {session.ReadArgs!.BytesTransferred} bytes.");
+
+                if (session.ReadArgs!.BytesTransferred == 0)
+                {
+                    Logger.Info<TcpSyncServer>($"OnReceiveCompleted (bytesReceived = {session.ReadArgs!.BytesTransferred}) soft disconnect.");
+                    CloseConnection(session);
+                    return;
+                }
+
+                session.HandleData(session.ReadArgs!.BytesTransferred);
+
+                bool pending = session.Socket!.ReceiveAsync(session.ReadArgs!);
+                if (pending)
+                    break;
             }
-
-            session.HandleData(bytesReceived);
-
-            bool pending = session.Socket!.ReceiveAsync(session.ReadArgs!);
-            if (!pending)
-                OnReceiveCompleted(session, session.ReadArgs!.BytesTransferred);
         }
         catch (Exception e)
         {
-            Logger.Error<TcpSyncServer>($"OnReceiveCompleted (bytesReceived = {bytesReceived}) unhandled exception.", e);
+            Logger.Error<TcpSyncServer>($"OnReceiveCompleted (bytesReceived = {session.ReadArgs!.BytesTransferred}) unhandled exception.", e);
             CloseConnection(session);
         }
     }
@@ -395,7 +398,7 @@ public class TcpSyncServer : IDisposable
                         }
                         else
                         {
-                            OnReceiveCompleted(session, e.BytesTransferred);
+                            OnReceiveCompleted(session);
                         }
                         break;
                     case SocketAsyncOperation.Send:

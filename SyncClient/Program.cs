@@ -1,165 +1,180 @@
 ﻿using Noise;
 using SyncClient;
 using SyncShared;
+using System;
+using System.Buffers.Binary;
 using System.Collections.Concurrent;
-using System.Net;
+using System.Collections.Generic;
 using System.Net.Sockets;
-using System.Text.Json;
-using System.Threading.Channels;
-using System.Xml.Linq;
+using System.Threading;
+using System.Threading.Tasks;
 
-internal class Program
+namespace ServerLoadTest
 {
-    static ConcurrentBag<string> _handshakeCompleted = new ConcurrentBag<string>();
-    static byte[] TestData = new byte[1000000];
-
-    static async Task Main(string[] args)
+    internal class Program
     {
-        new Random().NextBytes(TestData);
+        // Server configuration
+        private static readonly string ServerPublicKey = "j4c6+ORwifCF941mUhOYUUCQZsp9drYoSoJPyYOe5DY=";
+        private static int NumPairs = 1000; // Number of client pairs; adjust to scale load
+        private static readonly ConcurrentBag<string> HandshakeCompleted = new ConcurrentBag<string>();
+        private static int ActiveClients = 0;
 
-        KeyPair keyPair1 = LoadOrGenerateKeyPair("key1.txt");
-        KeyPair keyPair2 = LoadOrGenerateKeyPair("key2.txt");
-
-        string publicKey1 = Convert.ToBase64String(keyPair1.PublicKey);
-        string publicKey2 = Convert.ToBase64String(keyPair2.PublicKey);
-        Console.WriteLine("Client 1 Public Key: " + publicKey1);
-        Console.WriteLine("Client 2 Public Key: " + publicKey2);
-
-        string serverPublicKey = "9+sK/wU1MckxyexCaeyjyxgRhr67zgYLnuFR/4Mytno=";
-
-        var socket1 = new TcpClient("127.0.0.1", 9000);
-        var socketSession1 = CreateSocketSession(socket1, keyPair1, serverPublicKey);
-
-        var socket2 = new TcpClient("127.0.0.1", 9000);
-        var socketSession2 = CreateSocketSession(socket2, keyPair2, serverPublicKey);
-
-        socketSession1.StartAsInitiator(serverPublicKey);
-        socketSession2.StartAsInitiator(serverPublicKey);
-
-        await Task.WhenAll(
-            WaitForHandshake(socketSession1),
-            WaitForHandshake(socketSession2)
-        );
-
-        /*await socketSession1.PublishConnectionInformationAsync([socketSession2.LocalPublicKey], 1000, true, true, true, true);
-        await socketSession2.PublishConnectionInformationAsync([socketSession1.LocalPublicKey], 1000, true, true, true, true);
-
-        var connectionInfo = await socketSession1.RequestConnectionInfoAsync(publicKey2);
-        if (connectionInfo != null)
+        static async Task Main(string[] args)
         {
-            Logger.Info<SyncSocketSession>(
-                $"Received connection info: port={connectionInfo.Port}, name={connectionInfo.Name}, " +
-                $"remoteIp={connectionInfo.RemoteIp}, ipv4={string.Join(", ", connectionInfo.Ipv4Addresses)}, ipv6={string.Join(", ", connectionInfo.Ipv6Addresses)}, " +
-                $"allowLocal={connectionInfo.AllowLocal}, allowRemoteDirect={connectionInfo.AllowRemoteDirect}, allowRemoteHolePunched={connectionInfo.AllowRemoteHolePunched}, allowRemoteProxied={connectionInfo.AllowRemoteProxied}"
+            int numClients = NumPairs * 2;
+            List<KeyPair> keyPairs = new List<KeyPair>();
+            List<SyncSocketSession> sessions = new List<SyncSocketSession>();
+            Dictionary<SyncSocketSession, string> sessionToPeer = new Dictionary<SyncSocketSession, string>();
+
+            _ = Task.Run(async () =>
+            {
+                while (true)
+                {
+                    await Task.Delay(5000); // Report every 5 seconds
+                    var now = DateTime.Now;
+
+                    double avgLatency = Metrics.DataLatencies.Any() ? Metrics.DataLatencies.Average() : 0;
+                    long missingPackets = Metrics.MissingPackets;
+                    int disconnections = Metrics.Disconnections.Count;
+
+                    Console.WriteLine(
+                        $"[{now}] Clients: {ActiveClients}, " +
+                        $"Avg Latency: {avgLatency:F2}ms, " +
+                        $"Missing Packets: {missingPackets}, " +
+                        $"Disconnections: {disconnections}");
+                }
+            });
+
+            for (int i = 0; i < numClients; i++)
+            {
+                KeyPair keyPair = KeyPair.Generate(); // Generate in-memory key pair
+                keyPairs.Add(keyPair);
+                var socket = new TcpClient("127.0.0.1", 9000); // Connect to server
+                var session = CreateSocketSession(socket, keyPair, ServerPublicKey, sessionToPeer);
+                sessions.Add(session);
+                _ = session.StartAsInitiatorAsync(ServerPublicKey); // Initiate handshake
+                ActiveClients++;
+                await Task.Delay(1);
+            }
+
+            for (int i = 0; i < numClients; i += 2)
+            {
+                string pubKey1 = Convert.ToBase64String(keyPairs[i].PublicKey);
+                string pubKey2 = Convert.ToBase64String(keyPairs[i + 1].PublicKey);
+                sessionToPeer[sessions[i]] = pubKey2;
+                sessionToPeer[sessions[i + 1]] = pubKey1;
+            }
+
+            await Task.WhenAll(sessions.Select(s => WaitForHandshake(s)));
+            Console.WriteLine($"All {numClients} handshakes completed.");
+
+            for (int i = 0; i < numClients; i += 2)
+            {
+                var session1 = sessions[i];
+                var publicKey2 = Convert.ToBase64String(keyPairs[i + 1].PublicKey);
+                await session1.StartRelayedChannelAsync(publicKey2);
+                Console.WriteLine($"Started channel from client {i} to client {i + 1}");
+            }
+
+            CancellationTokenSource cts = new CancellationTokenSource();
+            Console.CancelKeyPress += (_, __) => cts.Cancel();
+            Console.WriteLine($"Running with {NumPairs} pairs ({numClients} clients). Press Ctrl+C to stop.");
+            await Task.Delay(-1, cts.Token);
+        }
+
+        /// <summary>
+        /// Creates a socket session with handlers for handshake, data, and channel events.
+        /// </summary>
+        private static SyncSocketSession CreateSocketSession(
+            TcpClient socket,
+            KeyPair keyPair,
+            string serverPublicKey,
+            Dictionary<SyncSocketSession, string> sessionToPeer)
+        {
+            var publicKey = Convert.ToBase64String(keyPair.PublicKey);
+            var socketSession = new SyncSocketSession(
+                (socket.Client.RemoteEndPoint as System.Net.IPEndPoint)!.Address.ToString(),
+                keyPair,
+                socket.GetStream(),
+                socket.GetStream(),
+                onClose: s => { Metrics.Disconnections.Add(s.LocalPublicKey); }, // Track disconnections
+                onHandshakeComplete: s =>
+                {
+                    // Measure handshake time
+                    HandshakeCompleted.Add(s.LocalPublicKey);
+                },
+                onData: (s, opcode, subOpcode, data) => { /* Optional: Log non-channel data */ },
+                onNewChannel: (s, c) =>
+                {
+                    // Start sending data at ~1 kb/s
+                    int sequenceNumber = 0;
+                    Task.Run(async () =>
+                    {
+                        await Task.Delay(TimeSpan.FromSeconds(5));
+
+                        while (true)
+                        {
+                            long timestamp = DateTime.UtcNow.Ticks;
+                            int seq = Interlocked.Increment(ref sequenceNumber);
+                            byte[] dataToSend = new byte[100]; // 100 bytes per packet
+                            BitConverter.GetBytes(timestamp).CopyTo(dataToSend, 0); // 8 bytes
+                            BitConverter.GetBytes(seq).CopyTo(dataToSend, 8);       // 4 bytes
+                            Array.Fill(dataToSend, (byte)0xFF, 12, 88);            // 88 bytes dummy data
+                            await c.SendRelayedDataAsync(Opcode.DATA, 0, dataToSend);
+                            await Task.Delay(100); // Send every 100ms (~1 kb/s)
+                        }
+                    });
+
+                    // Handle received data
+                    c.SetDataHandler((session, channel, opcode, subOpcode, data) =>
+                    {
+                        if (data.Length < 12) return; // Ensure data has timestamp and sequence
+                        long sentTimestamp = BinaryPrimitives.ReadInt64LittleEndian(data);
+                        int seq = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(8));
+                        long receivedTimestamp = DateTime.UtcNow.Ticks;
+                        double latencyMs = (receivedTimestamp - sentTimestamp) / (double)TimeSpan.TicksPerMillisecond;
+                        Metrics.DataLatencies.Add(latencyMs);
+
+                        // Check for missing packets
+                        string senderKey = sessionToPeer[session]; // Peer is the sender
+                        string receiverKey = session.LocalPublicKey;
+                        string key = $"{senderKey}->{receiverKey}";
+                        int lastSeq = Metrics.LastSequenceNumbers.GetOrAdd(key, 0);
+                        if (seq > lastSeq + 1)
+                        {
+                            int missing = seq - lastSeq - 1;
+                            Interlocked.Add(ref Metrics.MissingPackets, missing);
+                        }
+                        Metrics.LastSequenceNumbers[key] = seq;
+                    });
+                }
             );
+            return socketSession;
         }
-        else
+
+        /// <summary>
+        /// Waits for a client's handshake to complete.
+        /// </summary>
+        private static Task WaitForHandshake(SyncSocketSession session)
         {
-            Logger.Info<SyncSocketSession>("Connection info is null");
-        }*/
-
-        //var channel = await socketSession1.StartRelayedChannelAsync(publicKey2);
-
-        //Logger.Info<Program>($"Channel opened {channel.ConnectionId}");
-
-        bool success = await socketSession1.PublishRecordsAsync([publicKey2], "myKey", [1, 2, 3]);
-        var keys = await socketSession1.ListRecordKeysAsync(publicKey1, publicKey2);
-        var keysShouldBeEmpty = await socketSession1.ListRecordKeysAsync(publicKey2, publicKey1);
-        var keys2 = await socketSession2.ListRecordKeysAsync(publicKey1, publicKey2);
-        var record = await socketSession2.GetRecordsAsync([publicKey1], "myKey");
-
-        CancellationTokenSource cts = new CancellationTokenSource();
-        Console.CancelKeyPress += (_, __) => cts.Cancel();
-        while (!cts.IsCancellationRequested)
-        {
-            await Task.Delay(TimeSpan.FromSeconds(5), cts.Token);
-            //await channel.SendRelayedDataAsync(SyncSocketSession.Opcode.DATA, 0, TestData);
+            return Task.Run(() =>
+            {
+                while (!HandshakeCompleted.Contains(session.LocalPublicKey))
+                {
+                    Thread.Sleep(100);
+                }
+            });
         }
     }
 
-    static KeyPair LoadOrGenerateKeyPair(string fileName)
+    /// <summary>
+    /// Static class to store and manage performance metrics.
+    /// </summary>
+    static class Metrics
     {
-        try
-        {
-            var syncKeyPair = JsonSerializer.Deserialize<SyncKeyPair>(File.ReadAllText(fileName));
-            return new KeyPair(Convert.FromBase64String(syncKeyPair!.PrivateKey), Convert.FromBase64String(syncKeyPair!.PublicKey));
-        }
-        catch (Exception ex)
-        {
-            var p = KeyPair.Generate();
-            var syncKeyPair = new SyncKeyPair(1, Convert.ToBase64String(p.PublicKey), Convert.ToBase64String(p.PrivateKey));
-            File.WriteAllText(fileName, JsonSerializer.Serialize(syncKeyPair));
-            Logger.Error(nameof(Program), $"Failed to load existing key pair from {fileName}", ex);
-            return p;
-        }
-    }
-
-    static SyncSocketSession CreateSocketSession(TcpClient socket, KeyPair keyPair, string serverPublicKey)
-    {
-        var publicKey = Convert.ToBase64String(keyPair.PublicKey);
-        var socketSession = new SyncSocketSession(
-            (socket.Client.RemoteEndPoint as IPEndPoint)!.Address.ToString(),
-            keyPair,
-            socket.GetStream(),
-            socket.GetStream(),
-            onClose: s => { },
-            onHandshakeComplete: s =>
-            {
-                var remotePublicKey = s.RemotePublicKey;
-                if (remotePublicKey == null)
-                {
-                    s.Dispose();
-                    return;
-                }
-                Logger.Info(nameof(Program), $"Handshake complete for {publicKey} with server {remotePublicKey}");
-                _handshakeCompleted.Add(publicKey);
-            },
-            onData: (s, opcode, subOpcode, data) =>
-            {
-                if (opcode == Opcode.RESPONSE_CONNECTION_INFO)
-                {
-                    if (subOpcode == 0)
-                    {
-                        Logger.Info(nameof(Program), $"Received connection info for requested public key.");
-                    }
-                    else
-                    {
-                        Logger.Info(nameof(Program), $"Connection info request failed with error code {subOpcode}");
-                    }
-                }
-                else
-                {
-                    Logger.Info(nameof(Program), $"Received data (opcode: {opcode}, subOpcode: {subOpcode})");
-                }
-            },
-            onNewChannel: (s, c) =>
-            {
-                Logger.Info<Program>($"Channel opened {c.ConnectionId}");
-
-                c.SetDataHandler((s, c, opcode, subOpcode, data) =>
-                {
-                    Logger.Info(nameof(Program), $"Received data via channel (opcode: {opcode}, subOpcode: {subOpcode}, data length: {data.Length})");
-
-                    if (subOpcode == 0)
-                    {
-                        if (!TestData.AsSpan().SequenceEqual(data))
-                            throw new Exception("Data has been corrupted");
-                        c.SendRelayedDataAsync(Opcode.DATA, 1, [4, 5, 6]);
-                    }
-                });
-            }
-        );
-        return socketSession;
-    }
-
-    static Task WaitForHandshake(SyncSocketSession session)
-    {
-        return Task.Run(() =>
-        {
-            while (!_handshakeCompleted.Contains(session.LocalPublicKey))
-            {
-                Thread.Sleep(100);
-            }
-        });
+        public static ConcurrentBag<double> DataLatencies = new ConcurrentBag<double>(); // ms
+        public static ConcurrentDictionary<string, int> LastSequenceNumbers = new ConcurrentDictionary<string, int>();
+        public static long MissingPackets = 0;
+        public static ConcurrentBag<string> Disconnections = new ConcurrentBag<string>();
     }
 }
