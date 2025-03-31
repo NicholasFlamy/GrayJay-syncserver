@@ -49,7 +49,7 @@ namespace ServerLoadTest
             {
                 KeyPair keyPair = KeyPair.Generate(); // Generate in-memory key pair
                 keyPairs.Add(keyPair);
-                var socket = new TcpClient(/*"relay.grayjay.app"*/"178.156.173.80", 9000); // Connect to server
+                var socket = new TcpClient("relay.grayjay.app", 9000); // Connect to server
                 var session = CreateSocketSession(socket, keyPair, ServerPublicKey, sessionToPeer);
                 sessions.Add(session);
                 _ = session.StartAsInitiatorAsync(ServerPublicKey); // Initiate handshake
