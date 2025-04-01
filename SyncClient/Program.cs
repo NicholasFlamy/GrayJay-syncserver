@@ -116,12 +116,12 @@ namespace ServerLoadTest
                         {
                             long timestamp = DateTime.UtcNow.Ticks;
                             int seq = Interlocked.Increment(ref sequenceNumber);
-                            byte[] dataToSend = new byte[100]; // 100 bytes per packet
+                            byte[] dataToSend = new byte[1000];
                             BitConverter.GetBytes(timestamp).CopyTo(dataToSend, 0); // 8 bytes
                             BitConverter.GetBytes(seq).CopyTo(dataToSend, 8);       // 4 bytes
                             Array.Fill(dataToSend, (byte)0xFF, 12, 88);            // 88 bytes dummy data
                             await c.SendRelayedDataAsync(Opcode.DATA, 0, dataToSend);
-                            await Task.Delay(100); // Send every 100ms (~1 kb/s)
+                            await Task.Delay(1000);
                         }
                     });
 
