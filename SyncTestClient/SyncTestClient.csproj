@@ -1,17 +1,14 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <OutputType>Library</OutputType>
+    <OutputType>Exe</OutputType>
     <TargetFramework>net9.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
-	<SelfContained>true</SelfContained>
-	<ServerGarbageCollection>true</ServerGarbageCollection>
-	<PublishTrimmed>true</PublishTrimmed>
-    <PublishAot>true</PublishAot>
   </PropertyGroup>
 
   <ItemGroup>
+    <ProjectReference Include="..\SyncClient\SyncClient.csproj" />
     <ProjectReference Include="..\SyncShared\SyncShared.csproj" />
   </ItemGroup>
 
