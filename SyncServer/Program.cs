@@ -1,12 +1,6 @@
 ﻿using Noise;
 using SyncServer.Repositories;
 using System.Text.Json;
-using System.Threading.Tasks;
-using Microsoft.AspNetCore.Builder;
-using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Hosting;
-using System.Text;
-using Newtonsoft.Json;
 
 namespace SyncServer;
 
@@ -20,7 +14,7 @@ class Program
         KeyPair keyPair;
         try
         {
-            var syncKeyPair = System.Text.Json.JsonSerializer.Deserialize(File.ReadAllText("key.txt"), SyncKeyPairContext.Default.SyncKeyPair);
+            var syncKeyPair = JsonSerializer.Deserialize(File.ReadAllText("key.txt"), SyncKeyPairContext.Default.SyncKeyPair);
             keyPair = new KeyPair(Convert.FromBase64String(syncKeyPair!.PrivateKey), Convert.FromBase64String(syncKeyPair!.PublicKey));
         }
         catch (Exception ex)
@@ -28,7 +22,7 @@ class Program
             // Key pair non-existing, invalid or lost
             var p = KeyPair.Generate();
             var syncKeyPair = new SyncKeyPair(1, Convert.ToBase64String(p.PublicKey), Convert.ToBase64String(p.PrivateKey));
-            File.WriteAllText("key.txt", System.Text.Json.JsonSerializer.Serialize(syncKeyPair, SyncKeyPairContext.Default.SyncKeyPair));
+            File.WriteAllText("key.txt", JsonSerializer.Serialize(syncKeyPair, SyncKeyPairContext.Default.SyncKeyPair));
             Logger.Error(nameof(Program), "Failed to load existing key pair", ex);
             keyPair = p;
         }
@@ -50,7 +44,7 @@ class Program
             logBuilder.AddProvider(new LoggerLoggerProvider());
         });
         using var app = builder.Build();
-        app.MapGet("/", () => Results.Text(JsonConvert.SerializeObject(server.Metrics, Formatting.Indented), "text/json"));
+        app.MapGet("/", () => Results.Text(JsonSerializer.Serialize(server.Metrics, TcpSyncServerMetricsContext.Default.TcpSyncServerMetrics), "text/json"));
         app.Run("http://localhost:3131");
     }
 }

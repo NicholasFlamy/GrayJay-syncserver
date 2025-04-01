@@ -5,6 +5,7 @@ using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
+using System.Text.Json.Serialization;
 using static SyncServer.SyncSession;
 
 namespace SyncServer;
@@ -76,6 +77,12 @@ public class TcpSyncServerMetrics
             return counts;
         }
     }
+}
+
+[JsonSourceGenerationOptions(WriteIndented = true, IncludeFields = true)]
+[JsonSerializable(typeof(TcpSyncServerMetrics))]
+public partial class TcpSyncServerMetricsContext : JsonSerializerContext
+{
 }
 
 public class TcpSyncServer : IDisposable
