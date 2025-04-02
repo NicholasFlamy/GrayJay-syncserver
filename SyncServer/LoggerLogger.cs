@@ -18,32 +18,32 @@ public class LoggerLogger : ILogger
         switch (logLevel)
         {
             case Microsoft.Extensions.Logging.LogLevel.Trace:
-                Logger.Debug(_category, message, exception); // Trace -> Debug
+                SyncShared.Logger.Debug(_category, message, exception); // Trace -> Debug
                 break;
             case Microsoft.Extensions.Logging.LogLevel.Debug:
-                Logger.Debug(_category, message, exception); // Debug -> Debug
+                SyncShared.Logger.Debug(_category, message, exception); // Debug -> Debug
                 break;
             case Microsoft.Extensions.Logging.LogLevel.Information:
-                Logger.Verbose(_category, message, exception); // Information -> Verbose
+                SyncShared.Logger.Verbose(_category, message, exception); // Information -> Verbose
                 break;
             case Microsoft.Extensions.Logging.LogLevel.Warning:
-                Logger.Warning(_category, message, exception); // Warning -> Warning
+                SyncShared.Logger.Warning(_category, message, exception); // Warning -> Warning
                 break;
             case Microsoft.Extensions.Logging.LogLevel.Error:
-                Logger.Error(_category, message, exception); // Error -> Error
+                SyncShared.Logger.Error(_category, message, exception); // Error -> Error
                 break;
             case Microsoft.Extensions.Logging.LogLevel.Critical:
-                Logger.Error(_category, message, exception); // Critical -> Error
+                SyncShared.Logger.Error(_category, message, exception); // Critical -> Error
                 break;
             default:
-                Logger.Verbose(_category, message, exception); // Fallback to Info
+                SyncShared.Logger.Verbose(_category, message, exception); // Fallback to Info
                 break;
         }
     }
 
     public bool IsEnabled(Microsoft.Extensions.Logging.LogLevel logLevel)
     {
-        int settingsLogLevel = (int)Logger.DefaultLogLevel;
+        int settingsLogLevel = (int)SyncShared.Logger.DefaultLogLevel;
         int logLevelValue = (int)logLevel;
 
         switch (settingsLogLevel)

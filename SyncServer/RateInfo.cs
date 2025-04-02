@@ -1,5 +1,8 @@
-﻿namespace SyncServer;
+﻿using SyncShared;
 
+namespace SyncServer;
+
+using LogLevel = SyncShared.LogLevel;
 public class RateInfo
 {
     private readonly long _maxBytesPerSecond; // The allowed rate (e.g., 1MB/s)

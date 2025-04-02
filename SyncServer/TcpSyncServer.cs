@@ -7,6 +7,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Text.Json.Serialization;
 using static SyncServer.SyncSession;
+using LogLevel = SyncShared.LogLevel;
 
 namespace SyncServer;
 

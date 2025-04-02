@@ -2,6 +2,7 @@
 using System.Collections.Concurrent;
 using System.Text;
 using Microsoft.Extensions.Caching.Memory;
+using SyncShared;
 
 namespace SyncServer.Repositories;
 

@@ -32,62 +32,6 @@ public record ConnectionInfo(
 //TODO: Cancellation token source and cancel on dispose
 public class SyncSocketSession : IDisposable
 {
-    private static readonly Protocol _protocol = new Protocol(
-        HandshakePattern.IK,
-        CipherFunction.ChaChaPoly,
-        HashFunction.Blake2b
-    );
-
-    public class Channel : IDisposable
-    {
-        public long ConnectionId { get; set; }
-        public HandshakeState? HandshakeState;
-        public string? RemotePublicKey { get; private set; } = null;
-        public Transport? Transport { get; private set; } = null;
-        private readonly KeyPair _localKeyPair;
-        private readonly SyncSocketSession _session;
-        private Action<SyncSocketSession, Channel, Opcode, byte, ReadOnlySpan<byte>>? _onData;
-
-        public Channel(SyncSocketSession session, KeyPair localKeyPair, string publicKey, bool initiator)
-        {
-            _session = session;
-            _localKeyPair = localKeyPair;
-            HandshakeState = initiator 
-                ? _protocol.Create(initiator, s: _localKeyPair.PrivateKey, rs: Convert.FromBase64String(publicKey))
-                : _protocol.Create(initiator, s: _localKeyPair.PrivateKey);
-        }
-
-        public void SetDataHandler(Action<SyncSocketSession, Channel, Opcode, byte, ReadOnlySpan<byte>>? onData)
-        {
-            _onData = onData;
-        }
-
-        public void Dispose()
-        {
-            Transport?.Dispose();
-            Transport = null;
-            HandshakeState?.Dispose();
-            HandshakeState = null;
-        }
-
-        public void InvokeDataHandler(Opcode opcode, byte subOpcode, ReadOnlySpan<byte> data, Channel? sourceChannel = null)
-        {
-            _onData?.Invoke(_session, this, opcode, subOpcode, data);
-        }
-
-        public void CompleteHandshake(Transport transport)
-        {
-            RemotePublicKey = Convert.ToBase64String(HandshakeState!.RemoteStaticPublicKey);
-            HandshakeState!.Dispose();
-            HandshakeState = null;
-            Transport = transport;
-            Logger.Info<SyncSocketSession>($"Completed handshake for connectionId {ConnectionId}");
-        }
-
-        public Task SendRelayedDataAsync(Opcode opcode, byte subOpcode, byte[]? data = null, int offset = 0, int count = -1, CancellationToken cancellationToken = default)
-            => _session.SendRelayedDataAsync(this, opcode, subOpcode, data, offset, count, cancellationToken);
-    }
-
     private readonly Stream _inputStream;
     private readonly Stream _outputStream;
     private readonly SemaphoreSlim _sendSemaphore = new SemaphoreSlim(1);
@@ -97,20 +41,21 @@ public class SyncSocketSession : IDisposable
     private readonly byte[] _sendBufferEncrypted = new byte[MAXIMUM_PACKET_SIZE_ENCRYPTED + 4]; //+4 to leave room for size prefix
     private readonly Dictionary<int, SyncStream> _syncStreams = new();
     private int _streamIdGenerator = 0;
-    private readonly Action<SyncSocketSession> _onClose;
-    private readonly Action<SyncSocketSession> _onHandshakeComplete;
-    private readonly Action<SyncSocketSession, Channel> _onNewChannel;
+    private readonly Action<SyncSocketSession>? _onClose;
+    private readonly Action<SyncSocketSession>? _onHandshakeComplete;
+    private readonly Action<SyncSocketSession, ChannelRelayed>? _onNewChannel;
+    private readonly Func<SyncSocketSession, string, bool>? _isChannelAllowed;
     private Transport? _transport = null;
     public string? RemotePublicKey { get; private set; } = null;
     private bool _started;
     private KeyPair _localKeyPair;
     private readonly string _localPublicKey;
     public string LocalPublicKey => _localPublicKey;
-    private readonly Action<SyncSocketSession, Opcode, byte, ReadOnlySpan<byte>> _onData;
+    private readonly Action<SyncSocketSession, Opcode, byte, ReadOnlySpan<byte>>? _onData;
     public string RemoteAddress { get; }
     public int RemoteVersion { get; private set; } = -1;
-    private readonly ConcurrentDictionary<long, Channel> _channels = new();
-    private readonly ConcurrentDictionary<int, (Channel Channel, TaskCompletionSource<Channel> Tcs)> _pendingChannels = new();
+    private readonly ConcurrentDictionary<long, ChannelRelayed> _channels = new();
+    private readonly ConcurrentDictionary<int, (ChannelRelayed Channel, TaskCompletionSource<ChannelRelayed> Tcs)> _pendingChannels = new();
     private readonly ConcurrentDictionary<int, TaskCompletionSource<ConnectionInfo?>> _pendingConnectionInfoRequests = new();
     private readonly ConcurrentDictionary<int, TaskCompletionSource<bool>> _pendingPublishRequests = new();
     private readonly ConcurrentDictionary<int, TaskCompletionSource<bool>> _pendingDeleteRequests = new();
@@ -127,8 +72,8 @@ public class SyncSocketSession : IDisposable
 
 
     public SyncSocketSession(string remoteAddress, KeyPair localKeyPair, Stream inputStream, Stream outputStream,
-        Action<SyncSocketSession> onClose, Action<SyncSocketSession> onHandshakeComplete,
-        Action<SyncSocketSession, Opcode, byte, ReadOnlySpan<byte>> onData, Action<SyncSocketSession, Channel> onNewChannel)
+        Action<SyncSocketSession>? onClose = null, Action<SyncSocketSession>? onHandshakeComplete = null,
+        Action<SyncSocketSession, Opcode, byte, ReadOnlySpan<byte>>? onData = null, Action<SyncSocketSession, ChannelRelayed>? onNewChannel = null, Func<SyncSocketSession, string, bool>? isChannelAllowed = null)
     {
         _inputStream = inputStream;
         _outputStream = outputStream;
@@ -138,17 +83,18 @@ public class SyncSocketSession : IDisposable
         _onData = onData;
         _onNewChannel = onNewChannel;
         _localPublicKey = Convert.ToBase64String(localKeyPair.PublicKey);
+        _isChannelAllowed = isChannelAllowed;
         RemoteAddress = remoteAddress;
     }
 
-    public async Task StartAsInitiatorAsync(string remotePublicKey)
+    public async Task StartAsInitiatorAsync(string remotePublicKey, CancellationToken cancellationToken = default)
     {
         _started = true;
         try
         {
-            await HandshakeAsInitiatorAsync(remotePublicKey);
-            _onHandshakeComplete(this);
-            await ReceiveLoopAsync();
+            await HandshakeAsInitiatorAsync(remotePublicKey, cancellationToken);
+            _onHandshakeComplete?.Invoke(this);
+            await ReceiveLoopAsync(cancellationToken);
         }
         catch (Exception e)
         {
@@ -160,14 +106,14 @@ public class SyncSocketSession : IDisposable
         }
     }
 
-    public async Task StartAsResponderAsync()
+    public async Task StartAsResponderAsync(CancellationToken cancellationToken = default)
     {
         _started = true;
         try
         {
-            await HandshakeAsResponderAsync();
-            _onHandshakeComplete(this);
-            await ReceiveLoopAsync();
+            await HandshakeAsResponderAsync(cancellationToken);
+            _onHandshakeComplete?.Invoke(this);
+            await ReceiveLoopAsync(cancellationToken);
         }
         catch (Exception e)
         {
@@ -231,7 +177,7 @@ public class SyncSocketSession : IDisposable
 
         var message = new byte[512];
         var plaintext = new byte[512];
-        using (var handshakeState = _protocol.Create(true, s: _localKeyPair.PrivateKey, rs: Convert.FromBase64String(remotePublicKey)))
+        using (var handshakeState = Constants.Protocol.Create(true, s: _localKeyPair.PrivateKey, rs: Convert.FromBase64String(remotePublicKey)))
         {
             var (bytesWritten, _, _) = handshakeState.WriteMessage(null, message.AsSpan(4));
             BinaryPrimitives.WriteInt32LittleEndian(message.AsSpan(0, 4), bytesWritten);
@@ -266,7 +212,7 @@ public class SyncSocketSession : IDisposable
 
         var message = new byte[512];
         var plaintext = new byte[512];
-        using (var handshakeState = _protocol.Create(false, s: _localKeyPair.PrivateKey))
+        using (var handshakeState = Constants.Protocol.Create(false, s: _localKeyPair.PrivateKey))
         {
             var bytesRead = await ReadAsync(message, 0, 4);
             if (bytesRead != 4)
@@ -297,11 +243,11 @@ public class SyncSocketSession : IDisposable
         }
     }
 
-    private const int CURRENT_VERSION = 3;
+    private const int CURRENT_VERSION = 4;
     private static readonly byte[] VERSION_BYTES = BitConverter.GetBytes(CURRENT_VERSION);
     private async ValueTask PerformVersionCheckAsync(CancellationToken cancellationToken = default)
     {
-        const int MINIMUM_VERSION = 2;
+        const int MINIMUM_VERSION = 4;
         await SendAsync(VERSION_BYTES, 0, 4, cancellationToken: cancellationToken);
         byte[] versionBytes = new byte[4];
         int bytesRead = await ReadAsync(versionBytes, 0, 4);
@@ -476,7 +422,7 @@ public class SyncSocketSession : IDisposable
         }
     }
 
-    private void HandleData(byte[] data, int length, Channel? sourceChannel = null)
+    private void HandleData(byte[] data, int length, ChannelRelayed? sourceChannel = null)
     {
         if (length < HEADER_SIZE)
             throw new Exception("Packet must be at least 6 bytes (header size)");
@@ -579,11 +525,11 @@ public class SyncSocketSession : IDisposable
         return await tcs.Task;
     }
 
-    public Task<Channel> StartRelayedChannelAsync(string publicKey, CancellationToken cancellationToken = default)
+    public Task<ChannelRelayed> StartRelayedChannelAsync(string publicKey, CancellationToken cancellationToken = default)
     {
-        var tcs = new TaskCompletionSource<Channel>();
+        var tcs = new TaskCompletionSource<ChannelRelayed>();
         var requestId = Interlocked.Increment(ref _requestIdGenerator);
-        var channel = new Channel(this, _localKeyPair, publicKey, true);
+        var channel = new ChannelRelayed(this, _localKeyPair, publicKey, true);
         _onNewChannel?.Invoke(this, channel);
         _pendingChannels[requestId] = (channel, tcs);
 
@@ -612,7 +558,7 @@ public class SyncSocketSession : IDisposable
             BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(36, 4), bytesWritten);
             message.AsSpan(0, bytesWritten).CopyTo(packet.AsSpan(40));
 
-            _ = SendAsync(Opcode.REQUEST_RELAYED_TRANSPORT, 0, packet, cancellationToken: cancellationToken)
+            _ = SendAsync(Opcode.REQUEST_TRANSPORT, 0, packet, cancellationToken: cancellationToken)
                 .ContinueWith(t =>
                 {
                     if (t.IsFaulted && _pendingChannels.TryRemove(requestId, out var pending))
@@ -723,7 +669,7 @@ public class SyncSocketSession : IDisposable
         await SendAsync(Opcode.PUBLISH_CONNECTION_INFO, 0, publishBytes, cancellationToken: cancellationToken);
     }
 
-    private void HandlePacket(Opcode opcode, byte subOpcode, ReadOnlySpan<byte> data, Channel? sourceChannel = null)
+    private void HandlePacket(Opcode opcode, byte subOpcode, ReadOnlySpan<byte> data, ChannelRelayed? sourceChannel = null)
     {
         if (Logger.WillLog(LogLevel.Verbose))
             Logger.Verbose<SyncSocketSession>($"HandlePacket (opcode = {opcode}, subOpcode = {subOpcode}, data.length = {data.Length}, sourceChannel.ConnectionId = {sourceChannel?.ConnectionId})");
@@ -758,7 +704,7 @@ public class SyncSocketSession : IDisposable
             case Opcode.NOTIFY_UNAUTHORIZED:
                 //Ignore for sourceChannel != null because in order to establish the channel authorization is already completed
                 if (sourceChannel == null)
-                    _onData(this, opcode, subOpcode, data);
+                    _onData?.Invoke(this, opcode, subOpcode, data);
                 return;
             case Opcode.RESPONSE_CONNECTION_INFO:
                 {
@@ -793,11 +739,11 @@ public class SyncSocketSession : IDisposable
                     }
                     return;
                 }
-            case Opcode.REQUEST_RELAYED_TRANSPORT:
+            case Opcode.REQUEST_TRANSPORT_RELAYED:
                 Logger.Info<SyncSocketSession>("Received request for a relayed transport");
-                HandleRequestRelayedTransport(data);
+                HandleRequestTransportRelayed(data);
                 return;
-            case Opcode.RESPONSE_RELAYED_TRANSPORT:
+            case Opcode.RESPONSE_TRANSPORT_RELAYED:
                 if (subOpcode == 0)
                 {
                     if (data.Length < 16)
@@ -805,22 +751,23 @@ public class SyncSocketSession : IDisposable
                         Logger.Error<SyncSocketSession>("RESPONSE_RELAYED_TRANSPORT packet too short");
                         return;
                     }
-                    int requestId = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(0, 4));
-                    long connectionId = BinaryPrimitives.ReadInt64LittleEndian(data.Slice(4, 8));
-                    int messageLength = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(12, 4));
-                    if (data.Length != 16 + messageLength)
+                    int remoteVersion = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(0, 4));
+                    int requestId = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(4, 4));
+                    long connectionId = BinaryPrimitives.ReadInt64LittleEndian(data.Slice(8, 8));
+                    int messageLength = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(16, 4));
+                    if (data.Length != 20 + messageLength)
                     {
-                        Logger.Error<SyncSocketSession>($"Invalid RESPONSE_RELAYED_TRANSPORT packet size. Expected {16 + messageLength}, got {data.Length}");
+                        Logger.Error<SyncSocketSession>($"Invalid RESPONSE_RELAYED_TRANSPORT packet size. Expected {20 + messageLength}, got {data.Length}");
                         return;
                     }
-                    byte[] handshakeMessage = data.Slice(16, messageLength).ToArray();
+                    byte[] handshakeMessage = data.Slice(20, messageLength).ToArray();
                     if (_pendingChannels.TryRemove(requestId, out var pending))
                     {
                         var (channel, tcs) = pending;
                         channel.ConnectionId = connectionId;
                         var plaintext = new byte[1024];
                         var (_, _, transport) = channel.HandshakeState!.ReadMessage(handshakeMessage, plaintext);
-                        channel.CompleteHandshake(transport!);
+                        channel.CompleteHandshake(remoteVersion, transport!);
                         _channels[connectionId] = channel;
                         tcs.SetResult(channel);
                     }
@@ -1330,7 +1277,7 @@ public class SyncSocketSession : IDisposable
                     if (sourceChannel != null)
                         sourceChannel.InvokeDataHandler(opcode, subOpcode, data);
                     else
-                        _onData.Invoke(this, opcode, subOpcode, data);
+                        _onData?.Invoke(this, opcode, subOpcode, data);
                     break;
                 }
             default:
@@ -1379,7 +1326,7 @@ public class SyncSocketSession : IDisposable
         return SendRelayedDataAsync(channel, opcode, subOpcode, data, offset, count, cancellationToken);
     }
 
-    public async Task SendRelayedDataAsync(Channel channel, Opcode opcode, byte subOpcode, byte[]? data = null, int offset = 0, int count = -1, CancellationToken cancellationToken = default)
+    public async Task SendRelayedDataAsync(ChannelRelayed channel, Opcode opcode, byte subOpcode, byte[]? data = null, int offset = 0, int count = -1, CancellationToken cancellationToken = default)
     {
         if (count == -1)
             count = data?.Length ?? 0;
@@ -1448,7 +1395,7 @@ public class SyncSocketSession : IDisposable
         }
     }
 
-    private async Task SendRelayedPacketAsync(Channel channel, byte[] packet, CancellationToken cancellationToken)
+    private async Task SendRelayedPacketAsync(ChannelRelayed channel, byte[] packet, CancellationToken cancellationToken)
     {
         var encryptedPayload = new byte[packet.Length + 16];
         int encryptedLength = channel.Transport!.WriteMessage(packet, encryptedPayload);
@@ -1457,30 +1404,30 @@ public class SyncSocketSession : IDisposable
         BinaryPrimitives.WriteInt64LittleEndian(relayedPacket.AsSpan(0, 8), channel.ConnectionId);
         Array.Copy(encryptedPayload, 0, relayedPacket, 8, encryptedLength);
 
-        await SendAsync(Opcode.RELAYED_DATA, 0, relayedPacket, cancellationToken: cancellationToken);
+        await SendAsync(Opcode.RELAY_DATA, 0, relayedPacket, cancellationToken: cancellationToken);
     }
 
-    private void HandleRequestRelayedTransport(ReadOnlySpan<byte> data)
+    private void HandleRequestTransportRelayed(ReadOnlySpan<byte> data)
     {
-        if (data.Length < 48)
+        if (data.Length < 4 + 48)
         {
             Logger.Error<SyncSocketSession>("HandleRequestRelayedTransport: Packet too short");
             return;
         }
-        long connectionId = BinaryPrimitives.ReadInt64LittleEndian(data.Slice(0, 8));
-        int requestId = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(8, 4));
-        var publicKeyBytes = data.Slice(12, 32).ToArray();
-        int messageLength = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(44, 4));
-        if (data.Length != 48 + messageLength)
+        int remoteVersion = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(0, 4));
+        long connectionId = BinaryPrimitives.ReadInt64LittleEndian(data.Slice(4, 8));
+        int requestId = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(12, 4));
+        var publicKeyBytes = data.Slice(16, 32).ToArray();
+        int messageLength = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(48, 4));
+        if (data.Length != 52 + messageLength)
         {
-            Logger.Error<SyncSocketSession>($"HandleRequestRelayedTransport: Invalid packet size. Expected {48 + messageLength}, got {data.Length}");
+            Logger.Error<SyncSocketSession>($"HandleRequestRelayedTransport: Invalid packet size. Expected {52 + messageLength}, got {data.Length}");
             return;
         }
-        byte[] handshakeMessage = data.Slice(48, messageLength).ToArray();
+        byte[] handshakeMessage = data.Slice(52, messageLength).ToArray();
         string publicKey = Convert.ToBase64String(publicKeyBytes);
 
-        // TODO: Placeholder authorization check
-        var isAllowedToConnect = publicKey != _localPublicKey;
+        var isAllowedToConnect = publicKey != _localPublicKey && (_isChannelAllowed?.Invoke(this, publicKey) ?? false);
         if (!isAllowedToConnect)
         {
             var rp = new byte[12];
@@ -1490,7 +1437,7 @@ public class SyncSocketSession : IDisposable
             {
                 try
                 {
-                    await SendAsync(Opcode.RESPONSE_RELAYED_TRANSPORT, 2, rp);
+                    await SendAsync(Opcode.RESPONSE_TRANSPORT, 2, rp);
                 }
                 catch (Exception e)
                 {
@@ -1500,7 +1447,7 @@ public class SyncSocketSession : IDisposable
             return;
         }
 
-        var channel = new Channel(this, _localKeyPair, publicKey, false);
+        var channel = new ChannelRelayed(this, _localKeyPair, publicKey, false);
         _onNewChannel?.Invoke(this, channel);
 
         channel.ConnectionId = connectionId;
@@ -1521,7 +1468,7 @@ public class SyncSocketSession : IDisposable
         {
             try
             {
-                await SendAsync(Opcode.RESPONSE_RELAYED_TRANSPORT, 0, responsePacket);
+                await SendAsync(Opcode.RESPONSE_TRANSPORT, 0, responsePacket);
             }
             catch (Exception e)
             {
@@ -1529,7 +1476,7 @@ public class SyncSocketSession : IDisposable
             }
         });
 
-        channel.CompleteHandshake(transport!);
+        channel.CompleteHandshake(remoteVersion, transport!);
     }
 
     private ConnectionInfo ParseConnectionInfo(ReadOnlySpan<byte> data)
@@ -2108,7 +2055,7 @@ public class SyncSocketSession : IDisposable
         _pendingChannels.Clear();
 
         _started = false;
-        _onClose(this);
+        _onClose?.Invoke(this);
         _inputStream.Close();
         _outputStream.Close();
         _transport?.Dispose();

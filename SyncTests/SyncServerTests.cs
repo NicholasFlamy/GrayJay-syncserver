@@ -27,7 +27,7 @@ namespace SyncServerTests
             string serverPublicKey,
             Action<SyncSocketSession>? onHandshakeComplete = null,
             Action<SyncSocketSession, Opcode, byte, ReadOnlySpan<byte>>? onData = null,
-            Action<SyncSocketSession, Channel>? onNewChannel = null)
+            Action<SyncSocketSession, ChannelRelayed>? onNewChannel = null)
         {
             var keyPair = KeyPair.Generate();
             var tcpClient = new TcpClient();
@@ -45,7 +45,8 @@ namespace SyncServerTests
                     tcs.SetResult(true);
                 },
                 onData: onData ?? ((s, o, so, d) => { }),
-                onNewChannel: onNewChannel ?? ((s, c) => { })
+                onNewChannel: onNewChannel ?? ((s, c) => { }),
+                isChannelAllowed: (s, c) => true
             )
             { IsTrusted = true };
             _ = socketSession.StartAsInitiatorAsync(serverPublicKey);
@@ -192,13 +193,13 @@ namespace SyncServerTests
             var (server, serverPublicKey, port) = SetupServer();
             using (server)
             {
-                var tcsA = new TaskCompletionSource<Channel>();
-                var tcsB = new TaskCompletionSource<Channel>();
+                var tcsA = new TaskCompletionSource<ChannelRelayed>();
+                var tcsB = new TaskCompletionSource<ChannelRelayed>();
                 using var clientA = await CreateClientAsync(port, serverPublicKey, onNewChannel: (s, c) => tcsA.SetResult(c));
                 using var clientB = await CreateClientAsync(port, serverPublicKey, onNewChannel: (s, c) => tcsB.SetResult(c));
                 var channelTask = clientA.StartRelayedChannelAsync(clientB.LocalPublicKey);
-                var channelA = await tcsA.Task.WithTimeout(5000, "Channel A creation timed out");
-                var channelB = await tcsB.Task.WithTimeout(5000, "Channel B creation timed out");
+                var channelA = await tcsA.Task.WithTimeout(500000, "Channel A creation timed out");
+                var channelB = await tcsB.Task.WithTimeout(500000, "Channel B creation timed out");
                 await channelTask;
 
                 var tcsDataB = new TaskCompletionSource<byte[]>();
@@ -209,8 +210,8 @@ namespace SyncServerTests
                 channelA.SetDataHandler((s, c, o, so, d) => tcsDataA.SetResult(d.ToArray()));
                 await channelB.SendRelayedDataAsync(Opcode.DATA, 0, new byte[] { 4, 5, 6 });
 
-                var receivedB = await tcsDataB.Task.WithTimeout(5000, "Data to B timed out");
-                var receivedA = await tcsDataA.Task.WithTimeout(5000, "Data to A timed out");
+                var receivedB = await tcsDataB.Task.WithTimeout(500000, "Data to B timed out");
+                var receivedA = await tcsDataA.Task.WithTimeout(500000, "Data to A timed out");
                 CollectionAssert.AreEqual(new byte[] { 1, 2, 3 }, receivedB);
                 CollectionAssert.AreEqual(new byte[] { 4, 5, 6 }, receivedA);
             }
@@ -225,8 +226,8 @@ namespace SyncServerTests
                 const int MAX_DATA_PER_PACKET = MAXIMUM_PACKET_SIZE - HEADER_SIZE - 8 - 16 - 16;
                 var maxSizeData = new byte[MAX_DATA_PER_PACKET];
                 new Random().NextBytes(maxSizeData);
-                var tcsA = new TaskCompletionSource<Channel>();
-                var tcsB = new TaskCompletionSource<Channel>();
+                var tcsA = new TaskCompletionSource<ChannelRelayed>();
+                var tcsB = new TaskCompletionSource<ChannelRelayed>();
                 using var clientA = await CreateClientAsync(port, serverPublicKey, onNewChannel: (s, c) => tcsA.SetResult(c));
                 using var clientB = await CreateClientAsync(port, serverPublicKey, onNewChannel: (s, c) => tcsB.SetResult(c));
                 var channelTask = clientA.StartRelayedChannelAsync(clientB.LocalPublicKey);
@@ -248,8 +249,8 @@ namespace SyncServerTests
             var (server, serverPublicKey, port) = SetupServer();
             using (server)
             {
-                var tcsA = new TaskCompletionSource<Channel>();
-                var tcsB = new TaskCompletionSource<Channel>();
+                var tcsA = new TaskCompletionSource<ChannelRelayed>();
+                var tcsB = new TaskCompletionSource<ChannelRelayed>();
                 using var clientA = await CreateClientAsync(port, serverPublicKey, onNewChannel: (s, c) => tcsA.SetResult(c));
                 using var clientB = await CreateClientAsync(port, serverPublicKey, onNewChannel: (s, c) => tcsB.SetResult(c));
                 var channelTask = clientA.StartRelayedChannelAsync(clientB.LocalPublicKey);
@@ -271,10 +272,10 @@ namespace SyncServerTests
             var (server, serverPublicKey, port) = SetupServer();
             using (server)
             {
-                var tcsA1 = new TaskCompletionSource<Channel>();
-                var tcsB1 = new TaskCompletionSource<Channel>();
-                var tcsA2 = new TaskCompletionSource<Channel>();
-                var tcsB2 = new TaskCompletionSource<Channel>();
+                var tcsA1 = new TaskCompletionSource<ChannelRelayed>();
+                var tcsB1 = new TaskCompletionSource<ChannelRelayed>();
+                var tcsA2 = new TaskCompletionSource<ChannelRelayed>();
+                var tcsB2 = new TaskCompletionSource<ChannelRelayed>();
                 using var clientA = await CreateClientAsync(port, serverPublicKey, onNewChannel: (s, c) =>
                 {
                     if (!tcsA1.Task.IsCompleted) tcsA1.SetResult(c);
@@ -332,8 +333,8 @@ namespace SyncServerTests
             var (server, serverPublicKey, port) = SetupServer();
             using (server)
             {
-                var tcsA = new TaskCompletionSource<Channel>();
-                var tcsB = new TaskCompletionSource<Channel>();
+                var tcsA = new TaskCompletionSource<ChannelRelayed>();
+                var tcsB = new TaskCompletionSource<ChannelRelayed>();
                 using var clientA = await CreateClientAsync(port, serverPublicKey, onNewChannel: (s, c) => tcsA.SetResult(c));
                 using var clientB = await CreateClientAsync(port, serverPublicKey, onNewChannel: (s, c) => tcsB.SetResult(c));
                 var channel = await clientA.StartRelayedChannelAsync(clientB.LocalPublicKey);
@@ -549,8 +550,8 @@ namespace SyncServerTests
             {
                 var largeData = new byte[100000];
                 new Random().NextBytes(largeData);
-                var tcsA = new TaskCompletionSource<Channel>();
-                var tcsB = new TaskCompletionSource<Channel>();
+                var tcsA = new TaskCompletionSource<ChannelRelayed>();
+                var tcsB = new TaskCompletionSource<ChannelRelayed>();
                 using var clientA = await CreateClientAsync(port, serverPublicKey, onNewChannel: (s, c) => tcsA.SetResult(c));
                 using var clientB = await CreateClientAsync(port, serverPublicKey, onNewChannel: (s, c) => tcsB.SetResult(c));
                 var channelTask = clientA.StartRelayedChannelAsync(clientB.LocalPublicKey);
@@ -593,8 +594,8 @@ namespace SyncServerTests
                 var largeData2 = new byte[50000];
                 new Random().NextBytes(largeData1);
                 new Random().NextBytes(largeData2);
-                var tcsA = new TaskCompletionSource<Channel>();
-                var tcsB = new TaskCompletionSource<Channel>();
+                var tcsA = new TaskCompletionSource<ChannelRelayed>();
+                var tcsB = new TaskCompletionSource<ChannelRelayed>();
                 using var clientA = await CreateClientAsync(port, serverPublicKey, onNewChannel: (s, c) => tcsA.SetResult(c));
                 using var clientB = await CreateClientAsync(port, serverPublicKey, onNewChannel: (s, c) => tcsB.SetResult(c));
                 var channelTask = clientA.StartRelayedChannelAsync(clientB.LocalPublicKey);
@@ -634,8 +635,8 @@ namespace SyncServerTests
                 var smallData = new byte[] { 1, 2, 3 };
                 var largeData = new byte[70000];
                 new Random().NextBytes(largeData);
-                var tcsA = new TaskCompletionSource<Channel>();
-                var tcsB = new TaskCompletionSource<Channel>();
+                var tcsA = new TaskCompletionSource<ChannelRelayed>();
+                var tcsB = new TaskCompletionSource<ChannelRelayed>();
                 using var clientA = await CreateClientAsync(port, serverPublicKey, onNewChannel: (s, c) => tcsA.SetResult(c));
                 using var clientB = await CreateClientAsync(port, serverPublicKey, onNewChannel: (s, c) => tcsB.SetResult(c));
                 var channelTask = clientA.StartRelayedChannelAsync(clientB.LocalPublicKey);

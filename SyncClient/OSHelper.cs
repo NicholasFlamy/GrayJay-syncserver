@@ -1,4 +1,5 @@
-﻿using System.Diagnostics;
+﻿using SyncShared;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 
 namespace SyncClient;

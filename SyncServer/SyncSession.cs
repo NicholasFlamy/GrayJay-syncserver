@@ -11,6 +11,7 @@ using Noise;
 using SyncShared;
 using static System.Runtime.InteropServices.JavaScript.JSType;
 using static SyncServer.TcpSyncServer;
+using LogLevel = SyncShared.LogLevel;
 
 namespace SyncServer;
 
@@ -310,10 +311,10 @@ public class SyncSession
             case Opcode.REQUEST_CONNECTION_INFO:
                 HandleRequestConnectionInfo(data);
                 break;
-            case Opcode.REQUEST_RELAYED_TRANSPORT:
-                HandleRequestRelayedTransport(data);
+            case Opcode.REQUEST_TRANSPORT:
+                HandleRequestTransport(data);
                 break;
-            case Opcode.RESPONSE_RELAYED_TRANSPORT:
+            case Opcode.RESPONSE_TRANSPORT:
                 if (subOpcode == 0)
                 {
                     if (data.Length < 16)
@@ -336,15 +337,16 @@ public class SyncSession
                     {
                         connection.Target = this;
                         connection.IsActive = true;
-                        var packetSize = 16 + messageLength;
+                        var packetSize = 20 + messageLength;
                         var packetToInitiator = Utilities.RentBytes(packetSize);
                         try
                         {
-                            BinaryPrimitives.WriteInt32LittleEndian(packetToInitiator.AsSpan(0, 4), requestId);
-                            BinaryPrimitives.WriteInt64LittleEndian(packetToInitiator.AsSpan(4, 8), connectionId);
-                            BinaryPrimitives.WriteInt32LittleEndian(packetToInitiator.AsSpan(12, 4), messageLength);
-                            responseHandshakeMessage.CopyTo(packetToInitiator.AsSpan(16));
-                            connection.Initiator.Send(Opcode.RESPONSE_RELAYED_TRANSPORT, 0, packetToInitiator.AsSpan(0, packetSize));
+                            BinaryPrimitives.WriteInt32LittleEndian(packetToInitiator.AsSpan(0, 4), RemoteVersion);
+                            BinaryPrimitives.WriteInt32LittleEndian(packetToInitiator.AsSpan(4, 4), requestId);
+                            BinaryPrimitives.WriteInt64LittleEndian(packetToInitiator.AsSpan(8, 8), connectionId);
+                            BinaryPrimitives.WriteInt32LittleEndian(packetToInitiator.AsSpan(16, 4), messageLength);
+                            responseHandshakeMessage.CopyTo(packetToInitiator.AsSpan(20));
+                            connection.Initiator.Send(Opcode.RESPONSE_TRANSPORT_RELAYED, 0, packetToInitiator.AsSpan(0, packetSize));
                             Interlocked.Increment(ref _server.Metrics.TotalRelayedConnectionsEstablished);
                         }
                         finally
@@ -373,7 +375,7 @@ public class SyncSession
                     {
                         Span<byte> packetToInitiator = stackalloc byte[4]; 
                         BinaryPrimitives.WriteInt32LittleEndian(packetToInitiator, requestId);
-                        connection.Initiator.Send(Opcode.RESPONSE_RELAYED_TRANSPORT, subOpcode, packetToInitiator);
+                        connection.Initiator.Send(Opcode.RESPONSE_TRANSPORT_RELAYED, subOpcode, packetToInitiator);
                         _server.RemoveRelayedConnection(connectionId);
 
                         string initiatorPublicKey = connection.Initiator.RemotePublicKey!;
@@ -383,8 +385,8 @@ public class SyncSession
                     }
                 }
                 break;
-            case Opcode.RELAYED_DATA:
-                HandleRelayedData(data);
+            case Opcode.RELAY_DATA:
+                HandleRelayData(data);
                 break;
             case Opcode.REQUEST_PUBLISH_RECORD:
                 HandleRequestPublishRecord(data);
@@ -554,11 +556,11 @@ public class SyncSession
         HandleDecryptedPacket(opcode, subOpcode, packetData);
     }
 
-    private void HandleRelayedData(ReadOnlySpan<byte> data)
+    private void HandleRelayData(ReadOnlySpan<byte> data)
     {
         if (data.Length < 8)
         {
-            Logger.Error<SyncSession>("RELAYED_DATA packet too short");
+            Logger.Error<SyncSession>("RELAY_DATA packet too short");
             return;
         }
 
@@ -784,13 +786,13 @@ public class SyncSession
         }
     }
 
-    private void HandleRequestRelayedTransport(ReadOnlySpan<byte> data)
+    private void HandleRequestTransport(ReadOnlySpan<byte> data)
     {
         Interlocked.Increment(ref _server.Metrics.TotalRelayedConnectionsRequested);
 
         if (data.Length < 40)
         {
-            Logger.Error<SyncSession>("REQUEST_RELAYED_TRANSPORT packet too short");
+            Logger.Error<SyncSession>("REQUEST_TRANSPORT packet too short");
             return;
         }
         int requestId = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(0, 4));
@@ -798,16 +800,18 @@ public class SyncSession
         int handshakeMessageLength = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(36, 4));
         if (data.Length != 40 + handshakeMessageLength)
         {
-            Logger.Error<SyncSession>($"Invalid REQUEST_RELAYED_TRANSPORT packet size. Expected {40 + handshakeMessageLength}, got {data.Length}");
+            Logger.Error<SyncSession>($"Invalid REQUEST_TRANSPORT packet size. Expected {44 + handshakeMessageLength}, got {data.Length}");
             return;
         }
         byte[] handshakeMessage = data.Slice(40, handshakeMessageLength).ToArray();
+
+        Logger.Verbose<SyncSession>($"Transport request received (from = {RemotePublicKey}, to = {targetPublicKey}).");
 
         // Check if the relay attempt is blacklisted
         if (_server.IsBlacklisted(RemotePublicKey!, targetPublicKey))
         {
             Logger.Info<SyncSession>($"Relay request from {RemotePublicKey} to {targetPublicKey} rejected due to blacklist.");
-            Send(Opcode.RESPONSE_RELAYED_TRANSPORT, 1, BitConverter.GetBytes(requestId));
+            Send(Opcode.RESPONSE_TRANSPORT_RELAYED, 1, BitConverter.GetBytes(requestId));
             return;
         }
 
@@ -815,7 +819,7 @@ public class SyncSession
         if (activeConnections >= MAX_RELAYED_CONNECTIONS_PER_INITIATOR)
         {
             Logger.Info<SyncSession>($"Too many active relayed connections for {RemotePublicKey}");
-            Send(Opcode.RESPONSE_RELAYED_TRANSPORT, 2, BitConverter.GetBytes(requestId)); // 2 = too many connections
+            Send(Opcode.RESPONSE_TRANSPORT_RELAYED, 2, BitConverter.GetBytes(requestId)); // 2 = too many connections
             return;
         }
 
@@ -823,7 +827,7 @@ public class SyncSession
         if (targetSession == null)
         {
             Logger.Info<SyncSession>($"Target {targetPublicKey} not found for relay request.");
-            Send(Opcode.RESPONSE_RELAYED_TRANSPORT, 1, BitConverter.GetBytes(requestId));
+            Send(Opcode.RESPONSE_TRANSPORT_RELAYED, 1, BitConverter.GetBytes(requestId));
             return;
         }
 
@@ -832,16 +836,19 @@ public class SyncSession
 
         byte[] initiatorPublicKeyBytes = Convert.FromBase64String(RemotePublicKey!);
 
-        var packetSize = 48 + handshakeMessageLength;
+        var packetSize = 4 + 48 + handshakeMessageLength;
         var packetToTarget = Utilities.RentBytes(packetSize);
         try
         {
-            BinaryPrimitives.WriteInt64LittleEndian(packetToTarget.AsSpan(0, 8), connectionId);
-            BinaryPrimitives.WriteInt32LittleEndian(packetToTarget.AsSpan(8, 4), requestId);
-            initiatorPublicKeyBytes.CopyTo(packetToTarget.AsSpan(12, 32));
-            BinaryPrimitives.WriteInt32LittleEndian(packetToTarget.AsSpan(44, 4), handshakeMessageLength);
-            handshakeMessage.CopyTo(packetToTarget.AsSpan(48));
-            targetSession.Send(Opcode.REQUEST_RELAYED_TRANSPORT, 0, packetToTarget.AsSpan(0, packetSize));
+            Logger.Verbose<SyncSession>($"Forwarding transport  {RemotePublicKey}");
+
+            BinaryPrimitives.WriteInt32LittleEndian(packetToTarget.AsSpan(0, 4), RemoteVersion);
+            BinaryPrimitives.WriteInt64LittleEndian(packetToTarget.AsSpan(4, 8), connectionId);
+            BinaryPrimitives.WriteInt32LittleEndian(packetToTarget.AsSpan(12, 4), requestId);
+            initiatorPublicKeyBytes.CopyTo(packetToTarget.AsSpan(16, 32));
+            BinaryPrimitives.WriteInt32LittleEndian(packetToTarget.AsSpan(48, 4), handshakeMessageLength);
+            handshakeMessage.CopyTo(packetToTarget.AsSpan(52));
+            targetSession.Send(Opcode.REQUEST_TRANSPORT_RELAYED, 0, packetToTarget.AsSpan(0, packetSize));
         }
         finally
         {
@@ -1089,7 +1096,7 @@ public class SyncSession
 
     public void HandleVersionCheck(ReadOnlySpan<byte> data)
     {
-        const int MINIMUM_VERSION = 2;
+        const int MINIMUM_VERSION = 4;
 
         if (data.Length != 4)
             throw new Exception("Expected exactly 4 bytes representing the version");
@@ -1099,7 +1106,7 @@ public class SyncSession
             throw new Exception($"Version must be at least {MINIMUM_VERSION}");
     }
 
-    private const int CURRENT_VERSION = 3;
+    private const int CURRENT_VERSION = 4;
     private static readonly byte[] VersionBytes = { CURRENT_VERSION, 0, 0, 0 };
     public void SendVersion()
     {
