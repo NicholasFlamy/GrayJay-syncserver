@@ -2035,6 +2035,10 @@ public class SyncSocketSession : IDisposable
             kvp.Value.TrySetCanceled();
         _pendingGetRecordRequests.Clear();
 
+        foreach (var kvp in _pendingBulkGetRecordRequests)
+            kvp.Value.TrySetCanceled();
+        _pendingBulkGetRecordRequests.Clear();
+
         foreach (var kvp in _pendingBulkConnectionInfoRequests)
             kvp.Value.TrySetCanceled();
         _pendingBulkConnectionInfoRequests.Clear();
