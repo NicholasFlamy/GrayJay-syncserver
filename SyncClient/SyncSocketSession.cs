@@ -317,10 +317,10 @@ public class SyncSocketSession : IDisposable
                     int bytesToSend;
                     int segmentPacketSize;
 
-                    Opcode op;
+                    StreamOpcode op;
                     if (sendOffset == 0)
                     {
-                        op = Opcode.STREAM_START;
+                        op = StreamOpcode.START;
                         bytesToSend = segmentSize - 4 - 4 - 1 - 1;
                         segmentPacketSize = bytesToSend + 4 + 4 + 1 + 1;
                     }
@@ -328,14 +328,14 @@ public class SyncSocketSession : IDisposable
                     {
                         bytesToSend = Math.Min(segmentSize - 4 - 4, bytesRemaining);
                         if (bytesToSend >= bytesRemaining)
-                            op = Opcode.STREAM_END;
+                            op = StreamOpcode.END;
                         else
-                            op = Opcode.STREAM_DATA;
+                            op = StreamOpcode.DATA;
 
                         segmentPacketSize = bytesToSend + 4 + 4;
                     }
 
-                    if (op == Opcode.STREAM_START)
+                    if (op == StreamOpcode.START)
                     {
                         //TODO: replace segmentData.AsSpan() into a local variable once C# 13
                         BinaryPrimitives.WriteInt32LittleEndian(segmentData.AsSpan().Slice(0, 4), id);
@@ -353,7 +353,7 @@ public class SyncSocketSession : IDisposable
                     }
 
                     sendOffset += bytesToSend;
-                    await SendAsync((byte)op, 0, segmentData.AsSpan().Slice(0, segmentPacketSize).ToArray(), cancellationToken: cancellationToken);
+                    await SendAsync((byte)Opcode.STREAM, (byte)op, segmentData.AsSpan().Slice(0, segmentPacketSize).ToArray(), cancellationToken: cancellationToken);
                 }
             }
             finally
@@ -460,7 +460,7 @@ public class SyncSocketSession : IDisposable
             BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(0, 4), requestId);
             publicKeyBytes.CopyTo(packet.AsSpan(4, 32));
 
-            _ = SendAsync(Opcode.REQUEST_CONNECTION_INFO, 0, packet, cancellationToken: cancellationToken)
+            _ = SendAsync(Opcode.REQUEST, (byte)RequestOpcode.CONNECTION_INFO, packet, cancellationToken: cancellationToken)
                 .ContinueWith(t =>
                 {
                     if (t.IsFaulted && _pendingConnectionInfoRequests.TryRemove(requestId, out var failedTcs))
@@ -511,7 +511,7 @@ public class SyncSocketSession : IDisposable
                 writer.Write(pkBytes); // 32 bytes per public key
             }
             var packet = ms.ToArray();
-            await SendAsync(Opcode.REQUEST_BULK_CONNECTION_INFO, 0, packet, cancellationToken: cancellationToken);
+            await SendAsync(Opcode.REQUEST, (byte)RequestOpcode.BULK_CONNECTION_INFO, packet, cancellationToken: cancellationToken);
         }
         catch (Exception ex)
         {
@@ -558,7 +558,7 @@ public class SyncSocketSession : IDisposable
             BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(36, 4), bytesWritten);
             message.AsSpan(0, bytesWritten).CopyTo(packet.AsSpan(40));
 
-            _ = SendAsync(Opcode.REQUEST_TRANSPORT, 0, packet, cancellationToken: cancellationToken)
+            _ = SendAsync(Opcode.REQUEST, (byte)RequestOpcode.TRANSPORT, packet, cancellationToken: cancellationToken)
                 .ContinueWith(t =>
                 {
                     if (t.IsFaulted && _pendingChannels.TryRemove(requestId, out var pending))
@@ -666,61 +666,47 @@ public class SyncSocketSession : IDisposable
         }
 
         // Send encrypted data
-        await SendAsync(Opcode.PUBLISH_CONNECTION_INFO, 0, publishBytes, cancellationToken: cancellationToken);
+        await SendAsync(Opcode.NOTIFY, (byte)NotifyOpcode.CONNECTION_INFO, publishBytes, cancellationToken: cancellationToken);
     }
 
-    private void HandlePacket(Opcode opcode, byte subOpcode, ReadOnlySpan<byte> data, ChannelRelayed? sourceChannel = null)
+    private void HandleNotify(NotifyOpcode opcode, ReadOnlySpan<byte> data, ChannelRelayed? sourceChannel = null)
     {
-        if (Logger.WillLog(LogLevel.Verbose))
-            Logger.Verbose<SyncSocketSession>($"HandlePacket (opcode = {opcode}, subOpcode = {subOpcode}, data.length = {data.Length}, sourceChannel.ConnectionId = {sourceChannel?.ConnectionId})");
+        switch (opcode)
+        {
+            case NotifyOpcode.AUTHORIZED:
+            case NotifyOpcode.UNAUTHORIZED:
+                //Ignore for sourceChannel != null because in order to establish the channel authorization is already completed
+                if (sourceChannel == null)
+                    _onData?.Invoke(this, Opcode.NOTIFY, (byte)opcode, data);
+                break;
+            case NotifyOpcode.CONNECTION_INFO:
+                break;
+        }
+    }
+
+    private void HandleResponse(ResponseOpcode opcode, ReadOnlySpan<byte> data, ChannelRelayed? sourceChannel = null)
+    {
+        if (data.Length < 8)
+        {
+            Logger.Error<SyncSocketSession>("Response packet too short");
+            return;
+        }
+
+        int requestId = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(0, 4));
+        int statusCode = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(4, 4));
+        data = data.Slice(8);
 
         switch (opcode)
         {
-            case Opcode.PING:
-                Task.Run(async () =>
+            case ResponseOpcode.CONNECTION_INFO:
                 {
-                    try
-                    {
-                        if (sourceChannel != null)
-                        {
-                            await sourceChannel.SendRelayedDataAsync(Opcode.PONG, 0);
-                        }
-                        else
-                        {
-                            await SendAsync(Opcode.PONG);
-                        }
-                    }
-                    catch (Exception e)
-                    {
-                        Logger.Error<SyncSocketSession>("Failed to send pong: " + e.ToString(), e);
-                    }
-                });
-                Logger.Debug<SyncSocketSession>("Received PONG");
-                return;
-            case Opcode.PONG:
-                Logger.Debug<SyncSocketSession>("Received PONG");
-                return;
-            case Opcode.NOTIFY_AUTHORIZED:
-            case Opcode.NOTIFY_UNAUTHORIZED:
-                //Ignore for sourceChannel != null because in order to establish the channel authorization is already completed
-                if (sourceChannel == null)
-                    _onData?.Invoke(this, opcode, subOpcode, data);
-                return;
-            case Opcode.RESPONSE_CONNECTION_INFO:
-                {
-                    if (data.Length < 4)
-                    {
-                        Logger.Error<SyncSocketSession>("RESPONSE_CONNECTION_INFO packet too short");
-                        return;
-                    }
-                    int requestId = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(0, 4));
                     if (_pendingConnectionInfoRequests.TryRemove(requestId, out var tcs))
                     {
-                        if (subOpcode == 0)
+                        if (statusCode == 0)
                         {
                             try
                             {
-                                var connectionInfo = ParseConnectionInfo(data.Slice(4));
+                                var connectionInfo = ParseConnectionInfo(data);
                                 tcs.SetResult(connectionInfo);
                             }
                             catch (Exception ex)
@@ -729,38 +715,30 @@ public class SyncSocketSession : IDisposable
                             }
                         }
                         else
-                        {
                             tcs.SetResult(null);
-                        }
                     }
                     else
-                    {
                         Logger.Error<SyncSocketSession>($"No pending request for requestId {requestId}");
-                    }
                     return;
                 }
-            case Opcode.REQUEST_TRANSPORT_RELAYED:
-                Logger.Info<SyncSocketSession>("Received request for a relayed transport");
-                HandleRequestTransportRelayed(data);
-                return;
-            case Opcode.RESPONSE_TRANSPORT_RELAYED:
-                if (subOpcode == 0)
+            case ResponseOpcode.TRANSPORT_RELAYED:
+                if (statusCode == 0)
                 {
                     if (data.Length < 16)
                     {
                         Logger.Error<SyncSocketSession>("RESPONSE_RELAYED_TRANSPORT packet too short");
                         return;
                     }
+                    
                     int remoteVersion = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(0, 4));
-                    int requestId = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(4, 4));
-                    long connectionId = BinaryPrimitives.ReadInt64LittleEndian(data.Slice(8, 8));
-                    int messageLength = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(16, 4));
-                    if (data.Length != 20 + messageLength)
+                    long connectionId = BinaryPrimitives.ReadInt64LittleEndian(data.Slice(4, 8));
+                    int messageLength = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(12, 4));
+                    if (data.Length != 16 + messageLength)
                     {
-                        Logger.Error<SyncSocketSession>($"Invalid RESPONSE_RELAYED_TRANSPORT packet size. Expected {20 + messageLength}, got {data.Length}");
+                        Logger.Error<SyncSocketSession>($"Invalid RESPONSE_RELAYED_TRANSPORT packet size. Expected {16 + messageLength}, got {data.Length}");
                         return;
                     }
-                    byte[] handshakeMessage = data.Slice(20, messageLength).ToArray();
+                    byte[] handshakeMessage = data.Slice(16, messageLength).ToArray();
                     if (_pendingChannels.TryRemove(requestId, out var pending))
                     {
                         var (channel, tcs) = pending;
@@ -772,47 +750,26 @@ public class SyncSocketSession : IDisposable
                         tcs.SetResult(channel);
                     }
                     else
-                    {
                         Logger.Error<SyncSocketSession>($"No pending channel for requestId {requestId}");
-                    }
                 }
                 else
                 {
-                    if (data.Length < 4)
-                    {
-                        Logger.Error<SyncSocketSession>("RESPONSE_RELAYED_TRANSPORT error packet too short");
-                        return;
-                    }
-                    int requestId = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(0, 4));
                     if (_pendingChannels.TryRemove(requestId, out var pending))
                     {
                         var (channel, tcs) = pending;
                         channel.Dispose();
-                        tcs.SetException(new Exception($"Relayed transport request {requestId} failed with error code {subOpcode}"));
+                        tcs.SetException(new Exception($"Relayed transport request {requestId} failed with error code {statusCode}"));
                     }
                 }
                 return;
-            case Opcode.RELAYED_DATA:
-                HandleRelayedData(subOpcode, data);
-                return;
-            case Opcode.RESPONSE_PUBLISH_RECORD:
+            case ResponseOpcode.PUBLISH_RECORD:
                 {
-                    if (data.Length < 4)
-                    {
-                        Logger.Error<SyncSocketSession>("RESPONSE_PUBLISH_RECORD packet too short");
-                        return;
-                    }
-                    int requestId = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(0, 4));
                     if (_pendingPublishRequests.TryRemove(requestId, out var tcs))
                     {
-                        if (subOpcode == 0)
-                        {
-                            tcs.SetResult(true); // Success
-                        }
+                        if (statusCode == 0)
+                            tcs.SetResult(true);
                         else
-                        {
-                            tcs.SetResult(false); // Error
-                        }
+                            tcs.SetResult(false);
                     }
                     else
                     {
@@ -821,24 +778,14 @@ public class SyncSocketSession : IDisposable
                     return;
                 }
 
-            case Opcode.RESPONSE_DELETE_RECORD:
+            case ResponseOpcode.DELETE_RECORD:
                 {
-                    if (data.Length < 4)
-                    {
-                        Logger.Error<SyncSocketSession>("RESPONSE_DELETE_RECORD packet too short");
-                        return;
-                    }
-                    int requestId = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(0, 4));
                     if (_pendingDeleteRequests.TryRemove(requestId, out var tcs))
                     {
-                        if (subOpcode == 0)
-                        {
-                            tcs.SetResult(true); // Success
-                        }
+                        if (statusCode == 0)
+                            tcs.SetResult(true);
                         else
-                        {
-                            tcs.SetResult(false); // Error
-                        }
+                            tcs.SetResult(false);
                     }
                     else
                     {
@@ -846,20 +793,14 @@ public class SyncSocketSession : IDisposable
                     }
                     return;
                 }
-            case Opcode.RESPONSE_BULK_DELETE_RECORD:
+            case ResponseOpcode.BULK_DELETE_RECORD:
                 {
-                    if (data.Length < 4)
-                    {
-                        Logger.Error<SyncSocketSession>("RESPONSE_BULK_DELETE_RECORD packet too short");
-                        return;
-                    }
-                    int requestId = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(0, 4));
                     if (_pendingDeleteRequests.TryRemove(requestId, out var tcs))
                     {
-                        if (subOpcode == 0)
-                            tcs.SetResult(true); // Success
+                        if (statusCode == 0)
+                            tcs.SetResult(true);
                         else
-                            tcs.SetResult(false); // Error
+                            tcs.SetResult(false);
                     }
                     else
                     {
@@ -867,15 +808,8 @@ public class SyncSocketSession : IDisposable
                     }
                     return;
                 }
-            case Opcode.RESPONSE_LIST_RECORD_KEYS:
+            case ResponseOpcode.LIST_RECORD_KEYS:
                 {
-                    if (data.Length < 5)
-                    {
-                        Logger.Error<SyncSocketSession>("RESPONSE_LIST_RECORD_KEYS packet too short");
-                        return;
-                    }
-                    int requestId = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(0, 4));
-                    byte statusCode = data[4];
                     if (_pendingListKeysRequests.TryRemove(requestId, out var tcs))
                     {
                         if (statusCode == 0)
@@ -883,33 +817,30 @@ public class SyncSocketSession : IDisposable
                             try
                             {
                                 var keys = new List<(string Key, DateTime Timestamp)>();
-                                ReadOnlySpan<byte> span = data.Slice(5);
-                                if (span.Length < 4)
-                                {
+                                if (data.Length < 4)
                                     throw new Exception("Packet too short for key count");
-                                }
-                                int keyCount = BinaryPrimitives.ReadInt32LittleEndian(span.Slice(0, 4));
-                                span = span.Slice(4);
+                                int keyCount = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(0, 4));
+                                data = data.Slice(4);
                                 for (int i = 0; i < keyCount; i++)
                                 {
-                                    if (span.Length < 1)
+                                    if (data.Length < 1)
                                     {
                                         throw new Exception("Packet too short for key length");
                                     }
-                                    byte keyLength = span[0];
-                                    span = span.Slice(1);
-                                    if (span.Length < keyLength)
+                                    byte keyLength = data[0];
+                                    data = data.Slice(1);
+                                    if (data.Length < keyLength)
                                     {
                                         throw new Exception("Packet too short for key data");
                                     }
-                                    string key = Encoding.UTF8.GetString(span.Slice(0, keyLength));
-                                    span = span.Slice(keyLength);
-                                    if (span.Length < 8)
+                                    string key = Encoding.UTF8.GetString(data.Slice(0, keyLength));
+                                    data = data.Slice(keyLength);
+                                    if (data.Length < 8)
                                     {
                                         throw new Exception("Packet too short for timestamp");
                                     }
-                                    long timestampBinary = BinaryPrimitives.ReadInt64LittleEndian(span.Slice(0, 8));
-                                    span = span.Slice(8);
+                                    long timestampBinary = BinaryPrimitives.ReadInt64LittleEndian(data.Slice(0, 8));
+                                    data = data.Slice(8);
                                     DateTime timestamp = DateTime.FromBinary(timestampBinary);
                                     keys.Add((key, timestamp));
                                 }
@@ -931,21 +862,15 @@ public class SyncSocketSession : IDisposable
                     }
                     return;
                 }
-            case Opcode.RESPONSE_BULK_GET_RECORD:
+            case ResponseOpcode.BULK_GET_RECORD:
                 {
-                    if (data.Length < 5)
+                    if (_pendingBulkGetRecordRequests.TryRemove(requestId, out var getTcs))
                     {
-                        Logger.Error<SyncSocketSession>("RESPONSE_BULK_GET_RECORD packet too short");
-                        return;
-                    }
-                    int getRequestId = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(0, 4));
-                    if (_pendingBulkGetRecordRequests.TryRemove(getRequestId, out var getTcs))
-                    {
-                        if (subOpcode == 0)
+                        if (statusCode == 0)
                         {
                             try
                             {
-                                int offset = 4;
+                                int offset = 0;
                                 byte recordCount = data[offset];
                                 offset += 1;
                                 var records = new Dictionary<string, (byte[], DateTime)>(recordCount);
@@ -1021,26 +946,20 @@ public class SyncSocketSession : IDisposable
                         }
                         else
                         {
-                            getTcs.SetException(new Exception($"Error getting bulk records: subOpcode {subOpcode}"));
+                            getTcs.SetException(new Exception($"Error getting bulk records: statusCode {statusCode}"));
                         }
                     }
                     return;
                 }
-            case Opcode.RESPONSE_GET_RECORD:
+            case ResponseOpcode.GET_RECORD:
                 {
-                    if (data.Length < 4)
-                    {
-                        Logger.Error<SyncSocketSession>("RESPONSE_GET_RECORD packet too short");
-                        return;
-                    }
-                    int requestId = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(0, 4));
                     if (_pendingGetRecordRequests.TryRemove(requestId, out var tcs))
                     {
-                        if (subOpcode == 0)
+                        if (statusCode == 0)
                         {
                             try
                             {
-                                int offset = 4;
+                                int offset = 0;
                                 int blobLength = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(offset, 4));
                                 offset += 4;
                                 var encryptedBlob = data.Slice(offset, blobLength);
@@ -1101,49 +1020,37 @@ public class SyncSocketSession : IDisposable
                                 tcs.SetException(ex);
                             }
                         }
-                        else if (subOpcode == 2)
+                        else if (statusCode == 2)
                         {
                             tcs.SetResult(null); // Record not found
                         }
                         else
                         {
-                            tcs.SetException(new Exception($"Error getting record: subOpcode {subOpcode}"));
+                            tcs.SetException(new Exception($"Error getting record: statusCode {statusCode}"));
                         }
                     }
                     return;
                 }
-            case Opcode.RESPONSE_BULK_PUBLISH_RECORD:
+            case ResponseOpcode.BULK_PUBLISH_RECORD:
                 {
-                    if (data.Length < 4)
+                    if (_pendingPublishRequests.TryRemove(requestId, out var publishTcs))
                     {
-                        Logger.Error<SyncSocketSession>("RESPONSE_BULK_PUBLISH_RECORD packet too short");
-                        return;
-                    }
-                    int publishRequestId = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(0, 4));
-                    if (_pendingPublishRequests.TryRemove(publishRequestId, out var publishTcs))
-                    {
-                        publishTcs.SetResult(subOpcode == 0);
+                        publishTcs.SetResult(statusCode == 0);
                     }
                     else
                     {
-                        Logger.Error<SyncSocketSession>($"No pending bulk publish request for requestId {publishRequestId}");
+                        Logger.Error<SyncSocketSession>($"No pending bulk publish request for requestId {requestId}");
                     }
                     return;
                 }
-            case Opcode.RESPONSE_BULK_CONNECTION_INFO:
+            case ResponseOpcode.BULK_CONNECTION_INFO:
                 {
-                    if (data.Length < 5)
-                    {
-                        Logger.Error<SyncSocketSession>("RESPONSE_BULK_CONNECTION_INFO packet too short");
-                        return;
-                    }
-                    int requestId = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(0, 4));
                     if (_pendingBulkConnectionInfoRequests.TryRemove(requestId, out var tcs))
                     {
                         try
                         {
                             var result = new Dictionary<string, ConnectionInfo?>();
-                            int offset = 4;
+                            int offset = 0;
                             byte numResponses = data[offset];
                             offset += 1;
                             for (int i = 0; i < numResponses; i++)
@@ -1191,17 +1098,24 @@ public class SyncSocketSession : IDisposable
                     return;
                 }
         }
+    }
 
-        var isAuthorized = IsAuthorized || sourceChannel != null;
-        if (!isAuthorized)
-        {
-            Logger.Warning<SyncSocketSession>($"Ignored message due to lack of authorization (opcode: {opcode}, subOpcode: {subOpcode}) because ");
-            return;
-        }
-
+    private void HandleRequest(RequestOpcode opcode, ReadOnlySpan<byte> data, ChannelRelayed? sourceChannel = null)
+    {
         switch (opcode)
         {
-            case Opcode.STREAM_START:
+            case RequestOpcode.TRANSPORT_RELAYED:
+                Logger.Info<SyncSocketSession>("Received request for a relayed transport");
+                HandleRequestTransportRelayed(data);
+                break;
+        }
+    }
+
+    private void HandleStream(StreamOpcode opcode, ReadOnlySpan<byte> data, ChannelRelayed? sourceChannel = null)
+    {
+        switch (opcode)
+        {
+            case StreamOpcode.START:
                 {
                     ReadOnlySpan<byte> span = data;
                     int id = BinaryPrimitives.ReadInt32LittleEndian(span);
@@ -1221,7 +1135,7 @@ public class SyncSocketSession : IDisposable
                     }
                     break;
                 }
-            case Opcode.STREAM_DATA:
+            case StreamOpcode.DATA:
                 {
                     ReadOnlySpan<byte> span = data;
                     int id = BinaryPrimitives.ReadInt32LittleEndian(span);
@@ -1240,7 +1154,7 @@ public class SyncSocketSession : IDisposable
                         syncStream.Add(span);
                     break;
                 }
-            case Opcode.STREAM_END:
+            case StreamOpcode.END:
                 {
                     ReadOnlySpan<byte> span = data;
                     int id = BinaryPrimitives.ReadInt32LittleEndian(span);
@@ -1272,6 +1186,79 @@ public class SyncSocketSession : IDisposable
                     }
                     break;
                 }
+        }
+    }
+
+    private void HandleRelay(RelayOpcode opcode, ReadOnlySpan<byte> data, ChannelRelayed? sourceChannel = null)
+    {
+        switch (opcode)
+        {
+            case RelayOpcode.RELAYED_DATA:
+                HandleRelayedData(data);
+                break;
+            case RelayOpcode.RELAYED_ERROR:
+                HandleRelayedError(data);
+                break;
+        }
+    }
+
+    private void HandlePacket(Opcode opcode, byte subOpcode, ReadOnlySpan<byte> data, ChannelRelayed? sourceChannel = null)
+    {
+        if (Logger.WillLog(LogLevel.Verbose))
+            Logger.Verbose<SyncSocketSession>($"HandlePacket (opcode = {opcode}, subOpcode = {subOpcode}, data.length = {data.Length}, sourceChannel.ConnectionId = {sourceChannel?.ConnectionId})");
+
+        switch (opcode)
+        {
+            case Opcode.PING:
+                Task.Run(async () =>
+                {
+                    try
+                    {
+                        if (sourceChannel != null)
+                        {
+                            await sourceChannel.SendRelayedDataAsync(Opcode.PONG, 0);
+                        }
+                        else
+                        {
+                            await SendAsync(Opcode.PONG);
+                        }
+                    }
+                    catch (Exception e)
+                    {
+                        Logger.Error<SyncSocketSession>("Failed to send pong: " + e.ToString(), e);
+                    }
+                });
+                Logger.Debug<SyncSocketSession>("Received PONG");
+                return;
+            case Opcode.PONG:
+                Logger.Debug<SyncSocketSession>("Received PONG");
+                return;
+            case Opcode.RESPONSE:
+                HandleResponse((ResponseOpcode)subOpcode, data, sourceChannel);
+                return;
+            case Opcode.REQUEST:
+                HandleRequest((RequestOpcode)subOpcode, data, sourceChannel);
+                return;
+            case Opcode.NOTIFY:
+                HandleNotify((NotifyOpcode)subOpcode, data, sourceChannel);
+                return;
+            case Opcode.RELAY:
+                HandleRelay((RelayOpcode)subOpcode, data, sourceChannel);
+                return;
+        }
+
+        var isAuthorized = IsAuthorized || sourceChannel != null;
+        if (!isAuthorized)
+        {
+            Logger.Warning<SyncSocketSession>($"Ignored message due to lack of authorization (opcode: {opcode}, subOpcode: {subOpcode}) because ");
+            return;
+        }
+
+        switch (opcode)
+        {
+            case Opcode.STREAM:
+                HandleStream((StreamOpcode)subOpcode, data, sourceChannel);
+                break;
             case Opcode.DATA:
                 {
                     if (sourceChannel != null)
@@ -1286,24 +1273,17 @@ public class SyncSocketSession : IDisposable
         }
     }
 
-    private void HandleRelayedData(byte subOpcode, ReadOnlySpan<byte> data)
+    private void HandleRelayedData(ReadOnlySpan<byte> data)
     {
         if (data.Length < 8)
         {
-            Logger.Error<SyncSocketSession>("RELAYED_DATA packet too short");
+            Logger.Error<SyncSocketSession>("RELAYED_DATA packet too short.");
             return;
         }
         long connectionId = BinaryPrimitives.ReadInt64LittleEndian(data.Slice(0, 8));
         if (!_channels.TryGetValue(connectionId, out var channel))
         {
-            Logger.Error<SyncSocketSession>($"No channel found for connectionId {connectionId}");
-            return;
-        }
-        if (data.Length == 8)
-        {
-            _channels.TryRemove(connectionId, out _);
-            channel.Dispose();
-            Logger.Info<SyncSocketSession>($"Relayed connection {connectionId} closed by peer");
+            Logger.Error<SyncSocketSession>($"No channel found for connectionId {connectionId}.");
             return;
         }
 
@@ -1312,11 +1292,27 @@ public class SyncSocketSession : IDisposable
         int plen = channel.Transport!.ReadMessage(encryptedPayload, decryptedPayload);
         if (plen != decryptedPayload.Length)
         {
-            Logger.Error<SyncSocketSession>("Failed to decrypt relayed data");
+            Logger.Error<SyncSocketSession>("Failed to decrypt relayed data.");
             return;
         }
 
         HandleData(decryptedPayload, plen, channel);
+    }
+
+    private void HandleRelayedError(ReadOnlySpan<byte> data)
+    {
+        if (data.Length < 12)
+        {
+            Logger.Error<SyncSocketSession>("RELAYED_ERROR packet too short");
+            return;
+        }
+
+        long connectionId = BinaryPrimitives.ReadInt64LittleEndian(data.Slice(0, 8));
+        int errorCode = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(12));
+        _channels.TryRemove(connectionId, out var channel);
+        channel?.Dispose();
+        Logger.Info<SyncSocketSession>($"Relayed connection {connectionId} closed by peer (error code: {errorCode}).");
+
     }
 
     public Task SendRelayedDataAsync(long connectionId, Opcode opcode, byte subOpcode, byte[]? data = null, int offset = 0, int count = -1, CancellationToken cancellationToken = default)
@@ -1352,10 +1348,10 @@ public class SyncSocketSession : IDisposable
 
                 // Prepare stream data
                 byte[] streamData;
-                Opcode streamOpcode;
+                StreamOpcode streamOpcode;
                 if (sendOffset == 0)
                 {
-                    streamOpcode = Opcode.STREAM_START;
+                    streamOpcode = StreamOpcode.START;
                     streamData = new byte[4 + 4 + 1 + 1 + bytesToSend];
                     BinaryPrimitives.WriteInt32LittleEndian(streamData.AsSpan(0, 4), streamId);
                     BinaryPrimitives.WriteInt32LittleEndian(streamData.AsSpan(4, 4), totalSize);
@@ -1369,14 +1365,14 @@ public class SyncSocketSession : IDisposable
                     BinaryPrimitives.WriteInt32LittleEndian(streamData.AsSpan(0, 4), streamId);
                     BinaryPrimitives.WriteInt32LittleEndian(streamData.AsSpan(4, 4), sendOffset);
                     Array.Copy(data, offset + sendOffset, streamData, 8, bytesToSend);
-                    streamOpcode = (bytesToSend < bytesRemaining) ? Opcode.STREAM_DATA : Opcode.STREAM_END;
+                    streamOpcode = (bytesToSend < bytesRemaining) ? StreamOpcode.DATA : StreamOpcode.END;
                 }
 
                 // Wrap with header
                 var fullPacket = new byte[HEADER_SIZE + streamData.Length];
                 BinaryPrimitives.WriteInt32LittleEndian(fullPacket.AsSpan(0, 4), streamData.Length + 2);
-                fullPacket[4] = (byte)streamOpcode;
-                fullPacket[5] = 0;
+                fullPacket[4] = (byte)Opcode.STREAM;
+                fullPacket[5] = (byte)streamOpcode;
                 Array.Copy(streamData, 0, fullPacket, HEADER_SIZE, streamData.Length);
 
                 await SendRelayedPacketAsync(channel, fullPacket, cancellationToken);
@@ -1404,7 +1400,7 @@ public class SyncSocketSession : IDisposable
         BinaryPrimitives.WriteInt64LittleEndian(relayedPacket.AsSpan(0, 8), channel.ConnectionId);
         Array.Copy(encryptedPayload, 0, relayedPacket, 8, encryptedLength);
 
-        await SendAsync(Opcode.RELAY_DATA, 0, relayedPacket, cancellationToken: cancellationToken);
+        await SendAsync(Opcode.RELAY, (byte)RelayOpcode.DATA, relayedPacket, cancellationToken: cancellationToken);
     }
 
     private void HandleRequestTransportRelayed(ReadOnlySpan<byte> data)
@@ -1430,14 +1426,15 @@ public class SyncSocketSession : IDisposable
         var isAllowedToConnect = publicKey != _localPublicKey && (_isChannelAllowed?.Invoke(this, publicKey) ?? false);
         if (!isAllowedToConnect)
         {
-            var rp = new byte[12];
-            BinaryPrimitives.WriteInt64LittleEndian(rp.AsSpan(0, 8), connectionId);
-            BinaryPrimitives.WriteInt32LittleEndian(rp.AsSpan(8, 4), requestId);
+            var rp = new byte[16];
+            BinaryPrimitives.WriteInt32LittleEndian(rp.AsSpan(0, 4), (int)2); //status code
+            BinaryPrimitives.WriteInt64LittleEndian(rp.AsSpan(4, 8), connectionId);
+            BinaryPrimitives.WriteInt32LittleEndian(rp.AsSpan(12, 4), requestId);
             _ = Task.Run(async () =>
             {
                 try
                 {
-                    await SendAsync(Opcode.RESPONSE_TRANSPORT, 2, rp);
+                    await SendAsync(Opcode.RESPONSE, (byte)ResponseOpcode.TRANSPORT, rp);
                 }
                 catch (Exception e)
                 {
@@ -1458,17 +1455,18 @@ public class SyncSocketSession : IDisposable
         channel.HandshakeState!.ReadMessage(handshakeMessage, plaintext);
         var (bytesWritten, _, transport) = channel.HandshakeState!.WriteMessage(null, message);
 
-        var responsePacket = new byte[16 + bytesWritten];
-        BinaryPrimitives.WriteInt64LittleEndian(responsePacket.AsSpan(0, 8), connectionId);
-        BinaryPrimitives.WriteInt32LittleEndian(responsePacket.AsSpan(8, 4), requestId);
-        BinaryPrimitives.WriteInt32LittleEndian(responsePacket.AsSpan(12, 4), bytesWritten);
-        message.AsSpan(0, bytesWritten).CopyTo(responsePacket.AsSpan(16));
+        var responsePacket = new byte[20 + bytesWritten];
+        BinaryPrimitives.WriteInt32LittleEndian(responsePacket.AsSpan(0, 4), (int)0); //status code
+        BinaryPrimitives.WriteInt64LittleEndian(responsePacket.AsSpan(4, 8), connectionId);
+        BinaryPrimitives.WriteInt32LittleEndian(responsePacket.AsSpan(12, 4), requestId);
+        BinaryPrimitives.WriteInt32LittleEndian(responsePacket.AsSpan(16, 4), bytesWritten);
+        message.AsSpan(0, bytesWritten).CopyTo(responsePacket.AsSpan(20));
 
         _ = Task.Run(async () =>
         {
             try
             {
-                await SendAsync(Opcode.RESPONSE_TRANSPORT, 0, responsePacket);
+                await SendAsync(Opcode.RESPONSE, (byte)ResponseOpcode.TRANSPORT, responsePacket);
             }
             catch (Exception e)
             {
@@ -1481,17 +1479,19 @@ public class SyncSocketSession : IDisposable
 
     private ConnectionInfo ParseConnectionInfo(ReadOnlySpan<byte> data)
     {
-        using var stream = new MemoryStream(data.ToArray());
-        using var reader = new BinaryReader(stream);
+        byte ipSize = data[0];
+        ReadOnlySpan<byte> remoteIpBytes = data.Slice(1, ipSize);
+        IPAddress remoteIp = new IPAddress(remoteIpBytes);
 
-        var expectedHandshakeSize = 32 + 16;
-        var ipSize = reader.ReadByte();
-        var remoteIpBytes = reader.ReadBytes(ipSize);
-        var remoteIp = new IPAddress(remoteIpBytes);
-        byte[] handshakeMessage = reader.ReadBytes(expectedHandshakeSize);
-        byte[] ciphertext = reader.ReadBytes(data.Length - expectedHandshakeSize - ipSize - 1);
+        int handshakeStart = 1 + ipSize;
+        ReadOnlySpan<byte> handshakeMessageSpan = data.Slice(handshakeStart, 48);
+        byte[] handshakeMessage = handshakeMessageSpan.ToArray();
+
+        int ciphertextStart = handshakeStart + 48;
+        ReadOnlySpan<byte> ciphertextSpan = data.Slice(ciphertextStart);
+        byte[] ciphertext = ciphertextSpan.ToArray();
+
         var protocol = new Protocol(HandshakePattern.N, CipherFunction.ChaChaPoly, HashFunction.Blake2b);
-
         using var handshakeState = protocol.Create(false, s: _localKeyPair.PrivateKey);
         var plaintextBuffer = new byte[0];
         var (_, _, transport) = handshakeState.ReadMessage(handshakeMessage, plaintextBuffer);
@@ -1503,40 +1503,47 @@ public class SyncSocketSession : IDisposable
             throw new Exception("Decryption failed: incomplete data");
         }
 
-        using var infoStream = new MemoryStream(decryptedData);
-        using var infoReader = new BinaryReader(infoStream);
-        ushort port = infoReader.ReadUInt16();
+        ReadOnlySpan<byte> infoSpan = decryptedData;
 
-        byte nameLength = infoReader.ReadByte();
-        byte[] nameBytes = infoReader.ReadBytes(nameLength);
+        ushort port = BinaryPrimitives.ReadUInt16LittleEndian(infoSpan);
+        infoSpan = infoSpan.Slice(2);
+
+        byte nameLength = infoSpan[0];
+        infoSpan = infoSpan.Slice(1);
+
+        ReadOnlySpan<byte> nameBytes = infoSpan.Slice(0, nameLength);
         string name = Encoding.UTF8.GetString(nameBytes);
+        infoSpan = infoSpan.Slice(nameLength);
 
-        byte ipv4Count = infoReader.ReadByte();
+        byte ipv4Count = infoSpan[0];
+        infoSpan = infoSpan.Slice(1);
+
         List<IPAddress> ipv4Addresses = new List<IPAddress>();
         for (int i = 0; i < ipv4Count; i++)
         {
-            byte[] addrBytes = infoReader.ReadBytes(4);
+            ReadOnlySpan<byte> addrBytes = infoSpan.Slice(0, 4);
             ipv4Addresses.Add(new IPAddress(addrBytes));
+            infoSpan = infoSpan.Slice(4);
         }
 
-        byte ipv6Count = infoReader.ReadByte();
+        byte ipv6Count = infoSpan[0];
+        infoSpan = infoSpan.Slice(1);
+
         List<IPAddress> ipv6Addresses = new List<IPAddress>();
         for (int i = 0; i < ipv6Count; i++)
         {
-            byte[] addrBytes = infoReader.ReadBytes(16);
+            ReadOnlySpan<byte> addrBytes = infoSpan.Slice(0, 16);
             ipv6Addresses.Add(new IPAddress(addrBytes));
+            infoSpan = infoSpan.Slice(16);
         }
 
-        bool allowLocal = infoReader.ReadByte() != 0;
-        bool allowRemoteDirect = infoReader.ReadByte() != 0;
-        bool allowRemoteHolePunched = infoReader.ReadByte() != 0;
-        bool allowRemoteProxied = infoReader.ReadByte() != 0;
-
-        Logger.Info<SyncSocketSession>(
-            $"Received connection info: port={port}, name={name}, " +
-            $"remoteIp={remoteIp}, ipv4={string.Join(", ", ipv4Addresses)}, ipv6={string.Join(", ", ipv6Addresses)}, " +
-            $"allowLocal={allowLocal}, allowRemoteDirect={allowRemoteDirect}, allowRemoteHolePunched={allowRemoteHolePunched}, allowRemoteProxied={allowRemoteProxied}"
-        );
+        bool allowLocal = infoSpan[0] != 0;
+        infoSpan = infoSpan.Slice(1);
+        bool allowRemoteDirect = infoSpan[0] != 0;
+        infoSpan = infoSpan.Slice(1);
+        bool allowRemoteHolePunched = infoSpan[0] != 0;
+        infoSpan = infoSpan.Slice(1);
+        bool allowRemoteProxied = infoSpan[0] != 0;
 
         return new ConnectionInfo(
             port,
@@ -1643,7 +1650,7 @@ public class SyncSocketSession : IDisposable
             }
 
             ArrayPool<byte>.Shared.Return(encryptedChunkBuffer);
-            await SendAsync(Opcode.REQUEST_BULK_PUBLISH_RECORD, 0, packet, cancellationToken: cancellationToken);
+            await SendAsync(Opcode.REQUEST, (byte)RequestOpcode.BULK_PUBLISH_RECORD, packet, cancellationToken: cancellationToken);
         }
         catch (Exception ex)
         {
@@ -1730,7 +1737,7 @@ public class SyncSocketSession : IDisposable
             }
 
             ArrayPool<byte>.Shared.Return(encryptedChunkBuffer);
-            await SendAsync(Opcode.REQUEST_PUBLISH_RECORD, 0, packet, cancellationToken: cancellationToken);
+            await SendAsync(Opcode.REQUEST, (byte)RequestOpcode.PUBLISH_RECORD, packet, cancellationToken: cancellationToken);
         }
         catch (Exception ex)
         {
@@ -1775,7 +1782,7 @@ public class SyncSocketSession : IDisposable
             offset += 1;
             keyBytes.CopyTo(packet.AsSpan(offset, keyBytes.Length));
 
-            await SendAsync(Opcode.REQUEST_GET_RECORD, 0, packet, cancellationToken: cancellationToken);
+            await SendAsync(Opcode.REQUEST, (byte)RequestOpcode.GET_RECORD, packet, cancellationToken: cancellationToken);
         }
         catch (Exception ex)
         {
@@ -1829,7 +1836,7 @@ public class SyncSocketSession : IDisposable
                 offset += 32;
             }
 
-            await SendAsync(Opcode.REQUEST_BULK_GET_RECORD, 0, packet, cancellationToken: cancellationToken);
+            await SendAsync(Opcode.REQUEST, (byte)RequestOpcode.BULK_GET_RECORD, packet, cancellationToken: cancellationToken);
         }
         catch (Exception ex)
         {
@@ -1880,7 +1887,7 @@ public class SyncSocketSession : IDisposable
                 writer.Write(keyBytes); // Variable: Key bytes
             }
             var packet = ms.ToArray();
-            await SendAsync(Opcode.REQUEST_BULK_DELETE_RECORD, 0, packet, cancellationToken: cancellationToken);
+            await SendAsync(Opcode.REQUEST, (byte)RequestOpcode.BULK_DELETE_RECORD, packet, cancellationToken: cancellationToken);
         }
         catch (Exception ex)
         {
@@ -1935,7 +1942,7 @@ public class SyncSocketSession : IDisposable
             offset += 1;
             keyBytes.CopyTo(packet.AsSpan(offset, keyBytes.Length));
 
-            _ = SendAsync(Opcode.REQUEST_DELETE_RECORD, 0, packet, cancellationToken: cancellationToken)
+            _ = SendAsync(Opcode.REQUEST, (byte)RequestOpcode.DELETE_RECORD, packet, cancellationToken: cancellationToken)
                 .ContinueWith(t =>
                 {
                     if (t.IsFaulted && _pendingDeleteRequests.TryRemove(requestId, out var failedTcs))
@@ -1985,7 +1992,7 @@ public class SyncSocketSession : IDisposable
             publisherPublicKeyBytes.CopyTo(packet.AsSpan(4, 32));
             consumerPublicKeyBytes.CopyTo(packet.AsSpan(36, 32));
 
-            _ = SendAsync(Opcode.REQUEST_LIST_RECORD_KEYS, 0, packet, cancellationToken: cancellationToken)
+            _ = SendAsync(Opcode.REQUEST, (byte)RequestOpcode.LIST_RECORD_KEYS, packet, cancellationToken: cancellationToken)
                 .ContinueWith(t =>
                 {
                     if (t.IsFaulted && _pendingListKeysRequests.TryRemove(requestId, out var failedTcs))

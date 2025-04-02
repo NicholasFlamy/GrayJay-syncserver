@@ -7,6 +7,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Text.Json.Serialization;
 using static SyncServer.SyncSession;
+using static System.Runtime.InteropServices.JavaScript.JSType;
 using LogLevel = SyncShared.LogLevel;
 
 namespace SyncServer;
@@ -180,9 +181,10 @@ public class TcpSyncServer : IDisposable
                 var otherSession = connection.Initiator == session ? connection.Target : connection.Initiator;
                 if (otherSession != null)
                 {
-                    var notification = new byte[8];
-                    BinaryPrimitives.WriteInt64LittleEndian(notification, kvp.Key);
-                    otherSession.Send(Opcode.RELAYED_DATA, 1, notification);
+                    var notification = new byte[12];
+                    BinaryPrimitives.WriteInt64LittleEndian(notification.AsSpan(0, 8), kvp.Key);
+                    BinaryPrimitives.WriteInt32LittleEndian(notification.AsSpan(8, 4), 2);
+                    otherSession.Send(Opcode.RELAY, (byte)RelayOpcode.RELAYED_ERROR, notification);
                 }
             }
         }
@@ -461,9 +463,10 @@ public class TcpSyncServer : IDisposable
                     var otherSession = connection.Initiator == session ? connection.Target : connection.Initiator;
                     if (otherSession != null && otherSession.PrimaryState != SessionPrimaryState.Closed)
                     {
-                        var notification = new byte[8];
-                        BinaryPrimitives.WriteInt64LittleEndian(notification, kvp.Key);
-                        otherSession.Send(Opcode.RELAYED_DATA, 1, notification);
+                        var notification = new byte[12];
+                        BinaryPrimitives.WriteInt64LittleEndian(notification.AsSpan(0, 8), kvp.Key);
+                        BinaryPrimitives.WriteInt32LittleEndian(notification.AsSpan(8, 4), 1);
+                        otherSession.Send(Opcode.RELAY, (byte)RelayOpcode.RELAYED_ERROR, notification);
                     }
                 }
             }
