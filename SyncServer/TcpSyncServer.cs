@@ -31,6 +31,7 @@ public class TcpSyncServerMetrics
     public long TotalRelayedConnectionsEstablished;
     public long TotalRelayedConnectionsFailed;
     public long TotalRelayedDataBytes;
+    public long TotalRelayedErrorBytes;
 
     public long TotalRateLimitExceedances;
 
@@ -453,6 +454,7 @@ public class TcpSyncServer : IDisposable
                 _connectionInfoStore.TryRemove(key, out _);
         }
 
+        Span<byte> notification = stackalloc byte[12];
         foreach (var kvp in RelayedConnections.ToArray())
         {
             var connection = kvp.Value;
@@ -462,10 +464,9 @@ public class TcpSyncServer : IDisposable
                 {
                     var otherSession = connection.Initiator == session ? connection.Target : connection.Initiator;
                     if (otherSession != null && otherSession.PrimaryState != SessionPrimaryState.Closed)
-                    {
-                        var notification = new byte[12];
-                        BinaryPrimitives.WriteInt64LittleEndian(notification.AsSpan(0, 8), kvp.Key);
-                        BinaryPrimitives.WriteInt32LittleEndian(notification.AsSpan(8, 4), 1);
+                    {                        
+                        BinaryPrimitives.WriteInt64LittleEndian(notification.Slice(0, 8), kvp.Key);
+                        BinaryPrimitives.WriteInt32LittleEndian(notification.Slice(8, 4), 1);
                         otherSession.Send(Opcode.RELAY, (byte)RelayOpcode.RELAYED_ERROR, notification);
                     }
                 }

@@ -61,5 +61,6 @@ public enum RelayOpcode : byte
     DATA = 0,
     RELAYED_DATA = 1,
     ERROR = 2,
-    RELAYED_ERROR = 3 //TODO: Server errors also included in this one, disentangle?
+    RELAYED_ERROR = 3,
+    RELAY_ERROR = 4
 }

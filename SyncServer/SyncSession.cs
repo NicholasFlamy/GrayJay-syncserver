@@ -548,9 +548,12 @@ public class SyncSession
         switch (opcode)
         {
             case RelayOpcode.DATA:
-                HandleRelayData(data);
+                ForwardRelayData(data);
                 break;
             case RelayOpcode.ERROR:
+                ForwardRelayError(data);
+                break;
+            case RelayOpcode.RELAY_ERROR:
                 HandleRelayError(data);
                 break;
         }
@@ -609,7 +612,7 @@ public class SyncSession
         HandleDecryptedPacket(opcode, subOpcode, packetData);
     }
 
-    private void HandleRelayData(ReadOnlySpan<byte> data)
+    private void ForwardRelayData(ReadOnlySpan<byte> data)
     {
         if (data.Length < 8)
         {
@@ -622,21 +625,21 @@ public class SyncSession
         if (_server.RateLimitExceeded(connectionId, data.Length))
         {
             Interlocked.Increment(ref _server.Metrics.TotalRateLimitExceedances);
-            Logger.Error<SyncSession>($"Exceeded rate limit by {RemotePublicKey}, connection terminated.");
+            Logger.Error<SyncSession>($"Received data to relay but exceeded rate limit by {RemotePublicKey}, connection terminated.");
             SendRelayError(connectionId, 1);
             _server.RemoveRelayedConnection(connectionId);
             return;
         }
         if (connection == null || !connection.IsActive)
         {
-            Logger.Error<SyncSession>($"No active relayed connection for connectionId {connectionId}");
-            SendRelayError(connectionId, 1);
+            Logger.Error<SyncSession>($"Received data to relay but no relayed connection for connectionId {connectionId}");
+            SendRelayError(connectionId, 2);
             return;
         }
         if (connection.Initiator != this && connection.Target != this)
         {
-            Logger.Error<SyncSession>($"Unauthorized access to relayed connection {connectionId} by {this.RemotePublicKey}");
-            SendRelayError(connectionId, 1);
+            Logger.Error<SyncSession>($"Received data to relay but unauthorized access to relayed connection {connectionId} by {this.RemotePublicKey}");
+            SendRelayError(connectionId, 3);
             return;
         }
         SyncSession? otherClient = connection.Initiator == this ? connection.Target : connection.Initiator;
@@ -659,40 +662,38 @@ public class SyncSession
             Logger.Warning<SyncSession>($"Relay data requested for null client by {this.RemotePublicKey}");
     }
 
-    private void HandleRelayError(ReadOnlySpan<byte> data)
+    private void ForwardRelayError(ReadOnlySpan<byte> data)
     {
         if (data.Length < 8)
         {
-            Logger.Error<SyncSession>("RELAY_ERROR packet too short");
+            Logger.Error<SyncSession>("ERROR relay packet too short");
             return;
         }
 
         long connectionId = BinaryPrimitives.ReadInt64LittleEndian(data.Slice(0, 8));
-        int errorCode = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(8, 4));
-
         var connection = _server.GetRelayedConnection(connectionId);
         if (connection == null || !connection.IsActive)
         {
-            Logger.Error<SyncSession>($"No active relayed connection for connectionId {connectionId}");
-            SendRelayError(connectionId, 1);
+            Logger.Error<SyncSession>($"Received error to relay but no active relayed connection for connectionId {connectionId}");
+            SendRelayError(connectionId, 2);
             return;
         }
         if (connection.Initiator != this && connection.Target != this)
         {
-            Logger.Error<SyncSession>($"Unauthorized access to relayed connection {connectionId} by {this.RemotePublicKey}");
-            SendRelayError(connectionId, 1);
+            Logger.Error<SyncSession>($"Received error to relay but unauthorized access to relayed connection {connectionId} by {this.RemotePublicKey}");
+            SendRelayError(connectionId, 3);
             return;
         }
         SyncSession? otherClient = connection.Initiator == this ? connection.Target : connection.Initiator;
         if (otherClient != null)
         {
-            byte[] packet = Utilities.RentBytes(12);
+            byte[] packet = Utilities.RentBytes(data.Length);
             try
             {
-                Logger.Verbose<SyncSession>($"Relay error requested for null client by {this.RemotePublicKey} (error code: {errorCode}).");
                 BinaryPrimitives.WriteInt64LittleEndian(packet.AsSpan(0, 8), connectionId);
-                BinaryPrimitives.WriteInt64LittleEndian(packet.AsSpan(8, 4), errorCode);
+                data.Slice(8).CopyTo(packet.AsSpan(8));
                 otherClient.Send(Opcode.RELAY, (byte)RelayOpcode.RELAYED_ERROR, packet.AsSpan(0, data.Length));
+                Interlocked.Add(ref _server.Metrics.TotalRelayedErrorBytes, data.Length - 8);
             }
             finally
             {
@@ -701,6 +702,39 @@ public class SyncSession
         }
         else
             Logger.Warning<SyncSession>($"Relay error requested for null client by {this.RemotePublicKey}");
+    }
+
+    private void HandleRelayError(ReadOnlySpan<byte> data)
+    {
+        if (data.Length < 12)
+        {
+            Logger.Error<SyncSession>("RELAY_ERROR packet too short");
+            return;
+        }
+
+        long connectionId = BinaryPrimitives.ReadInt64LittleEndian(data.Slice(0, 8));
+        int errorCode = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(8, 4));
+        var connection = _server.GetRelayedConnection(connectionId);
+        if (connection == null || !connection.IsActive)
+        {
+            Logger.Error<SyncSession>($"Received relay error but no active relayed connection for connectionId {connectionId}");
+            SendRelayError(connectionId, 2);
+            return;
+        }
+        if (connection.Initiator != this && connection.Target != this)
+        {
+            Logger.Error<SyncSession>($"Received relay error but it was unauthorized access to relayed connection {connectionId} by {this.RemotePublicKey}");
+            SendRelayError(connectionId, 3);
+            return;
+        }
+
+        Logger.Error<SyncSession>($"Received relay error {errorCode} from {this.RemotePublicKey} about connection {connectionId}, closing connection.");
+
+        SyncSession? otherClient = connection.Initiator == this ? connection.Target : connection.Initiator;
+        if (otherClient != null)
+            otherClient.SendRelayError(connectionId, errorCode);
+
+        _server.RemoveRelayedConnection(connectionId);
     }
 
     private void HandleRequestBulkDeleteRecord(ReadOnlySpan<byte> data)
@@ -1415,7 +1449,7 @@ public class SyncSession
         Span<byte> errorPacket = stackalloc byte[12];
         BinaryPrimitives.WriteInt64LittleEndian(errorPacket.Slice(0, 8), connectionId);
         BinaryPrimitives.WriteInt32LittleEndian(errorPacket.Slice(8, 4), errorCode);
-        Send(Opcode.RELAY, (byte)RelayOpcode.RELAYED_ERROR, errorPacket);
+        Send(Opcode.RELAY, (byte)RelayOpcode.RELAY_ERROR, errorPacket);
     }
 
     public void OnWriteCompleted()

@@ -341,7 +341,7 @@ namespace SyncServerTests
 
                 clientB.Dispose();
                 await Task.Delay(100);
-                await Assert.ThrowsExceptionAsync<NullReferenceException>(
+                await Assert.ThrowsExceptionAsync<ObjectDisposedException>(
                     async () => await channel.SendRelayedDataAsync(Opcode.DATA, 0, new byte[] { 1 }),
                     "Sending data after peer disconnect should fail"
                 );

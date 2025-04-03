@@ -1,5 +1,6 @@
 ﻿using Noise;
 using SyncShared;
+using System.Buffers.Binary;
 namespace SyncClient;
 
 public interface IChannel : IDisposable
@@ -48,22 +49,25 @@ public class ChannelSocket : IChannel
 
 public class ChannelRelayed : IChannel
 {
-    public long ConnectionId { get; set; }
-    public HandshakeState? HandshakeState;
-    public Transport? Transport { get; private set; } = null;
+    private SemaphoreSlim _sendSemaphore { get; } = new SemaphoreSlim(1);
+    private object _decryptLock = new object();
+    private HandshakeState? _handshakeState;
+    private Transport? _transport = null;
 
+    public long ConnectionId { get; set; }
     public string? RemotePublicKey { get; private set; }
     public int? RemoteVersion { get; private set; }
 
     private readonly KeyPair _localKeyPair;
     private readonly SyncSocketSession _session;
     private Action<SyncSocketSession, IChannel, Opcode, byte, ReadOnlySpan<byte>>? _onData;
+    private bool _disposed = false;
 
     public ChannelRelayed(SyncSocketSession session, KeyPair localKeyPair, string publicKey, bool initiator)
     {
         _session = session;
         _localKeyPair = localKeyPair;
-        HandshakeState = initiator
+        _handshakeState = initiator
             ? Constants.Protocol.Create(initiator, s: _localKeyPair.PrivateKey, rs: Convert.FromBase64String(publicKey))
             : Constants.Protocol.Create(initiator, s: _localKeyPair.PrivateKey);
     }
@@ -75,10 +79,35 @@ public class ChannelRelayed : IChannel
 
     public void Dispose()
     {
-        Transport?.Dispose();
-        Transport = null;
-        HandshakeState?.Dispose();
-        HandshakeState = null;
+        _disposed = true;
+
+        var connectionId = ConnectionId;
+        if (connectionId != 0)
+        {
+            Task.Run(async () =>
+            {
+                try
+                {
+                    await _session.SendRelayError(connectionId, 1);
+                }
+                catch (Exception ex)
+                {
+                    Logger.Error<SyncSocketSession>("Exception while sending relay error.", ex);
+                }
+            });
+        }
+
+        _sendSemaphore.Dispose();
+        _transport?.Dispose();
+        _transport = null;
+        _handshakeState?.Dispose();
+        _handshakeState = null;
+    }
+
+    private void ThrowIfDisposed()
+    {
+        if (_disposed) 
+            throw new ObjectDisposedException(nameof(ChannelRelayed));
     }
 
     public void InvokeDataHandler(Opcode opcode, byte subOpcode, ReadOnlySpan<byte> data)
@@ -86,16 +115,209 @@ public class ChannelRelayed : IChannel
         _onData?.Invoke(_session, this, opcode, subOpcode, data);
     }
 
-    public void CompleteHandshake(int remoteVersion, Transport transport)
+    private void CompleteHandshake(int remoteVersion, Transport transport)
     {
+        ThrowIfDisposed();
+
         RemoteVersion = remoteVersion;
-        RemotePublicKey = Convert.ToBase64String(HandshakeState!.RemoteStaticPublicKey);
-        HandshakeState!.Dispose();
-        HandshakeState = null;
-        Transport = transport;
+        RemotePublicKey = Convert.ToBase64String(_handshakeState!.RemoteStaticPublicKey);
+        _handshakeState!.Dispose();
+        _handshakeState = null;
+        _transport = transport;
         Logger.Info<SyncSocketSession>($"Completed handshake for connectionId {ConnectionId}");
     }
 
-    public Task SendRelayedDataAsync(Opcode opcode, byte subOpcode, byte[]? data = null, int offset = 0, int count = -1, CancellationToken cancellationToken = default)
-        => _session.SendRelayedDataAsync(this, opcode, subOpcode, data, offset, count, cancellationToken);
+    private async Task SendPacketAsync(byte[] packet, CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+
+        await _sendSemaphore.WaitAsync(cancellationToken);
+        try
+        {
+            var encryptedPayload = new byte[packet.Length + 16];
+            int encryptedLength = _transport!.WriteMessage(packet, encryptedPayload);
+
+            var relayedPacket = new byte[8 + encryptedLength];
+            BinaryPrimitives.WriteInt64LittleEndian(relayedPacket.AsSpan(0, 8), ConnectionId);
+            Array.Copy(encryptedPayload, 0, relayedPacket, 8, encryptedLength);
+
+            await _session.SendAsync(Opcode.RELAY, (byte)RelayOpcode.DATA, relayedPacket, cancellationToken: cancellationToken);
+        }
+        finally
+        {
+            _sendSemaphore.Release();
+        }
+    }
+
+    public async Task SendErrorAsync(int errorCode, CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+
+        await _sendSemaphore.WaitAsync(cancellationToken);
+        try
+        {
+            Span<byte> packet = stackalloc byte[4];
+            BinaryPrimitives.WriteInt32LittleEndian(packet, errorCode);
+
+            var encryptedPayload = new byte[4 + 16];
+            int encryptedLength = _transport!.WriteMessage(packet, encryptedPayload);
+
+            var relayedPacket = new byte[8 + encryptedLength];
+            BinaryPrimitives.WriteInt64LittleEndian(relayedPacket.AsSpan(0, 8), ConnectionId);
+            Array.Copy(encryptedPayload, 0, relayedPacket, 8, encryptedLength);
+
+            await _session.SendAsync(Opcode.RELAY, (byte)RelayOpcode.ERROR, relayedPacket, cancellationToken: cancellationToken);
+        }
+        finally
+        {
+            _sendSemaphore.Release();
+        }
+    }
+
+    public async Task SendRelayedDataAsync(Opcode opcode, byte subOpcode, byte[]? data = null, int offset = 0, int count = -1, CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+
+        if (count == -1)
+            count = data?.Length ?? 0;
+
+        if (count != 0 && data == null)
+            throw new Exception("Data must be set if count is not 0");
+
+        const int ENCRYPTION_OVERHEAD = 16;
+        const int CONNECTION_ID_SIZE = 8;
+        const int HEADER_SIZE = 6;
+        const int MAX_DATA_PER_PACKET = SyncSocketSession.MAXIMUM_PACKET_SIZE - HEADER_SIZE - CONNECTION_ID_SIZE - ENCRYPTION_OVERHEAD - 16;
+
+        if (count > MAX_DATA_PER_PACKET && data != null)
+        {
+            var streamId = _session.GenerateStreamId();
+            int totalSize = count;
+            int sendOffset = 0;
+
+            while (sendOffset < totalSize)
+            {
+                int bytesRemaining = totalSize - sendOffset;
+                int bytesToSend = Math.Min(MAX_DATA_PER_PACKET - 8 - 2, bytesRemaining);
+
+                // Prepare stream data
+                byte[] streamData;
+                StreamOpcode streamOpcode;
+                if (sendOffset == 0)
+                {
+                    streamOpcode = StreamOpcode.START;
+                    streamData = new byte[4 + 4 + 1 + 1 + bytesToSend];
+                    BinaryPrimitives.WriteInt32LittleEndian(streamData.AsSpan(0, 4), streamId);
+                    BinaryPrimitives.WriteInt32LittleEndian(streamData.AsSpan(4, 4), totalSize);
+                    streamData[8] = (byte)opcode;
+                    streamData[9] = subOpcode;
+                    Array.Copy(data, offset + sendOffset, streamData, 10, bytesToSend);
+                }
+                else
+                {
+                    streamData = new byte[4 + 4 + bytesToSend];
+                    BinaryPrimitives.WriteInt32LittleEndian(streamData.AsSpan(0, 4), streamId);
+                    BinaryPrimitives.WriteInt32LittleEndian(streamData.AsSpan(4, 4), sendOffset);
+                    Array.Copy(data, offset + sendOffset, streamData, 8, bytesToSend);
+                    streamOpcode = (bytesToSend < bytesRemaining) ? StreamOpcode.DATA : StreamOpcode.END;
+                }
+
+                // Wrap with header
+                var fullPacket = new byte[HEADER_SIZE + streamData.Length];
+                BinaryPrimitives.WriteInt32LittleEndian(fullPacket.AsSpan(0, 4), streamData.Length + 2);
+                fullPacket[4] = (byte)Opcode.STREAM;
+                fullPacket[5] = (byte)streamOpcode;
+                Array.Copy(streamData, 0, fullPacket, HEADER_SIZE, streamData.Length);
+
+                await SendPacketAsync(fullPacket, cancellationToken);
+                sendOffset += bytesToSend;
+            }
+        }
+        else
+        {
+            var packet = new byte[HEADER_SIZE + count];
+            BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(0, 4), count + 2);
+            packet[4] = (byte)opcode;
+            packet[5] = subOpcode;
+            if (count > 0 && data != null)
+                Array.Copy(data, offset, packet, HEADER_SIZE, count);
+            await SendPacketAsync(packet, cancellationToken);
+        }
+    }
+
+    public async Task SendRequestTransportAsync(int requestId, string publicKey, CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+
+        await _sendSemaphore.WaitAsync();
+        try
+        {
+            var message = new byte[1024];
+            var (bytesWritten, _, _) = _handshakeState!.WriteMessage(null, message);
+
+            byte[] publicKeyBytes = Convert.FromBase64String(publicKey);
+            if (publicKeyBytes.Length != 32)
+                throw new ArgumentException("Public key must be 32 bytes.");
+
+            var packetSize = 4 + 32 + 4 + bytesWritten;
+            var packet = new byte[packetSize];
+            BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(0, 4), requestId);
+            publicKeyBytes.CopyTo(packet.AsSpan(4, 32));
+            BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(36, 4), bytesWritten);
+            message.AsSpan(0, bytesWritten).CopyTo(packet.AsSpan(40));
+
+            await _session.SendAsync(Opcode.REQUEST, (byte)RequestOpcode.TRANSPORT, packet, cancellationToken: cancellationToken);
+        }
+        finally
+        {
+            _sendSemaphore.Release();
+        }
+    }
+
+    public async Task SendResponseTransportAsync(int remoteVersion, int requestId, byte[] handshakeMessage)
+    {
+        ThrowIfDisposed();
+
+        var message = new byte[1024];
+        var plaintext = new byte[1024];
+        _handshakeState!.ReadMessage(handshakeMessage, plaintext);
+        var (bytesWritten, _, transport) = _handshakeState!.WriteMessage(null, message);
+
+        var responsePacket = new byte[20 + bytesWritten];
+        BinaryPrimitives.WriteInt32LittleEndian(responsePacket.AsSpan(0, 4), (int)0); //status code
+        BinaryPrimitives.WriteInt64LittleEndian(responsePacket.AsSpan(4, 8), ConnectionId);
+        BinaryPrimitives.WriteInt32LittleEndian(responsePacket.AsSpan(12, 4), requestId);
+        BinaryPrimitives.WriteInt32LittleEndian(responsePacket.AsSpan(16, 4), bytesWritten);
+        message.AsSpan(0, bytesWritten).CopyTo(responsePacket.AsSpan(20));
+
+        CompleteHandshake(remoteVersion, transport!);
+        await _session.SendAsync(Opcode.RESPONSE, (byte)ResponseOpcode.TRANSPORT, responsePacket);
+    }
+
+    public (byte[] decryptedPayload, int length) Decrypt(ReadOnlySpan<byte> encryptedPayload)
+    {
+        ThrowIfDisposed();
+
+        lock (_decryptLock)
+        {
+            var decryptedPayload = new byte[encryptedPayload.Length - 16];
+            int plen = _transport!.ReadMessage(encryptedPayload, decryptedPayload);
+            if (plen != decryptedPayload.Length)
+                throw new Exception($"Expected decrypted payload length to be {plen}");
+            return (decryptedPayload, plen);
+        }
+    }
+
+    public void HandleTransportRelayed(int remoteVersion, long connectionId, byte[] handshakeMessage)
+    {
+        ThrowIfDisposed();
+
+        lock (_decryptLock)
+        {
+            ConnectionId = connectionId;
+            var plaintext = new byte[1024];
+            var (_, _, transport) = _handshakeState!.ReadMessage(handshakeMessage, plaintext);
+            CompleteHandshake(remoteVersion, transport!);
+        }
+    }
 }

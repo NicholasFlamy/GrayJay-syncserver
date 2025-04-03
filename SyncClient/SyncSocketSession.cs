@@ -40,11 +40,11 @@ public class SyncSocketSession : IDisposable
     private readonly byte[] _sendBuffer = new byte[MAXIMUM_PACKET_SIZE];
     private readonly byte[] _sendBufferEncrypted = new byte[MAXIMUM_PACKET_SIZE_ENCRYPTED + 4]; //+4 to leave room for size prefix
     private readonly Dictionary<int, SyncStream> _syncStreams = new();
-    private int _streamIdGenerator = 0;
     private readonly Action<SyncSocketSession>? _onClose;
     private readonly Action<SyncSocketSession>? _onHandshakeComplete;
     private readonly Action<SyncSocketSession, ChannelRelayed>? _onNewChannel;
     private readonly Func<SyncSocketSession, string, bool>? _isChannelAllowed;
+    private int _streamIdGenerator = 0;
     private Transport? _transport = null;
     public string? RemotePublicKey { get; private set; } = null;
     private bool _started;
@@ -166,6 +166,7 @@ public class SyncSocketSession : IDisposable
             catch (Exception e)
             {
                 Logger.Error<SyncSocketSession>($"Exception while receiving data: {e}");
+                Dispose();
                 break;
             }
         }
@@ -293,6 +294,7 @@ public class SyncSocketSession : IDisposable
         await _outputStream.WriteAsync(data, offset, size, cancellationToken);
     }
 
+    public int GenerateStreamId() => Interlocked.Increment(ref _streamIdGenerator);
     public async Task SendAsync(Opcode opcode, byte subOpcode, byte[] data, int offset = 0, int size = -1, CancellationToken cancellationToken = default) =>
         await SendAsync((byte)opcode, subOpcode, data, offset, size, cancellationToken);
     public async Task SendAsync(byte opcode, byte subOpcode, byte[] data, int offset = 0, int size = -1, CancellationToken cancellationToken = default)
@@ -306,7 +308,7 @@ public class SyncSocketSession : IDisposable
         if (size + HEADER_SIZE > MAXIMUM_PACKET_SIZE)
         {
             var segmentSize = MAXIMUM_PACKET_SIZE - HEADER_SIZE;
-            var id = Interlocked.Increment(ref _streamIdGenerator);
+            var id = GenerateStreamId();
             var segmentData = Utilities.RentBytes(segmentSize);
 
             try
@@ -437,10 +439,11 @@ public class SyncSocketSession : IDisposable
         HandlePacket((Opcode)opcode, subOpcode, packetData, sourceChannel);
     }
 
+    private int GenerateRequestId() => Interlocked.Increment(ref _requestIdGenerator);
     public Task<ConnectionInfo?> RequestConnectionInfoAsync(string publicKey, CancellationToken cancellationToken = default)
     {
         var tcs = new TaskCompletionSource<ConnectionInfo?>();
-        var requestId = Interlocked.Increment(ref _requestIdGenerator);
+        var requestId = GenerateRequestId();
         _pendingConnectionInfoRequests[requestId] = tcs;
         cancellationToken.Register(() =>
         {
@@ -484,7 +487,7 @@ public class SyncSocketSession : IDisposable
     public async Task<Dictionary<string, ConnectionInfo?>> RequestBulkConnectionInfoAsync(IEnumerable<string> publicKeys, CancellationToken cancellationToken = default)
     {
         var tcs = new TaskCompletionSource<Dictionary<string, ConnectionInfo?>>();
-        var requestId = Interlocked.Increment(ref _requestIdGenerator);
+        var requestId = GenerateRequestId();
         _pendingBulkConnectionInfoRequests[requestId] = tcs;
 
         cancellationToken.Register(() =>
@@ -528,7 +531,7 @@ public class SyncSocketSession : IDisposable
     public Task<ChannelRelayed> StartRelayedChannelAsync(string publicKey, CancellationToken cancellationToken = default)
     {
         var tcs = new TaskCompletionSource<ChannelRelayed>();
-        var requestId = Interlocked.Increment(ref _requestIdGenerator);
+        var requestId = GenerateRequestId();
         var channel = new ChannelRelayed(this, _localKeyPair, publicKey, true);
         _onNewChannel?.Invoke(this, channel);
         _pendingChannels[requestId] = (channel, tcs);
@@ -544,29 +547,14 @@ public class SyncSocketSession : IDisposable
 
         try
         {
-            var message = new byte[1024];
-            var (bytesWritten, _, _) = channel.HandshakeState!.WriteMessage(null, message);
-
-            byte[] publicKeyBytes = Convert.FromBase64String(publicKey);
-            if (publicKeyBytes.Length != 32)
-                throw new ArgumentException("Public key must be 32 bytes.");
-
-            var packetSize = 4 + 32 + 4 + bytesWritten;
-            var packet = new byte[packetSize];
-            BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(0, 4), requestId);
-            publicKeyBytes.CopyTo(packet.AsSpan(4, 32));
-            BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(36, 4), bytesWritten);
-            message.AsSpan(0, bytesWritten).CopyTo(packet.AsSpan(40));
-
-            _ = SendAsync(Opcode.REQUEST, (byte)RequestOpcode.TRANSPORT, packet, cancellationToken: cancellationToken)
-                .ContinueWith(t =>
+            _ = channel.SendRequestTransportAsync(requestId, publicKey, cancellationToken).ContinueWith(t =>
+            {
+                if (t.IsFaulted && _pendingChannels.TryRemove(requestId, out var pending))
                 {
-                    if (t.IsFaulted && _pendingChannels.TryRemove(requestId, out var pending))
-                    {
-                        pending.Channel.Dispose();
-                        pending.Tcs.TrySetException(t.Exception!.InnerException!);
-                    }
-                });
+                    pending.Channel.Dispose();
+                    pending.Tcs.TrySetException(t.Exception!.InnerException!);
+                }
+            });
         }
         catch (Exception ex)
         {
@@ -742,10 +730,7 @@ public class SyncSocketSession : IDisposable
                     if (_pendingChannels.TryRemove(requestId, out var pending))
                     {
                         var (channel, tcs) = pending;
-                        channel.ConnectionId = connectionId;
-                        var plaintext = new byte[1024];
-                        var (_, _, transport) = channel.HandshakeState!.ReadMessage(handshakeMessage, plaintext);
-                        channel.CompleteHandshake(remoteVersion, transport!);
+                        channel.HandleTransportRelayed(remoteVersion, connectionId, handshakeMessage);
                         _channels[connectionId] = channel;
                         tcs.SetResult(channel);
                     }
@@ -1199,6 +1184,9 @@ public class SyncSocketSession : IDisposable
             case RelayOpcode.RELAYED_ERROR:
                 HandleRelayedError(data);
                 break;
+            case RelayOpcode.RELAY_ERROR:
+                HandleRelayError(data);
+                break;
         }
     }
 
@@ -1284,123 +1272,124 @@ public class SyncSocketSession : IDisposable
         if (!_channels.TryGetValue(connectionId, out var channel))
         {
             Logger.Error<SyncSocketSession>($"No channel found for connectionId {connectionId}.");
+            //TODO: Maybe have a generic error to notify the other side the connection id doesn't exist?
             return;
         }
 
         var encryptedPayload = data.Slice(8);
-        var decryptedPayload = new byte[encryptedPayload.Length - 16];
-        int plen = channel.Transport!.ReadMessage(encryptedPayload, decryptedPayload);
-        if (plen != decryptedPayload.Length)
+        var (decryptedPayload, length) = channel.Decrypt(encryptedPayload);
+        try
         {
-            Logger.Error<SyncSocketSession>("Failed to decrypt relayed data.");
-            return;
+            HandleData(decryptedPayload, length, channel);
         }
+        catch (Exception e)
+        {
+            Logger.Error<SyncSocketSession>("Exception while handling relayed data.", e);
 
-        HandleData(decryptedPayload, plen, channel);
+            if (channel != null)
+            {
+                Task.Run(async () =>
+                {
+                    try
+                    {
+                        await channel.SendErrorAsync(1);
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.Error<SyncSocketSession>("Exception while sending relayed error.", ex);
+                    }
+                    finally
+                    {
+                        channel.Dispose();
+                    }
+                });
+            }
+            _channels.TryRemove(connectionId, out _);
+        }
     }
 
     private void HandleRelayedError(ReadOnlySpan<byte> data)
     {
-        if (data.Length < 12)
+        if (data.Length < 8)
         {
-            Logger.Error<SyncSocketSession>("RELAYED_ERROR packet too short");
+            Logger.Error<SyncSocketSession>("RELAYED_ERROR packet too short.");
             return;
         }
 
         long connectionId = BinaryPrimitives.ReadInt64LittleEndian(data.Slice(0, 8));
-        int errorCode = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(12));
-        _channels.TryRemove(connectionId, out var channel);
-        channel?.Dispose();
-        Logger.Info<SyncSocketSession>($"Relayed connection {connectionId} closed by peer (error code: {errorCode}).");
-
-    }
-
-    public Task SendRelayedDataAsync(long connectionId, Opcode opcode, byte subOpcode, byte[]? data = null, int offset = 0, int count = -1, CancellationToken cancellationToken = default)
-    {
-        if (!_channels.TryGetValue(connectionId, out var channel))
-            throw new Exception($"No channel found for connectionId {connectionId}");
-        return SendRelayedDataAsync(channel, opcode, subOpcode, data, offset, count, cancellationToken);
-    }
-
-    public async Task SendRelayedDataAsync(ChannelRelayed channel, Opcode opcode, byte subOpcode, byte[]? data = null, int offset = 0, int count = -1, CancellationToken cancellationToken = default)
-    {
-        if (count == -1)
-            count = data?.Length ?? 0;
-
-        if (count != 0 && data == null)
-            throw new Exception("Data must be set if count is not 0");
-
-        const int ENCRYPTION_OVERHEAD = 16;
-        const int CONNECTION_ID_SIZE = 8;
-        const int HEADER_SIZE = 6;
-        const int MAX_DATA_PER_PACKET = MAXIMUM_PACKET_SIZE - HEADER_SIZE - CONNECTION_ID_SIZE - ENCRYPTION_OVERHEAD - 16;
-
-        if (count > MAX_DATA_PER_PACKET && data != null)
+        if (!_channels.TryGetValue(connectionId, out var channel) || channel == null)
         {
-            var streamId = Interlocked.Increment(ref _streamIdGenerator);
-            int totalSize = count;
-            int sendOffset = 0;
-
-            while (sendOffset < totalSize)
+            Logger.Error<SyncSocketSession>($"No channel found for connectionId {connectionId}.");
+            Task.Run(async () =>
             {
-                int bytesRemaining = totalSize - sendOffset;
-                int bytesToSend = Math.Min(MAX_DATA_PER_PACKET - 8 - 2, bytesRemaining);
-
-                // Prepare stream data
-                byte[] streamData;
-                StreamOpcode streamOpcode;
-                if (sendOffset == 0)
+                try
                 {
-                    streamOpcode = StreamOpcode.START;
-                    streamData = new byte[4 + 4 + 1 + 1 + bytesToSend];
-                    BinaryPrimitives.WriteInt32LittleEndian(streamData.AsSpan(0, 4), streamId);
-                    BinaryPrimitives.WriteInt32LittleEndian(streamData.AsSpan(4, 4), totalSize);
-                    streamData[8] = (byte)opcode;
-                    streamData[9] = subOpcode;
-                    Array.Copy(data, offset + sendOffset, streamData, 10, bytesToSend);
+                    await SendRelayError(connectionId, 1);
                 }
-                else
+                catch (Exception ex)
                 {
-                    streamData = new byte[4 + 4 + bytesToSend];
-                    BinaryPrimitives.WriteInt32LittleEndian(streamData.AsSpan(0, 4), streamId);
-                    BinaryPrimitives.WriteInt32LittleEndian(streamData.AsSpan(4, 4), sendOffset);
-                    Array.Copy(data, offset + sendOffset, streamData, 8, bytesToSend);
-                    streamOpcode = (bytesToSend < bytesRemaining) ? StreamOpcode.DATA : StreamOpcode.END;
+                    Logger.Error<SyncSocketSession>("Exception while sending relay error.", ex);
                 }
-
-                // Wrap with header
-                var fullPacket = new byte[HEADER_SIZE + streamData.Length];
-                BinaryPrimitives.WriteInt32LittleEndian(fullPacket.AsSpan(0, 4), streamData.Length + 2);
-                fullPacket[4] = (byte)Opcode.STREAM;
-                fullPacket[5] = (byte)streamOpcode;
-                Array.Copy(streamData, 0, fullPacket, HEADER_SIZE, streamData.Length);
-
-                await SendRelayedPacketAsync(channel, fullPacket, cancellationToken);
-                sendOffset += bytesToSend;
-            }
+            });
+            return;
         }
-        else
+
+        var encryptedPayload = data.Slice(8);
+        try
         {
-            var packet = new byte[HEADER_SIZE + count];
-            BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(0, 4), count + 2);
-            packet[4] = (byte)opcode;
-            packet[5] = subOpcode;
-            if (count > 0 && data != null) 
-                Array.Copy(data, offset, packet, HEADER_SIZE, count);
-            await SendRelayedPacketAsync(channel, packet, cancellationToken);
+            var (decryptedPayload, length) = channel.Decrypt(encryptedPayload);
+            var errorCode = BinaryPrimitives.ReadInt32LittleEndian(decryptedPayload.AsSpan(0, length));
+            Logger.Error<SyncSocketSession>($"Received relayed error (errorCode = {errorCode}) on connection id {connectionId}, closing connection.");
+        }
+        catch (Exception e)
+        {
+            Logger.Error<SyncSocketSession>("Exception while handling relayed error.", e);
+        }
+        finally
+        {
+            channel.Dispose();
+            _channels.TryRemove(connectionId, out _);
         }
     }
 
-    private async Task SendRelayedPacketAsync(ChannelRelayed channel, byte[] packet, CancellationToken cancellationToken)
+    public async Task SendRelayError(long connectionId, int errorCode, CancellationToken cancellationToken = default)
     {
-        var encryptedPayload = new byte[packet.Length + 16];
-        int encryptedLength = channel.Transport!.WriteMessage(packet, encryptedPayload);
+        Span<byte> errorPacket = stackalloc byte[12];
+        BinaryPrimitives.WriteInt64LittleEndian(errorPacket.Slice(0, 8), connectionId);
+        BinaryPrimitives.WriteInt32LittleEndian(errorPacket.Slice(8, 4), errorCode);
+        await SendAsync(Opcode.RELAY, (byte)RelayOpcode.RELAY_ERROR, errorPacket.ToArray(), cancellationToken: cancellationToken);
+    }
 
-        var relayedPacket = new byte[8 + encryptedLength];
-        BinaryPrimitives.WriteInt64LittleEndian(relayedPacket.AsSpan(0, 8), channel.ConnectionId);
-        Array.Copy(encryptedPayload, 0, relayedPacket, 8, encryptedLength);
+    private void HandleRelayError(ReadOnlySpan<byte> data)
+    {
+        if (data.Length < 12)
+        {
+            Logger.Error<SyncSocketSession>("RELAY_ERROR packet too short.");
+            return;
+        }
 
-        await SendAsync(Opcode.RELAY, (byte)RelayOpcode.DATA, relayedPacket, cancellationToken: cancellationToken);
+        long connectionId = BinaryPrimitives.ReadInt64LittleEndian(data.Slice(0, 8));
+        int errorCode = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(8, 4));
+        if (!_channels.TryGetValue(connectionId, out var channel) || channel == null)
+        {
+            Logger.Error<SyncSocketSession>($"Received error code {errorCode} for non existant channel with connectionId {connectionId}.");
+            return;
+        }
+
+        var encryptedPayload = data.Slice(8);
+        try
+        {
+            Logger.Info<SyncSocketSession>($"Received relay error (errorCode = {errorCode}) on connection id {connectionId}, closing connection.");
+        }
+        catch (Exception e)
+        {
+            Logger.Error<SyncSocketSession>("Exception while handling relayed error.", e);
+        }
+        finally
+        {
+            channel.Dispose();
+            _channels.TryRemove(connectionId, out _);
+        }
     }
 
     private void HandleRequestTransportRelayed(ReadOnlySpan<byte> data)
@@ -1450,31 +1439,17 @@ public class SyncSocketSession : IDisposable
         channel.ConnectionId = connectionId;
         _channels[connectionId] = channel;
 
-        var message = new byte[1024];
-        var plaintext = new byte[1024];
-        channel.HandshakeState!.ReadMessage(handshakeMessage, plaintext);
-        var (bytesWritten, _, transport) = channel.HandshakeState!.WriteMessage(null, message);
-
-        var responsePacket = new byte[20 + bytesWritten];
-        BinaryPrimitives.WriteInt32LittleEndian(responsePacket.AsSpan(0, 4), (int)0); //status code
-        BinaryPrimitives.WriteInt64LittleEndian(responsePacket.AsSpan(4, 8), connectionId);
-        BinaryPrimitives.WriteInt32LittleEndian(responsePacket.AsSpan(12, 4), requestId);
-        BinaryPrimitives.WriteInt32LittleEndian(responsePacket.AsSpan(16, 4), bytesWritten);
-        message.AsSpan(0, bytesWritten).CopyTo(responsePacket.AsSpan(20));
-
         _ = Task.Run(async () =>
         {
             try
             {
-                await SendAsync(Opcode.RESPONSE, (byte)ResponseOpcode.TRANSPORT, responsePacket);
+                await channel.SendResponseTransportAsync(remoteVersion, requestId, handshakeMessage);
             }
             catch (Exception e)
             {
                 Logger.Info<SyncSocketSession>("Failed to send relayed transport response", e);
             }
         });
-
-        channel.CompleteHandshake(remoteVersion, transport!);
     }
 
     private ConnectionInfo ParseConnectionInfo(ReadOnlySpan<byte> data)
@@ -1569,7 +1544,7 @@ public class SyncSocketSession : IDisposable
         if (consumerList.Count == 0)
             throw new ArgumentException("At least one consumer is required.");
 
-        var requestId = Interlocked.Increment(ref _requestIdGenerator);
+        var requestId = GenerateRequestId();
         var tcs = new TaskCompletionSource<bool>();
         _pendingPublishRequests[requestId] = tcs;
 
@@ -1668,7 +1643,7 @@ public class SyncSocketSession : IDisposable
         if (string.IsNullOrEmpty(key) || keyBytes.Length > 32)
             throw new ArgumentException("Key must be non-empty and at most 32 bytes.", nameof(key));
 
-        var requestId = Interlocked.Increment(ref _requestIdGenerator);
+        var requestId = GenerateRequestId();
         var tcs = new TaskCompletionSource<bool>();
         _pendingPublishRequests[requestId] = tcs;
 
@@ -1755,7 +1730,7 @@ public class SyncSocketSession : IDisposable
             throw new ArgumentException("Key must be non-empty and at most 32 bytes.", nameof(key));
 
         var tcs = new TaskCompletionSource<(byte[] Data, DateTime Timestamp)?>();
-        var requestId = Interlocked.Increment(ref _requestIdGenerator);
+        var requestId = GenerateRequestId();
         _pendingGetRecordRequests[requestId] = tcs;
 
         cancellationToken.Register(() =>
@@ -1803,7 +1778,7 @@ public class SyncSocketSession : IDisposable
         if (publishers.Count == 0)
             return new Dictionary<string, (byte[], DateTime)>();
 
-        var requestId = Interlocked.Increment(ref _requestIdGenerator);
+        var requestId = GenerateRequestId();
         var tcs = new TaskCompletionSource<Dictionary<string, (byte[], DateTime)>>();
         _pendingBulkGetRecordRequests[requestId] = tcs;
 
@@ -1855,7 +1830,7 @@ public class SyncSocketSession : IDisposable
             throw new ArgumentException("Keys must be at most 32 bytes.", nameof(keys));
 
         var tcs = new TaskCompletionSource<bool>();
-        var requestId = Interlocked.Increment(ref _requestIdGenerator);
+        var requestId = GenerateRequestId();
         _pendingDeleteRequests[requestId] = tcs;
 
         cancellationToken.Register(() =>
@@ -1905,7 +1880,7 @@ public class SyncSocketSession : IDisposable
             throw new ArgumentException("Key must be at most 32 bytes.", nameof(key));
 
         var tcs = new TaskCompletionSource<bool>();
-        var requestId = Interlocked.Increment(ref _requestIdGenerator);
+        var requestId = GenerateRequestId();
         _pendingDeleteRequests[requestId] = tcs;
 
         cancellationToken.Register(() =>
@@ -1966,7 +1941,7 @@ public class SyncSocketSession : IDisposable
     public Task<List<(string Key, DateTime Timestamp)>> ListRecordKeysAsync(string publisherPublicKey, string consumerPublicKey, CancellationToken cancellationToken = default)
     {
         var tcs = new TaskCompletionSource<List<(string Key, DateTime Timestamp)>>();
-        var requestId = Interlocked.Increment(ref _requestIdGenerator);
+        var requestId = GenerateRequestId();
         _pendingListKeysRequests[requestId] = tcs;
 
         cancellationToken.Register(() =>
