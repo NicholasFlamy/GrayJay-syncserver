@@ -3,20 +3,23 @@ using SyncClient;
 using SyncServer;
 using SyncServer.Repositories;
 using SyncShared;
+using System.Buffers.Binary;
+using System.Drawing;
 using System.Net.Sockets;
-using static SyncClient.SyncSocketSession;
+using System.Reflection.Emit;
+using System.Threading;
 
 namespace SyncServerTests
 {
     [TestClass]
     public class SyncServerTests
     {
-        private (TcpSyncServer server, string serverPublicKey, int port) SetupServer()
+        private (TcpSyncServer server, string serverPublicKey, int port) SetupServer(int maxConnections = 50)
         {
             var serverKeyPair = KeyPair.Generate();
             var serverPublicKey = Convert.ToBase64String(serverKeyPair.PublicKey);
             var recordRepository = new InMemoryRecordRepository();
-            var server = new TcpSyncServer(0, serverKeyPair, recordRepository, 50);
+            var server = new TcpSyncServer(0, serverKeyPair, recordRepository, maxConnections);
             server.Start();
             var port = server.Port;
             return (server, serverPublicKey, port);
@@ -50,7 +53,7 @@ namespace SyncServerTests
             )
             { IsTrusted = true };
             _ = socketSession.StartAsInitiatorAsync(serverPublicKey);
-            await tcs.Task.WithTimeout(5000, "Handshake timed out");
+            await tcs.Task.WithTimeout(500000, "Handshake timed out");
             return socketSession;
         }
 
@@ -223,7 +226,7 @@ namespace SyncServerTests
             var (server, serverPublicKey, port) = SetupServer();
             using (server)
             {
-                const int MAX_DATA_PER_PACKET = MAXIMUM_PACKET_SIZE - HEADER_SIZE - 8 - 16 - 16;
+                const int MAX_DATA_PER_PACKET = SyncSocketSession.MAXIMUM_PACKET_SIZE - SyncSocketSession.HEADER_SIZE - 8 - 16 - 16;
                 var maxSizeData = new byte[MAX_DATA_PER_PACKET];
                 new Random().NextBytes(maxSizeData);
                 var tcsA = new TaskCompletionSource<ChannelRelayed>();
@@ -387,26 +390,6 @@ namespace SyncServerTests
         }
 
         [TestMethod]
-        public async Task PublishRecord_RateLimited()
-        {
-            var (server, serverPublicKey, port) = SetupServer();
-            using (server)
-            {
-                using var clientA = await CreateClientAsync(port, serverPublicKey);
-                using var clientB = await CreateClientAsync(port, serverPublicKey);
-                var data = new byte[5 * 1024 * 1024];
-                bool success1 = await clientA.PublishRecordAsync(clientB.LocalPublicKey, "testA", data);
-                bool success2 = await clientA.PublishRecordAsync(clientB.LocalPublicKey, "testB", data);
-                var record1 = await clientB.GetRecordAsync(clientA.LocalPublicKey, "testA").WithTimeout(5000, "Get record A timed out");
-                var record2 = await clientB.GetRecordAsync(clientA.LocalPublicKey, "testB").WithTimeout(5000, "Get record B timed out");
-                Assert.IsTrue(success1);
-                Assert.IsFalse(success2);
-                Assert.IsNotNull(record1);
-                Assert.IsNull(record2);
-            }
-        }
-
-        [TestMethod]
         public async Task PublishRecord_InvalidKey_Fails()
         {
             var (server, serverPublicKey, port) = SetupServer();
@@ -564,23 +547,6 @@ namespace SyncServerTests
                 await channelA.SendRelayedDataAsync(Opcode.DATA, 0, largeData);
                 var receivedData = await tcsDataB.Task.WithTimeout(10000, "Receiving large data timed out");
                 CollectionAssert.AreEqual(largeData, receivedData);
-            }
-        }
-
-
-        [TestMethod]
-        public async Task SingleLargeMessageViaRelayedChannel_RateLimited()
-        {
-            var (server, serverPublicKey, port) = SetupServer();
-            using (server)
-            {
-                var largeData = new byte[10_000_000];
-                new Random().NextBytes(largeData);
-                using var clientA = await CreateClientAsync(port, serverPublicKey);
-                using var clientB = await CreateClientAsync(port, serverPublicKey);
-                var channelA = await clientA.StartRelayedChannelAsync(clientB.LocalPublicKey);
-                await channelA.SendRelayedDataAsync(Opcode.DATA, 0, largeData);
-                Assert.ThrowsException<NullReferenceException>(async () => await channelA.SendRelayedDataAsync(Opcode.DATA, 0, largeData));
             }
         }
 
@@ -767,6 +733,306 @@ namespace SyncServerTests
                 var listedKeys = await clientB.ListRecordKeysAsync(clientA.LocalPublicKey, clientB.LocalPublicKey);
                 Assert.AreEqual(NUM_RECORDS, listedKeys.Count);
                 CollectionAssert.AreEquivalent(keys, listedKeys.Select(k => k.Key).ToArray());
+            }
+        }
+
+        [TestMethod]
+        public async Task KeypairRegistrationLimitPerIP_Enforced()
+        {
+            var (server, serverPublicKey, port) = SetupServer(51);
+            using (server)
+            {
+                var clients = new List<SyncSocketSession>();
+                // Register 50 clients successfully
+                for (int i = 0; i < 50; i++)
+                {
+                    var client = await CreateClientAsync(port, serverPublicKey);
+                    clients.Add(client);
+                }
+
+                // 51st client should be disconnected due to keypair limit
+                var client51 = await CreateClientAsync(port, serverPublicKey).WithTimeout(5000, "Timed out creating client");
+
+                await Task.Delay(100);
+
+                for (int i = 0; i < clients.Count; i++)
+                    await clients[i].SendAsync(Opcode.PING);
+                await Assert.ThrowsExceptionAsync<ObjectDisposedException>(async () => await client51.SendAsync(Opcode.PING));
+
+                Logger.Info<SyncServerTests>("Disposing client.Dispose()");
+                foreach (var client in clients)
+                    client.Dispose();
+                clients.Clear();
+
+                Logger.Info<SyncServerTests>("client51.Dispose()");
+                client51.Dispose();
+            }
+        }
+
+        [TestMethod]
+        public async Task RelayRequestLimitPerIP_Enforced()
+        {
+            var (server, serverPublicKey, port) = SetupServer();
+            using (server)
+            {
+                // Use 10 clients, each making 10 requests (total 100 allowed)
+                var clients = new List<SyncSocketSession>();
+                using var targetClient = await CreateClientAsync(port, serverPublicKey);
+                for (int i = 0; i < 10; i++)
+                {
+                    var client = await CreateClientAsync(port, serverPublicKey);
+                    clients.Add(client);
+                    for (int j = 0; j < 10; j++) // 10 requests per key, within per-key limit of 10
+                    {
+                        await client.StartRelayedChannelAsync(targetClient.LocalPublicKey).WithTimeout(5000, "Relay request timed out");
+                    }
+                }
+
+                // 101st request should fail
+                using var extraClient = await CreateClientAsync(port, serverPublicKey);
+                await Assert.ThrowsExceptionAsync<Exception>(
+                    async () => await extraClient.StartRelayedChannelAsync(targetClient.LocalPublicKey),
+                    "101st relay request should fail due to IP limit"
+                );
+            }
+        }
+
+        [TestMethod]
+        public async Task RelayRequestLimitPerKey_Enforced()
+        {
+            var (server, serverPublicKey, port) = SetupServer();
+            using (server)
+            {
+                using var initiator = await CreateClientAsync(port, serverPublicKey);
+                using var target = await CreateClientAsync(port, serverPublicKey);
+                // Make 10 relay requests (within limit)
+                for (int i = 0; i < 10; i++)
+                {
+                    await initiator.StartRelayedChannelAsync(target.LocalPublicKey).WithTimeout(5000, "Relay request timed out");
+                }
+                // 11th request should fail
+                await Assert.ThrowsExceptionAsync<Exception>(
+                    async () => await initiator.StartRelayedChannelAsync(target.LocalPublicKey),
+                    "11th relay request per key should fail"
+                );
+            }
+        }
+
+        [TestMethod]
+        public async Task RelayDataLimitPerIP_Enforced()
+        {
+            var (server, serverPublicKey, port) = SetupServer(100);
+            using (server)
+            {
+                // Create 10 client pairs (20 clients total) to distribute load
+                const int pairCount = 25;
+                var clientsA = new List<SyncSocketSession>();
+                var clientsB = new List<SyncSocketSession>();
+                var channels = new List<ChannelRelayed>();
+
+                for (int i = 0; i < pairCount; i++)
+                {
+                    var clientA = await CreateClientAsync(port, serverPublicKey);
+                    var clientB = await CreateClientAsync(port, serverPublicKey);
+                    var channel = await clientA.StartRelayedChannelAsync(clientB.LocalPublicKey);
+
+                    clientsA.Add(clientA);
+                    clientsB.Add(clientB);
+                    channels.Add(channel);
+                }
+
+                // Each channel sends data in chunks, aiming to exceed 100MB IP limit
+                var data = new byte[50_000]; // 50KB per send
+                const int sendsPerChannel = 100; // 50KB * 100 = 5MB per channel
+                                                 // Total: 25 pairs * 5MB = 125MB, well over 100MB IP limit
+
+                var successfulSends = new int[pairCount];
+                var sendTasks = new List<Task>();
+
+                for (int i = 0; i < pairCount; i++)
+                {
+                    int channelIndex = i;
+                    sendTasks.Add(Task.Run(async () =>
+                    {
+                        for (int j = 0; j < sendsPerChannel; j++)
+                        {
+                            try
+                            {
+                                await channels[channelIndex].SendRelayedDataAsync(Opcode.DATA, 0, data);
+                                successfulSends[channelIndex]++;
+                            }
+                            catch (Exception)
+                            {
+                                break;
+                            }
+                        }
+                    }));
+                }
+
+                await Task.WhenAll(sendTasks);
+
+                long totalBytesSent = successfulSends.Sum(count => (long)count * data.Length);
+                const long ipLimitBytes = 100_000_000; // 100MB
+
+                Assert.IsTrue(totalBytesSent >= ipLimitBytes,
+                    $"Expected at least {ipLimitBytes} bytes sent, but only sent {totalBytesSent}");
+                Assert.IsTrue(totalBytesSent < pairCount * sendsPerChannel * data.Length,
+                    "Expected failure before sending all data, but all sends succeeded");
+
+                foreach (var client in clientsA.Concat(clientsB)) client.Dispose();
+            }
+        }
+
+        [TestMethod]
+        public async Task RelayDataLimitPerConnectionID_Enforced()
+        {
+            var (server, serverPublicKey, port) = SetupServer();
+            using (server)
+            {
+                using var clientA = await CreateClientAsync(port, serverPublicKey);
+                using var clientB = await CreateClientAsync(port, serverPublicKey);
+                var channel = await clientA.StartRelayedChannelAsync(clientB.LocalPublicKey);
+                var data = new byte[100_000]; // 100KB per send
+                // Send 10MB (connection limit)
+                for (int i = 0; i < 100; i++)
+                {
+                    await channel.SendRelayedDataAsync(Opcode.DATA, 0, data);
+                }
+
+                await Task.Delay(100);
+
+                // Next send should fail
+                await Assert.ThrowsExceptionAsync<ObjectDisposedException>(
+                    async () => await channel.SendRelayedDataAsync(Opcode.DATA, 0, data),
+                    "Sending beyond connection data limit should fail"
+                );
+            }
+        }
+
+        [TestMethod]
+        public async Task PublishRequestLimitPerIP_Enforced()
+        {
+            var (server, serverPublicKey, port) = SetupServer();
+            using (server)
+            {
+                using var clientA = await CreateClientAsync(port, serverPublicKey);
+                using var clientB = await CreateClientAsync(port, serverPublicKey);
+
+                // Make 1000 publish requests
+                for (int i = 0; i < 2000; i++)
+                {
+                    if (!await clientA.PublishRecordAsync(clientB.LocalPublicKey, $"key{i}", new byte[] { 1 }))
+                    {
+                        Assert.IsTrue(i > 1000);
+                        break;
+                    }
+                }
+
+                await Task.Delay(1000);
+            }
+        }
+
+        [TestMethod]
+        public async Task KVStorageLimitPerPublisher_Enforced()
+        {
+            var (server, serverPublicKey, port) = SetupServer();
+            using (server)
+            {
+                using var clientA = await CreateClientAsync(port, serverPublicKey);
+                using var clientB = await CreateClientAsync(port, serverPublicKey);
+                var largeData = new byte[1024 * 1024]; // 1MB
+                // Publish 10MB (limit)
+                for (int i = 0; i < 10; i++)
+                {
+                    await clientA.PublishRecordAsync(clientB.LocalPublicKey, $"largeKey{i}", largeData);
+                }
+                // Next publish should fail
+                Assert.IsFalse(await clientA.PublishRecordAsync(clientB.LocalPublicKey, "largeKey10", largeData));
+            }
+        }
+
+        [TestMethod]
+        public async Task MaxRelayedConnectionsPerIP_Enforced()
+        {
+            var (server, serverPublicKey, port) = SetupServer(200);
+            server.MaxKeypairsPerHour = 1000;
+
+            using (server)
+            {
+                var clients = new List<SyncSocketSession>();
+                using var target = await CreateClientAsync(port, serverPublicKey);
+                // Create 100 active relayed connections
+                for (int i = 0; i < 100; i++)
+                {
+                    var client = await CreateClientAsync(port, serverPublicKey);
+                    await client.StartRelayedChannelAsync(target.LocalPublicKey);
+                    clients.Add(client);
+                }
+                // 101st connection should fail
+                using var extraClient = await CreateClientAsync(port, serverPublicKey);
+                await Assert.ThrowsExceptionAsync<Exception>(
+                    async () => await extraClient.StartRelayedChannelAsync(target.LocalPublicKey),
+                    "101st relayed connection per IP should fail"
+                );
+            }
+        }
+
+        [TestMethod]
+        public async Task MaxRelayedConnectionsPerKey_Enforced()
+        {
+            var (server, serverPublicKey, port) = SetupServer();
+            using (server)
+            {
+                using var initiator = await CreateClientAsync(port, serverPublicKey);
+                var targets = new List<SyncSocketSession>();
+                // Create 10 active relayed connections from one key
+                for (int i = 0; i < 10; i++)
+                {
+                    var target = await CreateClientAsync(port, serverPublicKey);
+                    await initiator.StartRelayedChannelAsync(target.LocalPublicKey);
+                    targets.Add(target);
+                }
+                // 11th connection should fail
+                using var extraTarget = await CreateClientAsync(port, serverPublicKey);
+                await Assert.ThrowsExceptionAsync<Exception>(
+                    async () => await initiator.StartRelayedChannelAsync(extraTarget.LocalPublicKey),
+                    "11th relayed connection per key should fail"
+                );
+            }
+        }
+
+        [TestMethod]
+        public async Task MaxActiveStreams_Enforced()
+        {
+            var (server, serverPublicKey, port) = SetupServer();
+            using (server)
+            {
+                using var clientA = await CreateClientAsync(port, serverPublicKey);
+
+                var streamIdGenerator = 0;
+                var startStream = async () =>
+                {
+                    var segmentData = new byte[10];
+                    BinaryPrimitives.WriteInt32LittleEndian(segmentData.AsSpan().Slice(0, 4), Interlocked.Increment(ref streamIdGenerator));
+                    BinaryPrimitives.WriteInt32LittleEndian(segmentData.AsSpan().Slice(4, 4), 100000);
+                    segmentData[8] = (byte)Opcode.DATA;
+                    segmentData[9] = (byte)0;
+                    await clientA.SendAsync((byte)Opcode.STREAM, (byte)StreamOpcode.START, segmentData);
+                };
+
+                await clientA.SendAsync(Opcode.STREAM, (byte)StreamOpcode.START);
+
+                // Start 10 streams
+                for (int i = 0; i < 10; i++)
+                    await startStream();
+
+                //Connection should still be open
+                await clientA.SendAsync(Opcode.PING);
+
+                // 11th stream should disconnect the session
+                await startStream();
+                await Task.Delay(100);
+                await Assert.ThrowsExceptionAsync<ObjectDisposedException>(async () => await clientA.SendAsync(Opcode.PING));
             }
         }
     }

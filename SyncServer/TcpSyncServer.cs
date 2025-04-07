@@ -7,7 +7,6 @@ using System.Net;
 using System.Net.Sockets;
 using System.Text.Json.Serialization;
 using static SyncServer.SyncSession;
-using static System.Runtime.InteropServices.JavaScript.JSType;
 using LogLevel = SyncShared.LogLevel;
 
 namespace SyncServer;
@@ -111,7 +110,6 @@ public class TcpSyncServer : IDisposable
 
     private const int MAX_CONNECTIONS = 100000;
     private const int BUFFER_SIZE = 1024;
-    private const long MAX_BYTES_PER_SECOND = 10_000_000;
 
     private Socket? _listenSocket;
     private readonly SemaphoreSlim _maxConnections;
@@ -123,7 +121,13 @@ public class TcpSyncServer : IDisposable
     private readonly ConcurrentDictionary<(string, string), byte[]> _connectionInfoStore = new();
     public readonly ConcurrentDictionary<long, RelayedConnection> RelayedConnections = new();
     private ConcurrentDictionary<(string, string), DateTime> _relayBlacklist = new ConcurrentDictionary<(string, string), DateTime>();
-    private readonly ConcurrentDictionary<long, RateInfo> _rateInfos = new();
+
+    private readonly ConcurrentDictionary<string, TokenBucket> _ipTokenBuckets = new();
+    private readonly ConcurrentDictionary<string, TokenBucket> _keyTokenBuckets = new();
+    private readonly ConcurrentDictionary<long, TokenBucket> _connectionTokenBuckets = new();
+    public int MaxRelayedConnectionsPerIp = 100;
+    public int MaxRelayedConnectionsPerKey = 10;
+    public int MaxKeypairsPerHour = 50;
 
     private readonly int _port;
     public int Port => (_listenSocket?.LocalEndPoint as IPEndPoint)?.Port ?? _port;
@@ -157,7 +161,6 @@ public class TcpSyncServer : IDisposable
     public void RemoveRelayedConnection(long connectionId)
     {
         RelayedConnections.TryRemove(connectionId, out _);
-        _rateInfos.TryRemove(connectionId, out _);
     }
 
     public RelayedConnection? GetRelayedConnection(long connectionId)
@@ -520,12 +523,6 @@ public class TcpSyncServer : IDisposable
         _relayBlacklist[(initiator, target)] = expiration;
     }
 
-    public bool RateLimitExceeded(long connectionId, long bytes)
-    {
-        var rateInfo = _rateInfos.GetOrAdd(connectionId, _ => new RateInfo(MAX_BYTES_PER_SECOND));
-        return rateInfo.Update(bytes, DateTime.UtcNow);
-    }
-
     public void Dispose()
     {
         try
@@ -547,5 +544,77 @@ public class TcpSyncServer : IDisposable
         }
 
         _maxConnections.Dispose();
+    }
+    public bool TryRegisterNewKeypair(string ipAddress)
+    {
+        var bucket = _ipTokenBuckets.GetOrAdd(
+            $"{ipAddress}:keypairs",
+            _ => new TokenBucket(MaxKeypairsPerHour, MaxKeypairsPerHour / 3600.0)
+        );
+        return bucket.TryConsume(1);
+    }
+
+    public bool IsRelayRequestAllowedByIP(string ipAddress)
+    {
+        var bucket = _ipTokenBuckets.GetOrAdd(
+            $"{ipAddress}:relays",
+            _ => new TokenBucket(100, 10)
+        );
+        return bucket.TryConsume(1) && GetRelayedConnectionCountByIP(ipAddress) < MaxRelayedConnectionsPerIp;
+    }
+
+    public bool IsRelayRequestAllowedByKey(string remotePublicKey)
+    {
+        var bucket = _keyTokenBuckets.GetOrAdd(
+            $"{remotePublicKey}:relays",
+            _ => new TokenBucket(10, 1)
+        );
+        return bucket.TryConsume(1) && GetRelayedConnectionCountByKey(remotePublicKey) < MaxRelayedConnectionsPerKey;
+    }
+
+    public bool IsRelayDataAllowedByIP(string ipAddress, int dataSize)
+    {
+        var bucket = _ipTokenBuckets.GetOrAdd(
+            $"{ipAddress}:relay_data",
+            _ => new TokenBucket(100_000_000, 100_000)
+        );
+        return bucket.TryConsume(dataSize);
+    }
+
+    public bool IsRelayDataAllowedByConnectionId(long connectionId, int dataSize)
+    {
+        var bucket = _connectionTokenBuckets.GetOrAdd(
+            connectionId,
+            _ => new TokenBucket(10_000_000, 10_000)
+        );
+        return bucket.TryConsume(dataSize);
+    }
+
+    public bool IsPublishRequestAllowed(string ipAddress)
+    {
+        var bucket = _ipTokenBuckets.GetOrAdd(
+            $"{ipAddress}:publishes",
+            _ => new TokenBucket(1000, 10)
+        );
+        return bucket.TryConsume(1);
+    }
+
+    private int GetRelayedConnectionCountByIP(string ipAddress)
+    {
+        return RelayedConnections.Values.Count(conn =>
+            GetIpAddress(conn.Initiator) == ipAddress ||
+            (conn.Target != null && GetIpAddress(conn.Target) == ipAddress));
+    }
+
+    private int GetRelayedConnectionCountByKey(string remotePublicKey)
+    {
+        return RelayedConnections.Values.Count(conn =>
+            conn.Initiator.RemotePublicKey == remotePublicKey ||
+            (conn.Target != null && conn.Target.RemotePublicKey == remotePublicKey));
+    }
+
+    private string GetIpAddress(SyncSession session)
+    {
+        return ((IPEndPoint)session.Socket.RemoteEndPoint!).Address.ToString();
     }
 }

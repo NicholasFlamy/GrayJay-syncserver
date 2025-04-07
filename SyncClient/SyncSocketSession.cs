@@ -1292,7 +1292,7 @@ public class SyncSocketSession : IDisposable
                 {
                     try
                     {
-                        await channel.SendErrorAsync(1);
+                        await channel.SendErrorAsync(SyncErrorCode.ConnectionClosed);
                     }
                     catch (Exception ex)
                     {
@@ -1324,7 +1324,7 @@ public class SyncSocketSession : IDisposable
             {
                 try
                 {
-                    await SendRelayError(connectionId, 1);
+                    await SendRelayError(connectionId, SyncErrorCode.NotFound);
                 }
                 catch (Exception ex)
                 {
@@ -1338,7 +1338,7 @@ public class SyncSocketSession : IDisposable
         try
         {
             var (decryptedPayload, length) = channel.Decrypt(encryptedPayload);
-            var errorCode = BinaryPrimitives.ReadInt32LittleEndian(decryptedPayload.AsSpan(0, length));
+            var errorCode = (SyncErrorCode)BinaryPrimitives.ReadInt32LittleEndian(decryptedPayload.AsSpan(0, length));
             Logger.Error<SyncSocketSession>($"Received relayed error (errorCode = {errorCode}) on connection id {connectionId}, closing connection.");
         }
         catch (Exception e)
@@ -1352,11 +1352,11 @@ public class SyncSocketSession : IDisposable
         }
     }
 
-    public async Task SendRelayError(long connectionId, int errorCode, CancellationToken cancellationToken = default)
+    public async Task SendRelayError(long connectionId, SyncErrorCode errorCode, CancellationToken cancellationToken = default)
     {
         Span<byte> errorPacket = stackalloc byte[12];
         BinaryPrimitives.WriteInt64LittleEndian(errorPacket.Slice(0, 8), connectionId);
-        BinaryPrimitives.WriteInt32LittleEndian(errorPacket.Slice(8, 4), errorCode);
+        BinaryPrimitives.WriteInt32LittleEndian(errorPacket.Slice(8, 4), (int)errorCode);
         await SendAsync(Opcode.RELAY, (byte)RelayOpcode.RELAY_ERROR, errorPacket.ToArray(), cancellationToken: cancellationToken);
     }
 
@@ -1369,27 +1369,16 @@ public class SyncSocketSession : IDisposable
         }
 
         long connectionId = BinaryPrimitives.ReadInt64LittleEndian(data.Slice(0, 8));
-        int errorCode = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(8, 4));
+        SyncErrorCode errorCode = (SyncErrorCode)BinaryPrimitives.ReadInt32LittleEndian(data.Slice(8, 4));
         if (!_channels.TryGetValue(connectionId, out var channel) || channel == null)
         {
             Logger.Error<SyncSocketSession>($"Received error code {errorCode} for non existant channel with connectionId {connectionId}.");
             return;
         }
 
-        var encryptedPayload = data.Slice(8);
-        try
-        {
-            Logger.Info<SyncSocketSession>($"Received relay error (errorCode = {errorCode}) on connection id {connectionId}, closing connection.");
-        }
-        catch (Exception e)
-        {
-            Logger.Error<SyncSocketSession>("Exception while handling relayed error.", e);
-        }
-        finally
-        {
-            channel.Dispose();
-            _channels.TryRemove(connectionId, out _);
-        }
+        Logger.Info<SyncSocketSession>($"Received relay error (errorCode = {errorCode}) on connection id {connectionId}, closing connection.");
+        channel.Dispose();
+        _channels.TryRemove(connectionId, out _);
     }
 
     private void HandleRequestTransportRelayed(ReadOnlySpan<byte> data)

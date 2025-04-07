@@ -88,7 +88,7 @@ public class ChannelRelayed : IChannel
             {
                 try
                 {
-                    await _session.SendRelayError(connectionId, 1);
+                    await _session.SendRelayError(connectionId, SyncErrorCode.ConnectionClosed);
                 }
                 catch (Exception ex)
                 {
@@ -149,7 +149,7 @@ public class ChannelRelayed : IChannel
         }
     }
 
-    public async Task SendErrorAsync(int errorCode, CancellationToken cancellationToken = default)
+    public async Task SendErrorAsync(SyncErrorCode errorCode, CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
 
@@ -157,7 +157,7 @@ public class ChannelRelayed : IChannel
         try
         {
             Span<byte> packet = stackalloc byte[4];
-            BinaryPrimitives.WriteInt32LittleEndian(packet, errorCode);
+            BinaryPrimitives.WriteInt32LittleEndian(packet, (int)errorCode);
 
             var encryptedPayload = new byte[4 + 16];
             int encryptedLength = _transport!.WriteMessage(packet, encryptedPayload);

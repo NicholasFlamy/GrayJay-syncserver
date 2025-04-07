@@ -24,6 +24,9 @@ public static class Logger
         if (ex != null)
             logMessage += $"\nException: {ex.Message}\nStack Trace: {ex.StackTrace}";
         Console.WriteLine(logMessage);
+#if DEBUG
+        System.Diagnostics.Debug.WriteLine(logMessage);
+#endif
     };
 
     public const LogLevel DefaultLogLevel = LogLevel.Verbose;

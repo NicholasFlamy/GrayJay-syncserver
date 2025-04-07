@@ -1,16 +1,11 @@
 ﻿using System.Buffers;
 using System.Buffers.Binary;
 using System.Diagnostics;
-using System.Drawing;
 using System.Net;
 using System.Net.Sockets;
-using System.Reflection.Emit;
-using System.Reflection.Metadata;
 using System.Text;
-using System.Threading;
 using Noise;
 using SyncShared;
-using static System.Runtime.InteropServices.JavaScript.JSType;
 using static SyncServer.TcpSyncServer;
 using LogLevel = SyncShared.LogLevel;
 
@@ -36,7 +31,6 @@ public class SyncSession
     public const int MAXIMUM_PACKET_SIZE = 65535 - 16;
     public const int MAXIMUM_PACKET_SIZE_ENCRYPTED = MAXIMUM_PACKET_SIZE + 16;
     private const long KV_STORAGE_LIMIT_PER_PUBLISHER = 10 * 1024 * 1024; // 10MB
-    private const int MAX_RELAYED_CONNECTIONS_PER_INITIATOR = 10;
     private const int MAX_ACTIVE_STREAMS = 10;
 
     public required Socket Socket { get; init; }
@@ -216,6 +210,14 @@ public class SyncSession
                 PrimaryState = SessionPrimaryState.DataTransfer;
                 _onHandshakeComplete?.Invoke(this);
                 Interlocked.Increment(ref _server.Metrics.TotalHandshakeSuccesses);
+
+                string ipAddress = GetIpAddress();
+                if (!_server.TryRegisterNewKeypair(ipAddress))
+                {
+                    Logger.Error<SyncSession>($"IP {ipAddress} exceeded keypair rate limit");
+                    Dispose();
+                    return;
+                }
             }
             else
             {
@@ -622,24 +624,36 @@ public class SyncSession
 
         long connectionId = BinaryPrimitives.ReadInt64LittleEndian(data.Slice(0, 8));
         var connection = _server.GetRelayedConnection(connectionId);
-        if (_server.RateLimitExceeded(connectionId, data.Length))
+
+        string ipAddress = GetIpAddress();
+        if (!_server.IsRelayDataAllowedByIP(ipAddress, data.Length))
         {
             Interlocked.Increment(ref _server.Metrics.TotalRateLimitExceedances);
-            Logger.Error<SyncSession>($"Received data to relay but exceeded rate limit by {RemotePublicKey}, connection terminated.");
-            SendRelayError(connectionId, 1);
+            Logger.Error<SyncSession>($"IP {ipAddress} exceeded relay data rate limit");
+            SendRelayError(connectionId, SyncErrorCode.RateLimitExceeded);
             _server.RemoveRelayedConnection(connectionId);
             return;
         }
+
+        if (!_server.IsRelayDataAllowedByConnectionId(connectionId, data.Length))
+        {
+            Interlocked.Increment(ref _server.Metrics.TotalRateLimitExceedances);
+            Logger.Error<SyncSession>($"Received data to relay but exceeded ConnectionId rate limit for connectionId {connectionId}, connection terminated.");
+            SendRelayError(connectionId, SyncErrorCode.RateLimitExceeded);
+            _server.RemoveRelayedConnection(connectionId);
+            return;
+        }
+
         if (connection == null || !connection.IsActive)
         {
             Logger.Error<SyncSession>($"Received data to relay but no relayed connection for connectionId {connectionId}");
-            SendRelayError(connectionId, 2);
+            SendRelayError(connectionId, SyncErrorCode.NotFound);
             return;
         }
         if (connection.Initiator != this && connection.Target != this)
         {
             Logger.Error<SyncSession>($"Received data to relay but unauthorized access to relayed connection {connectionId} by {this.RemotePublicKey}");
-            SendRelayError(connectionId, 3);
+            SendRelayError(connectionId, SyncErrorCode.Unauthorized);
             return;
         }
         SyncSession? otherClient = connection.Initiator == this ? connection.Target : connection.Initiator;
@@ -675,13 +689,13 @@ public class SyncSession
         if (connection == null || !connection.IsActive)
         {
             Logger.Error<SyncSession>($"Received error to relay but no active relayed connection for connectionId {connectionId}");
-            SendRelayError(connectionId, 2);
+            SendRelayError(connectionId, SyncErrorCode.NotFound);
             return;
         }
         if (connection.Initiator != this && connection.Target != this)
         {
             Logger.Error<SyncSession>($"Received error to relay but unauthorized access to relayed connection {connectionId} by {this.RemotePublicKey}");
-            SendRelayError(connectionId, 3);
+            SendRelayError(connectionId, SyncErrorCode.Unauthorized);
             return;
         }
         SyncSession? otherClient = connection.Initiator == this ? connection.Target : connection.Initiator;
@@ -713,18 +727,18 @@ public class SyncSession
         }
 
         long connectionId = BinaryPrimitives.ReadInt64LittleEndian(data.Slice(0, 8));
-        int errorCode = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(8, 4));
+        SyncErrorCode errorCode = (SyncErrorCode)BinaryPrimitives.ReadInt32LittleEndian(data.Slice(8, 4));
         var connection = _server.GetRelayedConnection(connectionId);
         if (connection == null || !connection.IsActive)
         {
             Logger.Error<SyncSession>($"Received relay error but no active relayed connection for connectionId {connectionId}");
-            SendRelayError(connectionId, 2);
+            SendRelayError(connectionId, SyncErrorCode.RateLimitExceeded);
             return;
         }
         if (connection.Initiator != this && connection.Target != this)
         {
             Logger.Error<SyncSession>($"Received relay error but it was unauthorized access to relayed connection {connectionId} by {this.RemotePublicKey}");
-            SendRelayError(connectionId, 3);
+            SendRelayError(connectionId, SyncErrorCode.Unauthorized);
             return;
         }
 
@@ -940,10 +954,17 @@ public class SyncSession
             return;
         }
 
-        int activeConnections = _server.GetActiveRelayedConnectionsCount(RemotePublicKey!);
-        if (activeConnections >= MAX_RELAYED_CONNECTIONS_PER_INITIATOR)
+        string ipAddress = GetIpAddress();
+        if (!_server.IsRelayRequestAllowedByIP(ipAddress))
         {
-            Logger.Info<SyncSession>($"Too many active relayed connections for {RemotePublicKey}");
+            Logger.Error<SyncSession>($"IP {ipAddress} exceeded relay request limit");
+            SendEmptyResponse(ResponseOpcode.TRANSPORT_RELAYED, requestId, 2);
+            return;
+        }
+
+        if (!_server.IsRelayRequestAllowedByKey(RemotePublicKey!))
+        {
+            Logger.Error<SyncSession>($"Remote public key {RemotePublicKey!} exceeded relay request limit");
             SendEmptyResponse(ResponseOpcode.TRANSPORT_RELAYED, requestId, 2);
             return;
         }
@@ -1009,6 +1030,14 @@ public class SyncSession
         byte[] encryptedBlob = data.Slice(blobLengthOffset + 4, blobLength).ToArray();
         byte[] publisherPublicKey = Convert.FromBase64String(RemotePublicKey!);
 
+        string ipAddress = GetIpAddress();
+        if (!_server.IsPublishRequestAllowed(ipAddress))
+        {
+            Logger.Error<SyncSession>($"IP {ipAddress} exceeded publish request rate limit");
+            SendEmptyResponse(ResponseOpcode.PUBLISH_RECORD, requestId, 3);
+            return;
+        }
+
         var stopwatch = Stopwatch.StartNew();
         _ = Task.Run(async () =>
         {
@@ -1017,6 +1046,7 @@ public class SyncSession
                 long totalSize = await _server.RecordRepository.GetTotalSizeAsync(publisherPublicKey);
                 if (totalSize + encryptedBlob.Length > KV_STORAGE_LIMIT_PER_PUBLISHER)
                 {
+                    Logger.Error<SyncSession>($"KV_STORAGE_LIMIT_PER_PUBLISHER exceeded for key '{publisherPublicKey}'.");
                     Interlocked.Increment(ref _server.Metrics.TotalStorageLimitExceedances);
                     SendEmptyResponse(ResponseOpcode.PUBLISH_RECORD, requestId, 2);
                     return;
@@ -1038,6 +1068,11 @@ public class SyncSession
                 SendEmptyResponse(ResponseOpcode.PUBLISH_RECORD, requestId, 1);
             }
         });
+    }
+
+    private string GetIpAddress()
+    {
+        return ((IPEndPoint)Socket.RemoteEndPoint!).Address.ToString();
     }
 
     private void HandleRequestDeleteRecord(ReadOnlySpan<byte> data)
@@ -1444,11 +1479,11 @@ public class SyncSession
         Send(Opcode.RESPONSE, (byte)responseOpcode, responseData);
     }
 
-    private void SendRelayError(long connectionId, int errorCode)
+    private void SendRelayError(long connectionId, SyncErrorCode errorCode)
     {
         Span<byte> errorPacket = stackalloc byte[12];
         BinaryPrimitives.WriteInt64LittleEndian(errorPacket.Slice(0, 8), connectionId);
-        BinaryPrimitives.WriteInt32LittleEndian(errorPacket.Slice(8, 4), errorCode);
+        BinaryPrimitives.WriteInt32LittleEndian(errorPacket.Slice(8, 4), (int)errorCode);
         Send(Opcode.RELAY, (byte)RelayOpcode.RELAY_ERROR, errorPacket);
     }
 
