@@ -13,6 +13,7 @@ namespace SyncServer;
 
 public class TcpSyncServerMetrics
 {
+    [JsonIgnore]
     private readonly TcpSyncServer _server;
 
     public TcpSyncServerMetrics(TcpSyncServer server)

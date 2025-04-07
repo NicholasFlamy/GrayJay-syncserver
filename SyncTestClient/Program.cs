@@ -120,7 +120,7 @@ internal class Program
                         BitConverter.GetBytes(timestamp).CopyTo(dataToSend, 0); // 8 bytes
                         BitConverter.GetBytes(seq).CopyTo(dataToSend, 8);       // 4 bytes
                         Array.Fill(dataToSend, (byte)0xFF, 12, 88);            // 88 bytes dummy data
-                        await c.SendRelayedDataAsync(Opcode.DATA, 0, dataToSend);
+                        await c.SendAsync(Opcode.DATA, 0, dataToSend);
                         await Task.Delay(1000);
                     }
                 });

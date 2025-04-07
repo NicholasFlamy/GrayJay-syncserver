@@ -1,14 +1,17 @@
 ﻿using Noise;
 using SyncShared;
 using System.Buffers.Binary;
+using System.Net.Sockets;
+using System.Text;
 namespace SyncClient;
 
 public interface IChannel : IDisposable
 {
     public string? RemotePublicKey { get; }
     public int? RemoteVersion { get; }
+    public IAuthorizable? Authorizable { get; set; }
     public void SetDataHandler(Action<SyncSocketSession, IChannel, Opcode, byte, ReadOnlySpan<byte>>? onData);
-    public Task SendRelayedDataAsync(Opcode opcode, byte subOpcode, byte[]? data = null, int offset = 0, int count = -1, CancellationToken cancellationToken = default);
+    public Task SendAsync(Opcode opcode, byte subOpcode, byte[]? data = null, int offset = 0, int count = -1, CancellationToken cancellationToken = default);
 }
 
 public class ChannelSocket : IChannel
@@ -17,6 +20,11 @@ public class ChannelSocket : IChannel
     public int? RemoteVersion => _session.RemoteVersion;
     private readonly SyncSocketSession _session;
     private Action<SyncSocketSession, IChannel, Opcode, byte, ReadOnlySpan<byte>>? _onData;
+    public IAuthorizable? Authorizable
+    {
+        get => _session.Authorizable;
+        set => _session.Authorizable = value;
+    }
 
     public ChannelSocket(SyncSocketSession session)
     {
@@ -38,7 +46,7 @@ public class ChannelSocket : IChannel
         _onData?.Invoke(_session, this, opcode, subOpcode, data);
     }
 
-    public async Task SendRelayedDataAsync(Opcode opcode, byte subOpcode, byte[]? data = null, int offset = 0, int count = -1, CancellationToken cancellationToken = default)
+    public async Task SendAsync(Opcode opcode, byte subOpcode, byte[]? data = null, int offset = 0, int count = -1, CancellationToken cancellationToken = default)
     {
         if (data != null)
             await _session.SendAsync(opcode, subOpcode, data, offset, count, cancellationToken: cancellationToken);
@@ -53,6 +61,8 @@ public class ChannelRelayed : IChannel
     private object _decryptLock = new object();
     private HandshakeState? _handshakeState;
     private Transport? _transport = null;
+    public IAuthorizable? Authorizable { get; set; }
+    public bool IsAuthorized => Authorizable?.IsAuthorized ?? false;
 
     public long ConnectionId { get; set; }
     public string? RemotePublicKey { get; private set; }
@@ -174,7 +184,7 @@ public class ChannelRelayed : IChannel
         }
     }
 
-    public async Task SendRelayedDataAsync(Opcode opcode, byte subOpcode, byte[]? data = null, int offset = 0, int count = -1, CancellationToken cancellationToken = default)
+    public async Task SendAsync(Opcode opcode, byte subOpcode, byte[]? data = null, int offset = 0, int count = -1, CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
 
@@ -245,26 +255,60 @@ public class ChannelRelayed : IChannel
         }
     }
 
-    public async Task SendRequestTransportAsync(int requestId, string publicKey, CancellationToken cancellationToken = default)
+    public async Task SendRequestTransportAsync(int requestId, string publicKey, string? pairingCode = null, CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
 
         await _sendSemaphore.WaitAsync();
         try
         {
-            var message = new byte[1024];
-            var (bytesWritten, _, _) = _handshakeState!.WriteMessage(null, message);
+            var channelMessage = new byte[1024];
+            var (channelBytesWritten, _, _) = _handshakeState!.WriteMessage(null, channelMessage);
 
             byte[] publicKeyBytes = Convert.FromBase64String(publicKey);
             if (publicKeyBytes.Length != 32)
                 throw new ArgumentException("Public key must be 32 bytes.");
 
-            var packetSize = 4 + 32 + 4 + bytesWritten;
+            int pairingMessageLength;
+            byte[] pairingMessage;
+
+            if (pairingCode != null)
+            {
+                var pairingProtocol = new Protocol(HandshakePattern.N, CipherFunction.ChaChaPoly, HashFunction.Blake2b);
+                using var pairingHandshakeState = pairingProtocol.Create(true, rs: publicKeyBytes);
+                byte[] pairingCodeBytes = Encoding.UTF8.GetBytes(pairingCode);
+                if (pairingCodeBytes.Length > 32)
+                    throw new ArgumentException("Pairing code must not exceed 32 bytes.");
+
+                var pairingMessageBuffer = new byte[1024];
+                var (bytesWritten, _, _) = pairingHandshakeState.WriteMessage(pairingCodeBytes, pairingMessageBuffer);
+                pairingMessageLength = bytesWritten;
+                pairingMessage = pairingMessageBuffer.AsSpan(0, bytesWritten).ToArray();
+            }
+            else
+            {
+                pairingMessageLength = 0;
+                pairingMessage = Array.Empty<byte>();
+            }
+
+            var packetSize = 4 + 32 + 4 + pairingMessageLength + 4 + channelBytesWritten;
             var packet = new byte[packetSize];
-            BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(0, 4), requestId);
-            publicKeyBytes.CopyTo(packet.AsSpan(4, 32));
-            BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(36, 4), bytesWritten);
-            message.AsSpan(0, bytesWritten).CopyTo(packet.AsSpan(40));
+
+            int offset = 0;
+            BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(offset, 4), requestId);
+            offset += 4;
+            publicKeyBytes.CopyTo(packet.AsSpan(offset, 32));
+            offset += 32;
+            BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(offset, 4), pairingMessageLength);
+            offset += 4;
+            if (pairingMessageLength > 0)
+            {
+                pairingMessage.CopyTo(packet.AsSpan(offset));
+                offset += pairingMessageLength;
+            }
+            BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(offset, 4), channelBytesWritten);
+            offset += 4;
+            channelMessage.AsSpan(0, channelBytesWritten).CopyTo(packet.AsSpan(offset));
 
             await _session.SendAsync(Opcode.REQUEST, (byte)RequestOpcode.TRANSPORT, packet, cancellationToken: cancellationToken);
         }

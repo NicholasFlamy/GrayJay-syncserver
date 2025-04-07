@@ -6,16 +6,9 @@ using Noise;
 using SyncShared;
 using System.Text;
 using System.Collections.Concurrent;
-using System.Security.Cryptography;
 using System.Buffers;
-using System.Threading;
 
 namespace SyncClient;
-
-public interface IAuthorizable
-{
-    bool IsAuthorized { get; }
-}
 
 public record ConnectionInfo(
     ushort Port,
@@ -43,7 +36,8 @@ public class SyncSocketSession : IDisposable
     private readonly Action<SyncSocketSession>? _onClose;
     private readonly Action<SyncSocketSession>? _onHandshakeComplete;
     private readonly Action<SyncSocketSession, ChannelRelayed>? _onNewChannel;
-    private readonly Func<SyncSocketSession, string, bool>? _isChannelAllowed;
+    private readonly Func<SyncSocketSession, string, string?, bool>? _isChannelAllowed;
+
     private int _streamIdGenerator = 0;
     private Transport? _transport = null;
     public string? RemotePublicKey { get; private set; } = null;
@@ -64,16 +58,12 @@ public class SyncSocketSession : IDisposable
     private readonly ConcurrentDictionary<int, TaskCompletionSource<Dictionary<string, (byte[] Data, DateTime Timestamp)>>> _pendingBulkGetRecordRequests = new();
     private readonly ConcurrentDictionary<int, TaskCompletionSource<Dictionary<string, ConnectionInfo?>>> _pendingBulkConnectionInfoRequests = new();
     private int _requestIdGenerator = 0;
-
-    //TODO: Can this be cleaner?
     public IAuthorizable? Authorizable { get; set; }
-    public bool IsTrusted { get; set; }
-    public bool IsAuthorized => (Authorizable?.IsAuthorized ?? false) || IsTrusted;
-
+    public bool IsAuthorized => Authorizable?.IsAuthorized ?? false;
 
     public SyncSocketSession(string remoteAddress, KeyPair localKeyPair, Stream inputStream, Stream outputStream,
         Action<SyncSocketSession>? onClose = null, Action<SyncSocketSession>? onHandshakeComplete = null,
-        Action<SyncSocketSession, Opcode, byte, ReadOnlySpan<byte>>? onData = null, Action<SyncSocketSession, ChannelRelayed>? onNewChannel = null, Func<SyncSocketSession, string, bool>? isChannelAllowed = null)
+        Action<SyncSocketSession, Opcode, byte, ReadOnlySpan<byte>>? onData = null, Action<SyncSocketSession, ChannelRelayed>? onNewChannel = null, Func<SyncSocketSession, string, string?, bool>? isChannelAllowed = null)
     {
         _inputStream = inputStream;
         _outputStream = outputStream;
@@ -528,7 +518,7 @@ public class SyncSocketSession : IDisposable
         return await tcs.Task;
     }
 
-    public Task<ChannelRelayed> StartRelayedChannelAsync(string publicKey, CancellationToken cancellationToken = default)
+    public Task<ChannelRelayed> StartRelayedChannelAsync(string publicKey, string? pairingCode = null, CancellationToken cancellationToken = default)
     {
         var tcs = new TaskCompletionSource<ChannelRelayed>();
         var requestId = GenerateRequestId();
@@ -547,7 +537,7 @@ public class SyncSocketSession : IDisposable
 
         try
         {
-            _ = channel.SendRequestTransportAsync(requestId, publicKey, cancellationToken).ContinueWith(t =>
+            _ = channel.SendRequestTransportAsync(requestId, publicKey, pairingCode, cancellationToken).ContinueWith(t =>
             {
                 if (t.IsFaulted && _pendingChannels.TryRemove(requestId, out var pending))
                 {
@@ -663,8 +653,9 @@ public class SyncSocketSession : IDisposable
         {
             case NotifyOpcode.AUTHORIZED:
             case NotifyOpcode.UNAUTHORIZED:
-                //Ignore for sourceChannel != null because in order to establish the channel authorization is already completed
-                if (sourceChannel == null)
+                if (sourceChannel != null)
+                    sourceChannel.InvokeDataHandler(Opcode.NOTIFY, (byte)opcode, data);
+                else
                     _onData?.Invoke(this, Opcode.NOTIFY, (byte)opcode, data);
                 break;
             case NotifyOpcode.CONNECTION_INFO:
@@ -1204,7 +1195,7 @@ public class SyncSocketSession : IDisposable
                     {
                         if (sourceChannel != null)
                         {
-                            await sourceChannel.SendRelayedDataAsync(Opcode.PONG, 0);
+                            await sourceChannel.SendAsync(Opcode.PONG, 0);
                         }
                         else
                         {
@@ -1235,7 +1226,7 @@ public class SyncSocketSession : IDisposable
                 return;
         }
 
-        var isAuthorized = IsAuthorized || sourceChannel != null;
+        var isAuthorized = sourceChannel != null ? sourceChannel.IsAuthorized : IsAuthorized;
         if (!isAuthorized)
         {
             Logger.Warning<SyncSocketSession>($"Ignored message due to lack of authorization (opcode: {opcode}, subOpcode: {subOpcode}) because ");
@@ -1379,33 +1370,71 @@ public class SyncSocketSession : IDisposable
         Logger.Info<SyncSocketSession>($"Received relay error (errorCode = {errorCode}) on connection id {connectionId}, closing connection.");
         channel.Dispose();
         _channels.TryRemove(connectionId, out _);
+
+        var requestId = -1;
+        foreach (var pendingChannelPair in _pendingChannels)
+        {
+            if (pendingChannelPair.Value.Channel == channel)
+            {
+                requestId = pendingChannelPair.Key;
+                break;
+            }
+        }
+        if (_pendingChannels.TryRemove(requestId, out var task))
+            task.Tcs.TrySetCanceled();
     }
 
     private void HandleRequestTransportRelayed(ReadOnlySpan<byte> data)
     {
-        if (data.Length < 4 + 48)
+        if (data.Length < 52)
         {
             Logger.Error<SyncSocketSession>("HandleRequestRelayedTransport: Packet too short");
             return;
         }
+
         int remoteVersion = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(0, 4));
         long connectionId = BinaryPrimitives.ReadInt64LittleEndian(data.Slice(4, 8));
         int requestId = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(12, 4));
         var publicKeyBytes = data.Slice(16, 32).ToArray();
-        int messageLength = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(48, 4));
-        if (data.Length != 52 + messageLength)
+        int pairingMessageLength = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(48, 4));
+        int offset = 52;
+
+        byte[] pairingMessage = Array.Empty<byte>();
+        if (pairingMessageLength > 0)
         {
-            Logger.Error<SyncSocketSession>($"HandleRequestRelayedTransport: Invalid packet size. Expected {52 + messageLength}, got {data.Length}");
+            if (data.Length < offset + pairingMessageLength + 4)
+            {
+                Logger.Error<SyncSocketSession>("HandleRequestRelayedTransport: Packet too short for pairing message");
+                return;
+            }
+            pairingMessage = data.Slice(offset, pairingMessageLength).ToArray();
+            offset += pairingMessageLength;
+        }
+
+        int channelMessageLength = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(offset, 4));
+        if (data.Length != offset + 4 + channelMessageLength)
+        {
+            Logger.Error<SyncSocketSession>($"HandleRequestRelayedTransport: Invalid packet size. Expected {offset + 4 + channelMessageLength}, got {data.Length}");
             return;
         }
-        byte[] handshakeMessage = data.Slice(52, messageLength).ToArray();
+        byte[] channelHandshakeMessage = data.Slice(offset + 4, channelMessageLength).ToArray();
         string publicKey = Convert.ToBase64String(publicKeyBytes);
 
-        var isAllowedToConnect = publicKey != _localPublicKey && (_isChannelAllowed?.Invoke(this, publicKey) ?? false);
+        string? pairingCode = null;
+        if (pairingMessageLength > 0)
+        {
+            var pairingProtocol = new Protocol(HandshakePattern.N, CipherFunction.ChaChaPoly, HashFunction.Blake2b);
+            using var pairingHandshakeState = pairingProtocol.Create(false, s: _localKeyPair.PrivateKey);
+            var plaintextBuffer = new byte[1024];
+            var (_, _, _) = pairingHandshakeState.ReadMessage(pairingMessage, plaintextBuffer);
+            pairingCode = Encoding.UTF8.GetString(plaintextBuffer, 0, Array.IndexOf(plaintextBuffer, (byte)0, 0, Math.Min(32, plaintextBuffer.Length)));
+        }
+
+        var isAllowedToConnect = publicKey != _localPublicKey && (_isChannelAllowed?.Invoke(this, publicKey, pairingCode) ?? false);
         if (!isAllowedToConnect)
         {
             var rp = new byte[16];
-            BinaryPrimitives.WriteInt32LittleEndian(rp.AsSpan(0, 4), (int)2); //status code
+            BinaryPrimitives.WriteInt32LittleEndian(rp.AsSpan(0, 4), (int)2);
             BinaryPrimitives.WriteInt64LittleEndian(rp.AsSpan(4, 8), connectionId);
             BinaryPrimitives.WriteInt32LittleEndian(rp.AsSpan(12, 4), requestId);
             _ = Task.Run(async () =>
@@ -1432,7 +1461,7 @@ public class SyncSocketSession : IDisposable
         {
             try
             {
-                await channel.SendResponseTransportAsync(remoteVersion, requestId, handshakeMessage);
+                await channel.SendResponseTransportAsync(remoteVersion, requestId, channelHandshakeMessage);
             }
             catch (Exception e)
             {

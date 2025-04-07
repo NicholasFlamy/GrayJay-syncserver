@@ -6,8 +6,6 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
 	<ServerGarbageCollection>true</ServerGarbageCollection>
-	<PublishTrimmed>true</PublishTrimmed>
-	<PublishAot>true</PublishAot>
 	<SelfContained>true</SelfContained>
 	<Platforms>AnyCPU;x64</Platforms>
   </PropertyGroup>

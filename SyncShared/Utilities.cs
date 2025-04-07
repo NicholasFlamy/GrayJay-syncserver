@@ -36,8 +36,11 @@ public static class Utilities
         return builder.ToString();
     }
 
-    public static byte[] GetLimitedUtf8Bytes(string str, int maxByteLength)
+    public static byte[] GetLimitedUtf8Bytes(string? str, int maxByteLength)
     {
+        if (str == null)
+            return Array.Empty<byte>();
+    
         if (str == null) throw new ArgumentNullException(nameof(str));
         if (maxByteLength < 0) throw new ArgumentOutOfRangeException(nameof(maxByteLength));
 

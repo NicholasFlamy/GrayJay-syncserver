@@ -929,24 +929,38 @@ public class SyncSession
     {
         Interlocked.Increment(ref _server.Metrics.TotalRelayedConnectionsRequested);
 
-        if (data.Length < 40)
+        if (data.Length < 44)
         {
             Logger.Error<SyncSession>("REQUEST_TRANSPORT packet too short");
             return;
         }
+
         int requestId = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(0, 4));
         string targetPublicKey = Convert.ToBase64String(data.Slice(4, 32));
-        int handshakeMessageLength = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(36, 4));
-        if (data.Length != 40 + handshakeMessageLength)
+        int pairingMessageLength = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(36, 4));
+        int offset = 40;
+
+        if (pairingMessageLength > 0)
         {
-            Logger.Error<SyncSession>($"Invalid REQUEST_TRANSPORT packet size. Expected {44 + handshakeMessageLength}, got {data.Length}");
+            if (data.Length < offset + pairingMessageLength + 4)
+            {
+                Logger.Error<SyncSession>("REQUEST_TRANSPORT packet too short for pairing message");
+                return;
+            }
+            offset += pairingMessageLength;
+        }
+        int channelMessageLength = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(offset, 4));
+        if (data.Length != offset + 4 + channelMessageLength)
+        {
+            Logger.Error<SyncSession>($"Invalid REQUEST_TRANSPORT packet size. Expected {offset + 4 + channelMessageLength}, got {data.Length}");
             return;
         }
-        byte[] handshakeMessage = data.Slice(40, handshakeMessageLength).ToArray();
+
+        byte[] pairingMessage = pairingMessageLength > 0 ? data.Slice(40, pairingMessageLength).ToArray() : Array.Empty<byte>();
+        byte[] channelHandshakeMessage = data.Slice(offset + 4, channelMessageLength).ToArray();
 
         Logger.Verbose<SyncSession>($"Transport request received (from = {RemotePublicKey}, to = {targetPublicKey}).");
 
-        // Check if the relay attempt is blacklisted
         if (_server.IsBlacklisted(RemotePublicKey!, targetPublicKey))
         {
             Logger.Info<SyncSession>($"Relay request from {RemotePublicKey} to {targetPublicKey} rejected due to blacklist.");
@@ -982,18 +996,30 @@ public class SyncSession
 
         byte[] initiatorPublicKeyBytes = Convert.FromBase64String(RemotePublicKey!);
 
-        var packetSize = 4 + 48 + handshakeMessageLength;
+        var packetSize = 4 + 8 + 4 + 32 + 4 + pairingMessageLength + 4 + channelMessageLength;
         var packetToTarget = Utilities.RentBytes(packetSize);
         try
         {
-            Logger.Verbose<SyncSession>($"Forwarding transport  {RemotePublicKey}");
+            int packetOffset = 0;
+            BinaryPrimitives.WriteInt32LittleEndian(packetToTarget.AsSpan(packetOffset, 4), RemoteVersion);
+            packetOffset += 4;
+            BinaryPrimitives.WriteInt64LittleEndian(packetToTarget.AsSpan(packetOffset, 8), connectionId);
+            packetOffset += 8;
+            BinaryPrimitives.WriteInt32LittleEndian(packetToTarget.AsSpan(packetOffset, 4), requestId);
+            packetOffset += 4;
+            initiatorPublicKeyBytes.CopyTo(packetToTarget.AsSpan(packetOffset, 32));
+            packetOffset += 32;
+            BinaryPrimitives.WriteInt32LittleEndian(packetToTarget.AsSpan(packetOffset, 4), pairingMessageLength);
+            packetOffset += 4;
+            if (pairingMessageLength > 0)
+            {
+                pairingMessage.CopyTo(packetToTarget.AsSpan(packetOffset));
+                packetOffset += pairingMessageLength;
+            }
+            BinaryPrimitives.WriteInt32LittleEndian(packetToTarget.AsSpan(packetOffset, 4), channelMessageLength);
+            packetOffset += 4;
+            channelHandshakeMessage.CopyTo(packetToTarget.AsSpan(packetOffset));
 
-            BinaryPrimitives.WriteInt32LittleEndian(packetToTarget.AsSpan(0, 4), RemoteVersion);
-            BinaryPrimitives.WriteInt64LittleEndian(packetToTarget.AsSpan(4, 8), connectionId);
-            BinaryPrimitives.WriteInt32LittleEndian(packetToTarget.AsSpan(12, 4), requestId);
-            initiatorPublicKeyBytes.CopyTo(packetToTarget.AsSpan(16, 32));
-            BinaryPrimitives.WriteInt32LittleEndian(packetToTarget.AsSpan(48, 4), handshakeMessageLength);
-            handshakeMessage.CopyTo(packetToTarget.AsSpan(52));
             targetSession.Send(Opcode.REQUEST, (byte)RequestOpcode.TRANSPORT_RELAYED, packetToTarget.AsSpan(0, packetSize));
         }
         finally
@@ -1501,6 +1527,8 @@ public class SyncSession
         {
             if (_sendQueue.Count > 0)
             {
+                bool lastSendPending = false;
+
                 do
                 {
                     var (data, offset, count, returnToPoolNext) = _sendQueue.Dequeue();
@@ -1521,19 +1549,22 @@ public class SyncSession
                     else
                     {
                         Logger.Verbose<SyncSession>($"Waiting on next send from queue to complete (_sendQueue.Count = {_sendQueue.Count}, _isBusyWriting = {_isBusyWriting}).");
+                        lastSendPending = true;
                         break;
                     }
                 } while (_sendQueue.Count > 0);
 
-                _sendQueueTotalSize = 0;
-                _isBusyWriting = false;
-                Logger.Verbose<SyncSession>($"Send completed. Set isBusyWriting to false because last write was completed.");
+                if (!lastSendPending)
+                {
+                    _isBusyWriting = false;
+                    Logger.Verbose<SyncSession>($"Send completed. Set isBusyWriting to false because queue is empty.");
+                }
             }
             else
             {
-                _sendQueueTotalSize = 0;
                 _isBusyWriting = false;
-                Logger.Verbose<SyncSession>($"Send completed asynchronously. Set isBusyWriting to false because last write was completed.");
+                _sendQueueTotalSize = 0;
+                Logger.Verbose<SyncSession>($"Send completed asynchronously. Set isBusyWriting to false because queue was empty.");
             }
         }
     }
