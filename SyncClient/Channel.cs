@@ -12,6 +12,7 @@ public interface IChannel : IDisposable
     public IAuthorizable? Authorizable { get; set; }
     public void SetDataHandler(Action<SyncSocketSession, IChannel, Opcode, byte, ReadOnlySpan<byte>>? onData);
     public Task SendAsync(Opcode opcode, byte subOpcode, byte[]? data = null, int offset = 0, int count = -1, CancellationToken cancellationToken = default);
+    public void SetCloseHandler(Action<IChannel>? onClose);
 }
 
 public class ChannelSocket : IChannel
@@ -20,6 +21,8 @@ public class ChannelSocket : IChannel
     public int? RemoteVersion => _session.RemoteVersion;
     private readonly SyncSocketSession _session;
     private Action<SyncSocketSession, IChannel, Opcode, byte, ReadOnlySpan<byte>>? _onData;
+    private Action<IChannel>? _onClose;
+    
     public IAuthorizable? Authorizable
     {
         get => _session.Authorizable;
@@ -36,9 +39,15 @@ public class ChannelSocket : IChannel
         _onData = onData;
     }
 
+    public void SetCloseHandler(Action<IChannel>? onClose)
+    {
+        _onClose = onClose;
+    }
+
     public void Dispose()
     {
         _session.Dispose();
+        _onClose?.Invoke(this);
     }
 
     public void InvokeDataHandler(Opcode opcode, byte subOpcode, ReadOnlySpan<byte> data)
@@ -63,7 +72,6 @@ public class ChannelRelayed : IChannel
     private Transport? _transport = null;
     public IAuthorizable? Authorizable { get; set; }
     public bool IsAuthorized => Authorizable?.IsAuthorized ?? false;
-
     public long ConnectionId { get; set; }
     public string? RemotePublicKey { get; private set; }
     public int? RemoteVersion { get; private set; }
@@ -71,6 +79,7 @@ public class ChannelRelayed : IChannel
     private readonly KeyPair _localKeyPair;
     private readonly SyncSocketSession _session;
     private Action<SyncSocketSession, IChannel, Opcode, byte, ReadOnlySpan<byte>>? _onData;
+    private Action<IChannel>? _onClose;
     private bool _disposed = false;
 
     public ChannelRelayed(SyncSocketSession session, KeyPair localKeyPair, string publicKey, bool initiator)
@@ -85,6 +94,11 @@ public class ChannelRelayed : IChannel
     public void SetDataHandler(Action<SyncSocketSession, IChannel, Opcode, byte, ReadOnlySpan<byte>>? onData)
     {
         _onData = onData;
+    }
+
+    public void SetCloseHandler(Action<IChannel>? onClose)
+    {
+        _onClose = onClose;
     }
 
     public void Dispose()
@@ -112,6 +126,8 @@ public class ChannelRelayed : IChannel
         _transport = null;
         _handshakeState?.Dispose();
         _handshakeState = null;
+
+        _onClose?.Invoke(this);
     }
 
     private void ThrowIfDisposed()

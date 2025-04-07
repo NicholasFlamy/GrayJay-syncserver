@@ -16,7 +16,7 @@ public record ConnectionInfo(
     IPAddress RemoteIp,
     List<IPAddress> Ipv4Addresses,
     List<IPAddress> Ipv6Addresses,
-    bool AllowLocal,
+    bool AllowLocalDirect,
     bool AllowRemoteDirect,
     bool AllowRemoteHolePunched,
     bool AllowRemoteProxied
@@ -56,7 +56,7 @@ public class SyncSocketSession : IDisposable
     private readonly ConcurrentDictionary<int, TaskCompletionSource<List<(string Key, DateTime Timestamp)>>> _pendingListKeysRequests = new();
     private readonly ConcurrentDictionary<int, TaskCompletionSource<(byte[] EncryptedBlob, DateTime Timestamp)?>> _pendingGetRecordRequests = new();
     private readonly ConcurrentDictionary<int, TaskCompletionSource<Dictionary<string, (byte[] Data, DateTime Timestamp)>>> _pendingBulkGetRecordRequests = new();
-    private readonly ConcurrentDictionary<int, TaskCompletionSource<Dictionary<string, ConnectionInfo?>>> _pendingBulkConnectionInfoRequests = new();
+    private readonly ConcurrentDictionary<int, TaskCompletionSource<Dictionary<string, ConnectionInfo>>> _pendingBulkConnectionInfoRequests = new();
     private int _requestIdGenerator = 0;
     public IAuthorizable? Authorizable { get; set; }
     public bool IsAuthorized => Authorizable?.IsAuthorized ?? false;
@@ -474,9 +474,9 @@ public class SyncSocketSession : IDisposable
         return tcs.Task;
     }
 
-    public async Task<Dictionary<string, ConnectionInfo?>> RequestBulkConnectionInfoAsync(IEnumerable<string> publicKeys, CancellationToken cancellationToken = default)
+    public async Task<Dictionary<string, ConnectionInfo>> RequestBulkConnectionInfoAsync(IEnumerable<string> publicKeys, CancellationToken cancellationToken = default)
     {
-        var tcs = new TaskCompletionSource<Dictionary<string, ConnectionInfo?>>();
+        var tcs = new TaskCompletionSource<Dictionary<string, ConnectionInfo>>();
         var requestId = GenerateRequestId();
         _pendingBulkConnectionInfoRequests[requestId] = tcs;
 
@@ -559,7 +559,7 @@ public class SyncSocketSession : IDisposable
         return tcs.Task;
     }
 
-    public async Task PublishConnectionInformationAsync(string[] authorizedKeys, int port, bool allowLocal, bool allowRemoteDirect, bool allowRemoteHolePunched, bool allowRemoteProxied, CancellationToken cancellationToken = default)
+    public async Task PublishConnectionInformationAsync(string[] authorizedKeys, int port, bool allowLocalDirect, bool allowRemoteDirect, bool allowRemoteHolePunched, bool allowRemoteProxied, CancellationToken cancellationToken = default)
     {
         const int MAX_AUTHORIZED_KEYS = 255;
         if (authorizedKeys.Length > MAX_AUTHORIZED_KEYS)
@@ -602,7 +602,7 @@ public class SyncSocketSession : IDisposable
             writer.Write((byte)ipv6Addresses.Count);
             foreach (var addr in ipv6Addresses)
                 writer.Write(addr.GetAddressBytes());
-            writer.Write((byte)(allowLocal ? 1 : 0));
+            writer.Write((byte)(allowLocalDirect ? 1 : 0));
             writer.Write((byte)(allowRemoteDirect ? 1 : 0));
             writer.Write((byte)(allowRemoteHolePunched ? 1 : 0));
             writer.Write((byte)(allowRemoteProxied ? 1 : 0));
@@ -1025,7 +1025,7 @@ public class SyncSocketSession : IDisposable
                     {
                         try
                         {
-                            var result = new Dictionary<string, ConnectionInfo?>();
+                            var result = new Dictionary<string, ConnectionInfo>();
                             int offset = 0;
                             byte numResponses = data[offset];
                             offset += 1;
@@ -1054,10 +1054,6 @@ public class SyncSocketSession : IDisposable
                                     var connectionInfo = ParseConnectionInfo(data.Slice(offset, infoSize));
                                     result[publicKey] = connectionInfo;
                                     offset += infoSize;
-                                }
-                                else // Not found
-                                {
-                                    result[publicKey] = null;
                                 }
                             }
                             tcs.SetResult(result);
@@ -1530,7 +1526,7 @@ public class SyncSocketSession : IDisposable
             infoSpan = infoSpan.Slice(16);
         }
 
-        bool allowLocal = infoSpan[0] != 0;
+        bool allowLocalDirect = infoSpan[0] != 0;
         infoSpan = infoSpan.Slice(1);
         bool allowRemoteDirect = infoSpan[0] != 0;
         infoSpan = infoSpan.Slice(1);
@@ -1544,7 +1540,7 @@ public class SyncSocketSession : IDisposable
             remoteIp,
             ipv4Addresses,
             ipv6Addresses,
-            allowLocal,
+            allowLocalDirect,
             allowRemoteDirect,
             allowRemoteHolePunched,
             allowRemoteProxied
@@ -2053,10 +2049,6 @@ public class SyncSocketSession : IDisposable
         foreach (var channel in _channels.Values)
             channel.Dispose();
         _channels.Clear();
-
-        foreach (var pair in _pendingChannels.Values)
-            pair.Channel.Dispose();
-        _pendingChannels.Clear();
 
         _started = false;
         _onClose?.Invoke(this);
