@@ -189,19 +189,44 @@ public class SyncSession
             {
                 Interlocked.Increment(ref _server.Metrics.TotalHandshakeAttempts);
 
-                var (_, _, _) = HandshakeState.ReadMessage(data, _decryptionBuffer);
+                int offset = 0;
+                int pairingMessageLength = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(offset, 4));
+                if (pairingMessageLength > 128)
+                    throw new InvalidDataException($"Received pairing message length ({pairingMessageLength}) exceeds maximum allowed size (128).");
+
+                offset += 4;
+
+                string? receivedPairingCode = null;
+                if (pairingMessageLength > 0)
+                {
+                    if (data.Length < offset + pairingMessageLength)
+                        throw new InvalidDataException("Message too short for specified pairing message length.");
+                    var pairingProtocol = new Protocol(HandshakePattern.N, CipherFunction.ChaChaPoly, HashFunction.Blake2b);
+                    using var pairingHandshakeState = pairingProtocol.Create(false, s: _server.LocalKeyPair.PrivateKey);
+                    var pairingMessage = data.Slice(offset, pairingMessageLength);
+                    offset += pairingMessageLength;
+                    var pairingPlaintext = new byte[512];
+                    var (_, _, _) = pairingHandshakeState.ReadMessage(pairingMessage, pairingPlaintext);
+                    receivedPairingCode = Encoding.UTF8.GetString(pairingPlaintext, 0, Array.IndexOf(pairingPlaintext, (byte)0, 0, Math.Min(32, pairingPlaintext.Length)));
+                    Logger.Info<SyncSession>($"HandshakeAsResponder: Received pairing code '{receivedPairingCode}' from client");
+                }
+
+                if (data.Length < offset)
+                    throw new InvalidDataException("Message too short for channel handshake.");
+                var channelMessage = data.Slice(offset);
+                var (_, _, _) = HandshakeState.ReadMessage(channelMessage, _decryptionBuffer);
                 var (bytesWritten, _, transport) = HandshakeState.WriteMessage(null, _decryptionBuffer);
-                Logger.Info<SyncSession>($"HandshakeAsResponder: Read message size {data.Length}");
+                Logger.Info<SyncSession>($"HandshakeAsResponder: Read channel message size {channelMessage.Length}");
 
                 BinaryPrimitives.WriteInt32LittleEndian(_sessionBuffer, bytesWritten);
-                _decryptionBuffer.AsSpan().Slice(0, bytesWritten).CopyTo(_sessionBuffer.AsSpan().Slice(4));
+                _decryptionBuffer.AsSpan(0, bytesWritten).CopyTo(_sessionBuffer.AsSpan(4));
 
                 lock (_sendLock)
                 {
                     Send(_sessionBuffer, 0, bytesWritten + 4);
                 }
 
-                Logger.Info<SyncSession>($"HandshakeAsResponder: Wrote message size {bytesWritten}");
+                Logger.Info<SyncSession>($"HandshakeAsResponder: Wrote response message size {bytesWritten}");
 
                 _transport = transport;
                 RemotePublicKey = Convert.ToBase64String(HandshakeState.RemoteStaticPublicKey);
@@ -218,6 +243,9 @@ public class SyncSession
                     Dispose();
                     return;
                 }
+
+                if (receivedPairingCode != null)
+                    Logger.Info<SyncSession>($"Accepted pairing code '{receivedPairingCode}' from {RemotePublicKey}");
             }
             else
             {

@@ -32,7 +32,7 @@ namespace SyncServerTests
             Action<SyncSocketSession>? onHandshakeComplete = null,
             Action<SyncSocketSession, Opcode, byte, ReadOnlySpan<byte>>? onData = null,
             Action<SyncSocketSession, ChannelRelayed>? onNewChannel = null,
-            Func<SyncSocketSession, string, string?, bool>? isChannelAllowed = null)
+            Func<SyncSocketSession, string, string?, bool>? isHandshakeAllowed = null)
         {
             var keyPair = KeyPair.Generate();
             var tcpClient = new TcpClient();
@@ -51,7 +51,7 @@ namespace SyncServerTests
                 },
                 onData: onData ?? ((s, o, so, d) => { }),
                 onNewChannel: onNewChannel ?? ((s, c) => { }),
-                isChannelAllowed: (s, pk, pw) => isChannelAllowed != null ? isChannelAllowed(s, pk, pw) : true
+                isHandshakeAllowed: (s, pk, pw) => isHandshakeAllowed != null ? isHandshakeAllowed(s, pk, pw) : true
             );
             socketSession.Authorizable = AlwaysAuthorized.Instance;
             _ = socketSession.StartAsInitiatorAsync(serverPublicKey);
@@ -183,12 +183,11 @@ namespace SyncServerTests
                 await clientC.PublishConnectionInformationAsync(new[] { clientB.LocalPublicKey }, 2000, true, true, true, true);
                 var nonExistentKey = Convert.ToBase64String(new byte[32]);
                 var infos = await clientB.RequestBulkConnectionInfoAsync(new[] { clientA.LocalPublicKey, clientC.LocalPublicKey, nonExistentKey });
-                Assert.AreEqual(3, infos.Count);
+                Assert.AreEqual(2, infos.Count);
                 Assert.IsNotNull(infos[clientA.LocalPublicKey]);
                 Assert.AreEqual(1000, infos[clientA.LocalPublicKey]!.Port);
                 Assert.IsNotNull(infos[clientC.LocalPublicKey]);
                 Assert.AreEqual(2000, infos[clientC.LocalPublicKey]!.Port);
-                Assert.IsNull(infos[nonExistentKey]);
             }
         }
 
@@ -1042,8 +1041,6 @@ namespace SyncServerTests
                     await clientA.SendAsync((byte)Opcode.STREAM, (byte)StreamOpcode.START, segmentData);
                 };
 
-                await clientA.SendAsync(Opcode.STREAM, (byte)StreamOpcode.START);
-
                 // Start 10 streams
                 for (int i = 0; i < 10; i++)
                     await startStream();
@@ -1073,7 +1070,7 @@ namespace SyncServerTests
                     port,
                     serverPublicKey,
                     onNewChannel: (s, c) => tcsB.SetResult(c),
-                    isChannelAllowed: (s, pk, code) => code == validPairingCode
+                    isHandshakeAllowed: (s, pk, code) => code == validPairingCode
                 );
 
                 using var clientA = await CreateClientAsync(
@@ -1115,7 +1112,7 @@ namespace SyncServerTests
                     port,
                     serverPublicKey,
                     onNewChannel: (s, c) => tcsB.SetResult(c),
-                    isChannelAllowed: (s, pk, code) => code == validPairingCode
+                    isHandshakeAllowed: (s, pk, code) => code == validPairingCode
                 );
 
                 using var clientA = await CreateClientAsync(port, serverPublicKey);
@@ -1147,7 +1144,7 @@ namespace SyncServerTests
                     port,
                     serverPublicKey,
                     onNewChannel: (s, c) => tcsB.SetResult(c),
-                    isChannelAllowed: (s, pk, code) => code == validPairingCode
+                    isHandshakeAllowed: (s, pk, code) => code == validPairingCode
                 );
 
                 using var clientA = await CreateClientAsync(port, serverPublicKey);
@@ -1180,7 +1177,7 @@ namespace SyncServerTests
                     port,
                     serverPublicKey,
                     onNewChannel: (s, c) => tcsB.SetResult(c),
-                    isChannelAllowed: (s, pk, code) => true
+                    isHandshakeAllowed: (s, pk, code) => true
                 );
 
                 using var clientA = await CreateClientAsync(

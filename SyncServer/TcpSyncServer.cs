@@ -119,6 +119,7 @@ public class TcpSyncServer : IDisposable
     private readonly ConcurrentDictionary<Socket, SyncSession> _clients = new();
     private readonly ConcurrentDictionary<string, SyncSession> _sessions = new();
     private readonly KeyPair _keyPair;
+    public KeyPair LocalKeyPair => _keyPair;
     private readonly ConcurrentDictionary<(string, string), byte[]> _connectionInfoStore = new();
     public readonly ConcurrentDictionary<long, RelayedConnection> RelayedConnections = new();
     private ConcurrentDictionary<(string, string), DateTime> _relayBlacklist = new ConcurrentDictionary<(string, string), DateTime>();

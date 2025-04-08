@@ -7,6 +7,7 @@ using SyncShared;
 using System.Text;
 using System.Collections.Concurrent;
 using System.Buffers;
+using System.Security.Cryptography.X509Certificates;
 
 namespace SyncClient;
 
@@ -36,7 +37,7 @@ public class SyncSocketSession : IDisposable
     private readonly Action<SyncSocketSession>? _onClose;
     private readonly Action<SyncSocketSession>? _onHandshakeComplete;
     private readonly Action<SyncSocketSession, ChannelRelayed>? _onNewChannel;
-    private readonly Func<SyncSocketSession, string, string?, bool>? _isChannelAllowed;
+    private readonly Func<SyncSocketSession, string, string?, bool>? _isHandshakeAllowed;
 
     private int _streamIdGenerator = 0;
     private Transport? _transport = null;
@@ -63,7 +64,7 @@ public class SyncSocketSession : IDisposable
 
     public SyncSocketSession(string remoteAddress, KeyPair localKeyPair, Stream inputStream, Stream outputStream,
         Action<SyncSocketSession>? onClose = null, Action<SyncSocketSession>? onHandshakeComplete = null,
-        Action<SyncSocketSession, Opcode, byte, ReadOnlySpan<byte>>? onData = null, Action<SyncSocketSession, ChannelRelayed>? onNewChannel = null, Func<SyncSocketSession, string, string?, bool>? isChannelAllowed = null)
+        Action<SyncSocketSession, Opcode, byte, ReadOnlySpan<byte>>? onData = null, Action<SyncSocketSession, ChannelRelayed>? onNewChannel = null, Func<SyncSocketSession, string, string?, bool>? isHandshakeAllowed = null)
     {
         _inputStream = inputStream;
         _outputStream = outputStream;
@@ -73,16 +74,16 @@ public class SyncSocketSession : IDisposable
         _onData = onData;
         _onNewChannel = onNewChannel;
         _localPublicKey = Convert.ToBase64String(localKeyPair.PublicKey);
-        _isChannelAllowed = isChannelAllowed;
+        _isHandshakeAllowed = isHandshakeAllowed;
         RemoteAddress = remoteAddress;
     }
 
-    public async Task StartAsInitiatorAsync(string remotePublicKey, CancellationToken cancellationToken = default)
+    public async Task StartAsInitiatorAsync(string remotePublicKey, string? pairingCode = null, CancellationToken cancellationToken = default)
     {
         _started = true;
         try
         {
-            await HandshakeAsInitiatorAsync(remotePublicKey, cancellationToken);
+            await HandshakeAsInitiatorAsync(remotePublicKey, pairingCode, cancellationToken);
             _onHandshakeComplete?.Invoke(this);
             await ReceiveLoopAsync(cancellationToken);
         }
@@ -101,9 +102,11 @@ public class SyncSocketSession : IDisposable
         _started = true;
         try
         {
-            await HandshakeAsResponderAsync(cancellationToken);
-            _onHandshakeComplete?.Invoke(this);
-            await ReceiveLoopAsync(cancellationToken);
+            if (await HandshakeAsResponderAsync(cancellationToken))
+            {
+                _onHandshakeComplete?.Invoke(this);
+                await ReceiveLoopAsync(cancellationToken);
+            }
         }
         catch (Exception e)
         {
@@ -162,7 +165,7 @@ public class SyncSocketSession : IDisposable
         }
     }
 
-    private async ValueTask HandshakeAsInitiatorAsync(string remotePublicKey, CancellationToken cancellationToken = default)
+    private async ValueTask HandshakeAsInitiatorAsync(string remotePublicKey, string? pairingCode = null, CancellationToken cancellationToken = default)
     {
         await PerformVersionCheckAsync();
 
@@ -170,10 +173,35 @@ public class SyncSocketSession : IDisposable
         var plaintext = new byte[512];
         using (var handshakeState = Constants.Protocol.Create(true, s: _localKeyPair.PrivateKey, rs: Convert.FromBase64String(remotePublicKey)))
         {
-            var (bytesWritten, _, _) = handshakeState.WriteMessage(null, message.AsSpan(4));
-            BinaryPrimitives.WriteInt32LittleEndian(message.AsSpan(0, 4), bytesWritten);
-            await SendAsync(message, 0, bytesWritten + 4, cancellationToken: cancellationToken);
-            Logger.Info<SyncSocketSession>($"HandshakeAsInitiator: Wrote message size {bytesWritten}");
+            byte[] pairingMessage = Array.Empty<byte>();
+            int pairingMessageLength = 0;
+            if (pairingCode != null)
+            {
+                var pairingProtocol = new Protocol(HandshakePattern.N, CipherFunction.ChaChaPoly, HashFunction.Blake2b);
+                using var pairingHandshakeState = pairingProtocol.Create(true, rs: Convert.FromBase64String(remotePublicKey));
+                byte[] pairingCodeBytes = Encoding.UTF8.GetBytes(pairingCode);
+                if (pairingCodeBytes.Length > 32)
+                    throw new ArgumentException("Pairing code must not exceed 32 bytes.");
+
+                var pairingMessageBuffer = new byte[512];
+                (pairingMessageLength, _, _) = pairingHandshakeState.WriteMessage(pairingCodeBytes, pairingMessageBuffer);
+                pairingMessage = pairingMessageBuffer.AsSpan(0, pairingMessageLength).ToArray();
+            }
+
+            int offset = 4;
+            BinaryPrimitives.WriteInt32LittleEndian(message.AsSpan(offset, 4), pairingMessageLength);
+            offset += 4;
+            if (pairingMessageLength > 0)
+            {
+                pairingMessage.CopyTo(message.AsSpan(offset, pairingMessageLength));
+                offset += pairingMessageLength;
+            }
+            var (channelBytesWritten, _, _) = handshakeState.WriteMessage(null, message.AsSpan(offset));
+            int totalMessageSize = 4 + pairingMessageLength + channelBytesWritten;
+            BinaryPrimitives.WriteInt32LittleEndian(message.AsSpan(0, 4), totalMessageSize);
+
+            await SendAsync(message, 0, totalMessageSize + 4, cancellationToken: cancellationToken);
+            Logger.Info<SyncSocketSession>($"HandshakeAsInitiator: Wrote message size {totalMessageSize} (pairing: {pairingMessageLength}, channel: {channelBytesWritten})");
 
             var bytesRead = await ReadAsync(message, 0, 4);
             if (bytesRead != 4)
@@ -192,12 +220,11 @@ public class SyncSocketSession : IDisposable
 
             var (_, _, transport) = handshakeState.ReadMessage(message.AsSpan().Slice(0, messageSize), plaintext);
             _transport = transport;
-
             RemotePublicKey = Convert.ToBase64String(handshakeState.RemoteStaticPublicKey);
         }
     }
 
-    private async ValueTask HandshakeAsResponderAsync(CancellationToken cancellationToken = default)
+    private async ValueTask<bool> HandshakeAsResponderAsync(CancellationToken cancellationToken = default)
     {
         await PerformVersionCheckAsync();
 
@@ -221,16 +248,47 @@ public class SyncSocketSession : IDisposable
                 bytesRead += read;
             }
 
-            var (_, _, _) = handshakeState.ReadMessage(message.AsSpan().Slice(0, messageSize), plaintext);
+            int offset = 0;
+            int pairingMessageLength = BinaryPrimitives.ReadInt32LittleEndian(message.AsSpan(offset, 4));
+            if (pairingMessageLength > 128)
+                throw new InvalidDataException($"Received pairing message length ({pairingMessageLength}) exceeds maximum allowed size (128).");
+
+            offset += 4;
+            string? receivedPairingCode = null;
+            if (pairingMessageLength > 0)
+            {
+                var pairingProtocol = new Protocol(HandshakePattern.N, CipherFunction.ChaChaPoly, HashFunction.Blake2b);
+                using var pairingHandshakeState = pairingProtocol.Create(false, s: _localKeyPair.PrivateKey);
+                var pairingMessage = message.AsSpan(offset, pairingMessageLength);
+                offset += pairingMessageLength;
+                var pairingPlaintext = new byte[512];
+                var (_, _, _) = pairingHandshakeState.ReadMessage(pairingMessage, pairingPlaintext);
+                receivedPairingCode = Encoding.UTF8.GetString(pairingPlaintext, 0, Array.IndexOf(pairingPlaintext, (byte)0, 0, Math.Min(32, pairingPlaintext.Length)));
+                Logger.Info<SyncSocketSession>($"HandshakeAsResponder: Received pairing code '{receivedPairingCode}'");
+            }
+
+            var channelMessage = message.AsSpan(offset, messageSize - offset);
+            var (_, _, _) = handshakeState.ReadMessage(channelMessage, plaintext);
 
             var (bytesWritten, _, transport) = handshakeState.WriteMessage(null, message.AsSpan(4));
+            var remotePublicKey = Convert.ToBase64String(handshakeState.RemoteStaticPublicKey);
+
+            var isAllowedToConnect = remotePublicKey != _localPublicKey && (_isHandshakeAllowed?.Invoke(this, remotePublicKey, receivedPairingCode) ?? true);
+            if (!isAllowedToConnect)
+            {
+                Logger.Info<SyncSocketSession>($"HandshakeAsResponder: Handshake is not allowed. Closing connection.");
+                Dispose();
+                return false;
+            }
+
             BinaryPrimitives.WriteInt32LittleEndian(message.AsSpan(0, 4), bytesWritten);
             await SendAsync(message, 0, bytesWritten + 4, cancellationToken: cancellationToken);
             Logger.Info<SyncSocketSession>($"HandshakeAsResponder: Wrote message size {bytesWritten}");
 
             _transport = transport;
 
-            RemotePublicKey = Convert.ToBase64String(handshakeState.RemoteStaticPublicKey);
+            RemotePublicKey = remotePublicKey;
+            return true;
         }
     }
 
@@ -1393,6 +1451,9 @@ public class SyncSocketSession : IDisposable
         int requestId = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(12, 4));
         var publicKeyBytes = data.Slice(16, 32).ToArray();
         int pairingMessageLength = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(48, 4));
+        if (pairingMessageLength > 128)
+            throw new InvalidDataException($"Received pairing message length ({pairingMessageLength}) exceeds maximum allowed size (128).");
+
         int offset = 52;
 
         byte[] pairingMessage = Array.Empty<byte>();
@@ -1426,7 +1487,7 @@ public class SyncSocketSession : IDisposable
             pairingCode = Encoding.UTF8.GetString(plaintextBuffer, 0, Array.IndexOf(plaintextBuffer, (byte)0, 0, Math.Min(32, plaintextBuffer.Length)));
         }
 
-        var isAllowedToConnect = publicKey != _localPublicKey && (_isChannelAllowed?.Invoke(this, publicKey, pairingCode) ?? false);
+        var isAllowedToConnect = publicKey != _localPublicKey && (_isHandshakeAllowed?.Invoke(this, publicKey, pairingCode) ?? true);
         if (!isAllowedToConnect)
         {
             var rp = new byte[16];
