@@ -112,7 +112,7 @@ public class ChannelRelayed : IChannel
             {
                 try
                 {
-                    await _session.SendRelayError(connectionId, SyncErrorCode.ConnectionClosed);
+                    await _session.SendRelayError(connectionId, RelayErrorCode.ConnectionClosed);
                 }
                 catch (Exception ex)
                 {
@@ -175,7 +175,7 @@ public class ChannelRelayed : IChannel
         }
     }
 
-    public async Task SendErrorAsync(SyncErrorCode errorCode, CancellationToken cancellationToken = default)
+    public async Task SendErrorAsync(RelayErrorCode errorCode, CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
 
@@ -299,6 +299,7 @@ public class ChannelRelayed : IChannel
                 var pairingMessageBuffer = new byte[1024];
                 var (bytesWritten, _, _) = pairingHandshakeState.WriteMessage(pairingCodeBytes, pairingMessageBuffer);
                 pairingMessageLength = bytesWritten;
+
                 pairingMessage = pairingMessageBuffer.AsSpan(0, bytesWritten).ToArray();
             }
             else

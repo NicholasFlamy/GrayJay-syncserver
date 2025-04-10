@@ -338,162 +338,186 @@ public class SyncSession
 
     private void HandleRequest(RequestOpcode subOpcode, Span<byte> data)
     {
-        switch (subOpcode)
+        if (data.Length < 4)
         {
-            case RequestOpcode.CONNECTION_INFO:
-                HandleRequestConnectionInfo(data);
-                break;
-            case RequestOpcode.TRANSPORT:
-                HandleRequestTransport(data);
-                break;
-            case RequestOpcode.PUBLISH_RECORD:
-                HandleRequestPublishRecord(data);
-                break;
-            case RequestOpcode.BULK_DELETE_RECORD:
-                HandleRequestBulkDeleteRecord(data);
-                break;
-            case RequestOpcode.DELETE_RECORD:
-                HandleRequestDeleteRecord(data);
-                break;
-            case RequestOpcode.LIST_RECORD_KEYS:
-                HandleRequestListKeys(data);
-                break;
-            case RequestOpcode.GET_RECORD:
-                HandleRequestGetRecord(data);
-                break;
-            case RequestOpcode.BULK_PUBLISH_RECORD:
-                Interlocked.Increment(ref _server.Metrics.TotalPublishRecordRequests);
+            Logger.Error<SyncSession>("Received a request without a request id, terminating connection.");
+            Dispose();
+            return;
+        }
 
-                if (data.Length < 10)
-                {
-                    Logger.Error<SyncSession>("REQUEST_BULK_PUBLISH_RECORD packet too short");
-                    return;
-                }
-                int bulkPublishRequestId = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(0, 4));
-                int keyLength = data[4];
-                if (keyLength > 32 || data.Length < 6 + keyLength)
-                {
-                    SendEmptyResponse(ResponseOpcode.BULK_PUBLISH_RECORD, bulkPublishRequestId, 1);
-                    return;
-                }
-                string key = Encoding.UTF8.GetString(data.Slice(5, keyLength));
-                byte numConsumers = data[5 + keyLength];
-                int offset = 6 + keyLength;
-                var records = new List<(byte[] publisherPublicKey, byte[] consumerPublicKey, string key, byte[] encryptedBlob)>(numConsumers);
+        int requestId = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(0, 4));
+        data = data.Slice(4);
 
-                byte[] publisherPublicKey = Convert.FromBase64String(RemotePublicKey!);
-                for (int i = 0; i < numConsumers; i++)
-                {
-                    if (offset + 36 > data.Length)
+        try
+        {
+            switch (subOpcode)
+            {
+                case RequestOpcode.CONNECTION_INFO:
+                    HandleRequestConnectionInfo(requestId, data);
+                    break;
+                case RequestOpcode.TRANSPORT:
+                    HandleRequestTransport(requestId, data);
+                    break;
+                case RequestOpcode.PUBLISH_RECORD:
+                    HandleRequestPublishRecord(requestId, data);
+                    break;
+                case RequestOpcode.BULK_DELETE_RECORD:
+                    HandleRequestBulkDeleteRecord(requestId, data);
+                    break;
+                case RequestOpcode.DELETE_RECORD:
+                    HandleRequestDeleteRecord(requestId, data);
+                    break;
+                case RequestOpcode.LIST_RECORD_KEYS:
+                    HandleRequestListKeys(requestId, data);
+                    break;
+                case RequestOpcode.GET_RECORD:
+                    HandleRequestGetRecord(requestId, data);
+                    break;
+                case RequestOpcode.BULK_PUBLISH_RECORD:
+                    Interlocked.Increment(ref _server.Metrics.TotalPublishRecordRequests);
+
+                    if (data.Length < 10)
                     {
-                        SendEmptyResponse(ResponseOpcode.BULK_PUBLISH_RECORD, bulkPublishRequestId, 1);
+                        Logger.Error<SyncSession>("REQUEST_BULK_PUBLISH_RECORD packet too short");
+                        SendEmptyResponse(ResponseOpcode.BULK_PUBLISH_RECORD, requestId, (int)BulkPublishRecordResponseCode.InvalidRequest);
                         return;
                     }
-                    byte[] consumerPublicKey = data.Slice(offset, 32).ToArray();
-                    offset += 32;
-                    int blobLength = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(offset, 4));
-                    offset += 4;
-                    if (offset + blobLength > data.Length)
+                    int keyLength = data[0];
+                    if (keyLength > 32 || data.Length < 6 + keyLength)
                     {
-                        SendEmptyResponse(ResponseOpcode.BULK_PUBLISH_RECORD, bulkPublishRequestId, 1);
+                        SendEmptyResponse(ResponseOpcode.BULK_PUBLISH_RECORD, requestId, (int)BulkPublishRecordResponseCode.InvalidRequest);
                         return;
                     }
-                    byte[] encryptedBlob = data.Slice(offset, blobLength).ToArray();
-                    offset += blobLength;
-                    records.Add((publisherPublicKey, consumerPublicKey, key, encryptedBlob));
-                }
+                    string key = Encoding.UTF8.GetString(data.Slice(1, keyLength));
+                    byte numConsumers = data[1 + keyLength];
+                    int offset = 2 + keyLength;
+                    var records = new List<(byte[] publisherPublicKey, byte[] consumerPublicKey, string key, byte[] encryptedBlob)>(numConsumers);
 
-                var stopwatch = Stopwatch.StartNew();
-                _ = Task.Run(async () =>
-                {
-                    try
+                    byte[] publisherPublicKey = Convert.FromBase64String(RemotePublicKey!);
+                    for (int i = 0; i < numConsumers; i++)
                     {
-                        long totalNewSize = records.Sum(r => r.encryptedBlob.Length);
-                        long totalSize = await _server.RecordRepository.GetTotalSizeAsync(publisherPublicKey);
-                        if (totalSize + totalNewSize > KV_STORAGE_LIMIT_PER_PUBLISHER)
+                        if (offset + 36 > data.Length)
                         {
-                            SendEmptyResponse(ResponseOpcode.BULK_PUBLISH_RECORD, bulkPublishRequestId, 2); // 2 = storage limit exceeded
+                            SendEmptyResponse(ResponseOpcode.BULK_PUBLISH_RECORD, requestId, (int)BulkPublishRecordResponseCode.InvalidRequest);
                             return;
                         }
-                        await _server.RecordRepository.BulkInsertOrUpdateAsync(records);
-
-                        stopwatch.Stop();
-                        Interlocked.Add(ref _server.Metrics.TotalPublishRecordTimeMs, stopwatch.ElapsedMilliseconds);
-                        Interlocked.Increment(ref _server.Metrics.PublishRecordCount);
-                        Interlocked.Increment(ref _server.Metrics.TotalPublishRecordSuccesses);
-                        SendEmptyResponse(ResponseOpcode.BULK_PUBLISH_RECORD, bulkPublishRequestId, 0); //Success
+                        byte[] consumerPublicKey = data.Slice(offset, 32).ToArray();
+                        offset += 32;
+                        int blobLength = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(offset, 4));
+                        offset += 4;
+                        if (offset + blobLength > data.Length)
+                        {
+                            SendEmptyResponse(ResponseOpcode.BULK_PUBLISH_RECORD, requestId, (int)BulkPublishRecordResponseCode.InvalidRequest);
+                            return;
+                        }
+                        byte[] encryptedBlob = data.Slice(offset, blobLength).ToArray();
+                        offset += blobLength;
+                        records.Add((publisherPublicKey, consumerPublicKey, key, encryptedBlob));
                     }
-                    catch (Exception ex)
-                    {
-                        stopwatch.Stop();
-                        Interlocked.Add(ref _server.Metrics.TotalPublishRecordTimeMs, stopwatch.ElapsedMilliseconds);
-                        Interlocked.Increment(ref _server.Metrics.PublishRecordCount);
-                        Interlocked.Increment(ref _server.Metrics.TotalPublishRecordFailures);
-                        Logger.Error<SyncSession>("Error bulk publishing records", ex);
-                        SendEmptyResponse(ResponseOpcode.BULK_PUBLISH_RECORD, bulkPublishRequestId, 1);
-                    }
-                });
-                break;
 
-            case RequestOpcode.BULK_GET_RECORD:
-                if (data.Length < 10) // Minimum: requestId (4) + keyLength (1) + key (0) + numPublishers (1)
-                {
-                    Logger.Error<SyncSession>("REQUEST_BULK_GET_RECORD packet too short");
-                    return;
-                }
-                int bulkGetRequestId = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(0, 4));
-                keyLength = data[4];
-                if (keyLength > 32 || data.Length < 6 + keyLength)
-                {
-                    SendEmptyResponse(ResponseOpcode.BULK_GET_RECORD, bulkGetRequestId, 1);
-                    return;
-                }
-                key = Encoding.UTF8.GetString(data.Slice(5, keyLength));
-                byte numPublishers = data[5 + keyLength];
-                offset = 6 + keyLength;
-                var publisherPublicKeys = new List<byte[]>(numPublishers);
-
-                for (int i = 0; i < numPublishers; i++)
-                {
-                    if (offset + 32 > data.Length)
+                    var stopwatch = Stopwatch.StartNew();
+                    _ = Task.Run(async () =>
                     {
-                        SendEmptyResponse(ResponseOpcode.BULK_GET_RECORD, bulkGetRequestId, 1);
+                        try
+                        {
+                            long totalNewSize = records.Sum(r => r.encryptedBlob.Length);
+                            long totalSize = await _server.RecordRepository.GetTotalSizeAsync(publisherPublicKey);
+                            if (totalSize + totalNewSize > KV_STORAGE_LIMIT_PER_PUBLISHER)
+                            {
+                                SendEmptyResponse(ResponseOpcode.BULK_PUBLISH_RECORD, requestId, (int)BulkPublishRecordResponseCode.StorageLimitExceeded); // 2 = storage limit exceeded
+                                return;
+                            }
+                            await _server.RecordRepository.BulkInsertOrUpdateAsync(records);
+
+                            stopwatch.Stop();
+                            Interlocked.Add(ref _server.Metrics.TotalPublishRecordTimeMs, stopwatch.ElapsedMilliseconds);
+                            Interlocked.Increment(ref _server.Metrics.PublishRecordCount);
+                            Interlocked.Increment(ref _server.Metrics.TotalPublishRecordSuccesses);
+                            SendEmptyResponse(ResponseOpcode.BULK_PUBLISH_RECORD, requestId, (int)BulkPublishRecordResponseCode.Success); //Success
+                        }
+                        catch (Exception ex)
+                        {
+                            stopwatch.Stop();
+                            Interlocked.Add(ref _server.Metrics.TotalPublishRecordTimeMs, stopwatch.ElapsedMilliseconds);
+                            Interlocked.Increment(ref _server.Metrics.PublishRecordCount);
+                            Interlocked.Increment(ref _server.Metrics.TotalPublishRecordFailures);
+                            Logger.Error<SyncSession>("Error bulk publishing records", ex);
+                            SendEmptyResponse(ResponseOpcode.BULK_PUBLISH_RECORD, requestId, (int)BulkPublishRecordResponseCode.GeneralError);
+                        }
+                    });
+                    break;
+
+                case RequestOpcode.BULK_GET_RECORD:
+                    if (data.Length < 10) // Minimum: requestId (4) + keyLength (1) + key (0) + numPublishers (1)
+                    {
+                        Logger.Error<SyncSession>("REQUEST_BULK_GET_RECORD packet too short");
+                        SendEmptyResponse(ResponseOpcode.BULK_GET_RECORD, requestId, (int)BulkGetRecordResponseCode.InvalidRequest);
                         return;
                     }
-                    publisherPublicKeys.Add(data.Slice(offset, 32).ToArray());
-                    offset += 32;
-                }
+                    keyLength = data[0];
+                    if (keyLength > 32 || data.Length < 6 + keyLength)
+                    {
+                        SendEmptyResponse(ResponseOpcode.BULK_GET_RECORD, requestId, (int)BulkGetRecordResponseCode.InvalidRequest);
+                        return;
+                    }
+                    key = Encoding.UTF8.GetString(data.Slice(1, keyLength));
+                    byte numPublishers = data[1 + keyLength];
+                    offset = 2 + keyLength;
+                    var publisherPublicKeys = new List<byte[]>(numPublishers);
 
-                _ = Task.Run(async () =>
-                {
-                    try
+                    for (int i = 0; i < numPublishers; i++)
                     {
-                        byte[] consumerPublicKey = Convert.FromBase64String(RemotePublicKey!);
-                        var records = await _server.RecordRepository.GetByPublishersAsync(consumerPublicKey, publisherPublicKeys, key);
-                        using var ms = new MemoryStream();
-                        using var writer = new BinaryWriter(ms);
-                        writer.Write(bulkGetRequestId);
-                        writer.Write((int)0); //status code
-                        writer.Write((byte)records.Count());
-                        foreach (var record in records)
+                        if (offset + 32 > data.Length)
                         {
-                            writer.Write(record.PublisherPublicKey);
-                            writer.Write(record.EncryptedBlob.Length);
-                            writer.Write(record.EncryptedBlob);
-                            writer.Write(record.Timestamp.ToBinary());
+                            SendEmptyResponse(ResponseOpcode.BULK_GET_RECORD, requestId, (int)BulkGetRecordResponseCode.InvalidRequest);
+                            return;
                         }
-                        Send(Opcode.RESPONSE, (byte)ResponseOpcode.BULK_GET_RECORD, ms.ToArray());
+                        publisherPublicKeys.Add(data.Slice(offset, 32).ToArray());
+                        offset += 32;
                     }
-                    catch (Exception ex)
+
+                    _ = Task.Run(async () =>
                     {
-                        Logger.Error<SyncSession>("Error bulk getting records", ex);
-                        SendEmptyResponse(ResponseOpcode.BULK_GET_RECORD, bulkGetRequestId, 1);
-                    }
-                });
-                break;
-            case RequestOpcode.BULK_CONNECTION_INFO:
-                HandleRequestBulkConnectionInfo(data);
-                break;
+                        try
+                        {
+                            byte[] consumerPublicKey = Convert.FromBase64String(RemotePublicKey!);
+                            var records = await _server.RecordRepository.GetByPublishersAsync(consumerPublicKey, publisherPublicKeys, key);
+                            using var ms = new MemoryStream();
+                            using var writer = new BinaryWriter(ms);
+                            writer.Write(requestId);
+                            writer.Write((int)BulkGetRecordResponseCode.Success); //status code
+                            writer.Write((byte)records.Count());
+                            foreach (var record in records)
+                            {
+                                writer.Write(record.PublisherPublicKey);
+                                writer.Write(record.EncryptedBlob.Length);
+                                writer.Write(record.EncryptedBlob);
+                                writer.Write(record.Timestamp.ToBinary());
+                            }
+                            Send(Opcode.RESPONSE, (byte)ResponseOpcode.BULK_GET_RECORD, ms.ToArray());
+                        }
+                        catch (Exception ex)
+                        {
+                            Logger.Error<SyncSession>("Error bulk getting records", ex);
+                            SendEmptyResponse(ResponseOpcode.BULK_GET_RECORD, requestId, (int)BulkGetRecordResponseCode.GeneralError);
+                        }
+                    });
+                    break;
+                case RequestOpcode.BULK_CONNECTION_INFO:
+                    HandleRequestBulkConnectionInfo(requestId, data);
+                    break;
+                default:
+                    Logger.Info<SyncSession>($"Invalid RequestOpcode received {subOpcode}.");
+                    SendEmptyResponse((ResponseOpcode)((byte)subOpcode), requestId, 1);
+                    //TODO: Dispose?
+                    break;
+            }
+        }
+        catch (Exception e)
+        {
+            Logger.Error<SyncSession>($"Generic error happened in request handler {subOpcode}.", e);
+            SendEmptyResponse((ResponseOpcode)((byte)subOpcode), requestId, 1);
+            //TODO: Dispose?
         }
     }
 
@@ -658,7 +682,7 @@ public class SyncSession
         {
             Interlocked.Increment(ref _server.Metrics.TotalRateLimitExceedances);
             Logger.Error<SyncSession>($"IP {ipAddress} exceeded relay data rate limit");
-            SendRelayError(connectionId, SyncErrorCode.RateLimitExceeded);
+            SendRelayError(connectionId, RelayErrorCode.RateLimitExceeded);
             _server.RemoveRelayedConnection(connectionId);
             return;
         }
@@ -667,7 +691,7 @@ public class SyncSession
         {
             Interlocked.Increment(ref _server.Metrics.TotalRateLimitExceedances);
             Logger.Error<SyncSession>($"Received data to relay but exceeded ConnectionId rate limit for connectionId {connectionId}, connection terminated.");
-            SendRelayError(connectionId, SyncErrorCode.RateLimitExceeded);
+            SendRelayError(connectionId, RelayErrorCode.RateLimitExceeded);
             _server.RemoveRelayedConnection(connectionId);
             return;
         }
@@ -675,13 +699,13 @@ public class SyncSession
         if (connection == null || !connection.IsActive)
         {
             Logger.Error<SyncSession>($"Received data to relay but no relayed connection for connectionId {connectionId}");
-            SendRelayError(connectionId, SyncErrorCode.NotFound);
+            SendRelayError(connectionId, RelayErrorCode.NotFound);
             return;
         }
         if (connection.Initiator != this && connection.Target != this)
         {
             Logger.Error<SyncSession>($"Received data to relay but unauthorized access to relayed connection {connectionId} by {this.RemotePublicKey}");
-            SendRelayError(connectionId, SyncErrorCode.Unauthorized);
+            SendRelayError(connectionId, RelayErrorCode.Unauthorized);
             return;
         }
         SyncSession? otherClient = connection.Initiator == this ? connection.Target : connection.Initiator;
@@ -717,13 +741,13 @@ public class SyncSession
         if (connection == null || !connection.IsActive)
         {
             Logger.Error<SyncSession>($"Received error to relay but no active relayed connection for connectionId {connectionId}");
-            SendRelayError(connectionId, SyncErrorCode.NotFound);
+            SendRelayError(connectionId, RelayErrorCode.NotFound);
             return;
         }
         if (connection.Initiator != this && connection.Target != this)
         {
             Logger.Error<SyncSession>($"Received error to relay but unauthorized access to relayed connection {connectionId} by {this.RemotePublicKey}");
-            SendRelayError(connectionId, SyncErrorCode.Unauthorized);
+            SendRelayError(connectionId, RelayErrorCode.Unauthorized);
             return;
         }
         SyncSession? otherClient = connection.Initiator == this ? connection.Target : connection.Initiator;
@@ -755,18 +779,18 @@ public class SyncSession
         }
 
         long connectionId = BinaryPrimitives.ReadInt64LittleEndian(data.Slice(0, 8));
-        SyncErrorCode errorCode = (SyncErrorCode)BinaryPrimitives.ReadInt32LittleEndian(data.Slice(8, 4));
+        RelayErrorCode errorCode = (RelayErrorCode)BinaryPrimitives.ReadInt32LittleEndian(data.Slice(8, 4));
         var connection = _server.GetRelayedConnection(connectionId);
         if (connection == null || !connection.IsActive)
         {
             Logger.Error<SyncSession>($"Received relay error but no active relayed connection for connectionId {connectionId}");
-            SendRelayError(connectionId, SyncErrorCode.RateLimitExceeded);
+            SendRelayError(connectionId, RelayErrorCode.RateLimitExceeded);
             return;
         }
         if (connection.Initiator != this && connection.Target != this)
         {
             Logger.Error<SyncSession>($"Received relay error but it was unauthorized access to relayed connection {connectionId} by {this.RemotePublicKey}");
-            SendRelayError(connectionId, SyncErrorCode.Unauthorized);
+            SendRelayError(connectionId, RelayErrorCode.Unauthorized);
             return;
         }
 
@@ -779,32 +803,32 @@ public class SyncSession
         _server.RemoveRelayedConnection(connectionId);
     }
 
-    private void HandleRequestBulkDeleteRecord(ReadOnlySpan<byte> data)
+    private void HandleRequestBulkDeleteRecord(int requestId, ReadOnlySpan<byte> data)
     {
-        if (data.Length < 69) // Minimum: requestId (4) + publisher (32) + consumer (32) + numKeys (1)
+        if (data.Length < 65) // Minimum: publisher (32) + consumer (32) + numKeys (1)
         {
             Logger.Error<SyncSession>("REQUEST_BULK_DELETE_RECORD packet too short");
+            SendEmptyResponse(ResponseOpcode.BULK_DELETE_RECORD, requestId, (int)BulkDeleteRecordResponseCode.InvalidRequest);
             return;
         }
-        int requestId = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(0, 4));
-        byte[] publisherPublicKey = data.Slice(4, 32).ToArray();
-        byte[] consumerPublicKey = data.Slice(36, 32).ToArray();
-        byte numKeys = data[68];
-        int offset = 69;
+        byte[] publisherPublicKey = data.Slice(0, 32).ToArray();
+        byte[] consumerPublicKey = data.Slice(32, 32).ToArray();
+        byte numKeys = data[64];
+        int offset = 65;
         var keys = new List<string>(numKeys);
 
         for (int i = 0; i < numKeys; i++)
         {
             if (offset >= data.Length)
             {
-                SendEmptyResponse(ResponseOpcode.BULK_DELETE_RECORD, requestId, 1);
+                SendEmptyResponse(ResponseOpcode.BULK_DELETE_RECORD, requestId, (int)BulkDeleteRecordResponseCode.InvalidRequest);
                 return;
             }
             byte keyLength = data[offset];
             offset += 1;
             if (offset + keyLength > data.Length || keyLength > 32)
             {
-                SendEmptyResponse(ResponseOpcode.BULK_DELETE_RECORD, requestId, 1);
+                SendEmptyResponse(ResponseOpcode.BULK_DELETE_RECORD, requestId, (int)BulkDeleteRecordResponseCode.InvalidRequest);
                 return;
             }
             string key = Encoding.UTF8.GetString(data.Slice(offset, keyLength));
@@ -816,7 +840,7 @@ public class SyncSession
         // Authorization: Sender must be publisher or consumer
         if (!senderPublicKey.SequenceEqual(publisherPublicKey) && !senderPublicKey.SequenceEqual(consumerPublicKey))
         {
-            SendEmptyResponse(ResponseOpcode.BULK_DELETE_RECORD, requestId, 1); // Unauthorized
+            SendEmptyResponse(ResponseOpcode.BULK_DELETE_RECORD, requestId, (int)BulkDeleteRecordResponseCode.Unauthorized); // Unauthorized
             return;
         }
 
@@ -825,34 +849,35 @@ public class SyncSession
             try
             {
                 await _server.RecordRepository.BulkDeleteAsync(publisherPublicKey, consumerPublicKey, keys);
-                SendEmptyResponse(ResponseOpcode.BULK_DELETE_RECORD, requestId, 0); // Success
+                SendEmptyResponse(ResponseOpcode.BULK_DELETE_RECORD, requestId, (int)BulkDeleteRecordResponseCode.Success); // Success
             }
             catch (Exception ex)
             {
                 Logger.Error<SyncSession>("Error bulk deleting records", ex);
-                SendEmptyResponse(ResponseOpcode.BULK_DELETE_RECORD, requestId, 1); // Error
+                SendEmptyResponse(ResponseOpcode.BULK_DELETE_RECORD, requestId, (int)BulkDeleteRecordResponseCode.GeneralError); // Error
             }
         });
     }
 
-    private void HandleRequestBulkConnectionInfo(ReadOnlySpan<byte> data)
+    private void HandleRequestBulkConnectionInfo(int requestId, ReadOnlySpan<byte> data)
     {
-        if (data.Length < 5)
+        if (data.Length < 1)
         {
             Logger.Error<SyncSession>("REQUEST_BULK_CONNECTION_INFO packet too short");
+            SendEmptyResponse(ResponseOpcode.BULK_CONNECTION_INFO, requestId, (int)BulkConnectionInfoResponseCode.InvalidRequest);
             return;
         }
-        int requestId = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(0, 4));
-        byte numKeys = data[4];
-        if (data.Length != 5 + numKeys * 32)
+        byte numKeys = data[0];
+        if (data.Length != 1 + numKeys * 32)
         {
             Logger.Error<SyncSession>("Invalid REQUEST_BULK_CONNECTION_INFO packet size");
+            SendEmptyResponse(ResponseOpcode.BULK_CONNECTION_INFO, requestId, (int)BulkConnectionInfoResponseCode.InvalidRequest);
             return;
         }
         var publicKeys = new List<string>(numKeys);
         for (int i = 0; i < numKeys; i++)
         {
-            string pk = Convert.ToBase64String(data.Slice(5 + i * 32, 32));
+            string pk = Convert.ToBase64String(data.Slice(1 + i * 32, 32));
             publicKeys.Add(pk);
         }
         string requestingPublicKey = RemotePublicKey!;
@@ -860,7 +885,7 @@ public class SyncSession
         var responseData = new MemoryStream();
         using var writer = new BinaryWriter(responseData);
         writer.Write(requestId); // 4 bytes: Request ID
-        writer.Write((int)0);
+        writer.Write((int)BulkConnectionInfoResponseCode.Success);
         writer.Write(numKeys); // 1 byte: Number of responses
         foreach (var pk in publicKeys)
         {
@@ -920,59 +945,61 @@ public class SyncSession
         Logger.Info<SyncSession>($"Published connection info for {numEntries} authorized keys.");
     }
 
-    private void HandleRequestConnectionInfo(ReadOnlySpan<byte> data)
+    private void HandleRequestConnectionInfo(int requestId, ReadOnlySpan<byte> data)
     {
-        if (data.Length != 36)
+        if (data.Length != 32)
         {
             Logger.Error<SyncSession>("Invalid target public key length in REQUEST_CONNECTION_INFO");
+            SendEmptyResponse(ResponseOpcode.CONNECTION_INFO, requestId, (int)ConnectionInfoResponseCode.InvalidRequest); 
             return;
         }
 
-        int requestId = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(0, 4));
-        string targetPublicKey = Convert.ToBase64String(data.Slice(4, 32)); 
+        string targetPublicKey = Convert.ToBase64String(data.Slice(0, 32)); 
         string requestingPublicKey = RemotePublicKey!;
 
         var block = _server.RetrieveConnectionInfo(targetPublicKey, requestingPublicKey);
-        if (block != null)
+        if (block == null)
         {
-            var responseData = Utilities.RentBytes(8 + block.Length);
-
-            try
-            {
-                BinaryPrimitives.WriteInt32LittleEndian(responseData.AsSpan(0, 4), requestId);
-                BinaryPrimitives.WriteInt32LittleEndian(responseData.AsSpan(4, 4), 0); //status code
-                block.CopyTo(responseData.AsSpan(8));
-                Send(Opcode.RESPONSE, (byte)ResponseOpcode.CONNECTION_INFO, responseData, 0, 8 + block.Length);
-            }
-            finally
-            {
-                Utilities.ReturnBytes(responseData);
-            }
-        }
-        else
-            SendEmptyResponse(ResponseOpcode.CONNECTION_INFO, requestId, 1);
-    }
-
-    private void HandleRequestTransport(ReadOnlySpan<byte> data)
-    {
-        Interlocked.Increment(ref _server.Metrics.TotalRelayedConnectionsRequested);
-
-        if (data.Length < 44)
-        {
-            Logger.Error<SyncSession>("REQUEST_TRANSPORT packet too short");
+            SendEmptyResponse(ResponseOpcode.CONNECTION_INFO, requestId, (int)ConnectionInfoResponseCode.NotFound);
             return;
         }
 
-        int requestId = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(0, 4));
-        string targetPublicKey = Convert.ToBase64String(data.Slice(4, 32));
-        int pairingMessageLength = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(36, 4));
-        int offset = 40;
+        var responseData = Utilities.RentBytes(8 + block.Length);
+
+        try
+        {
+            BinaryPrimitives.WriteInt32LittleEndian(responseData.AsSpan(0, 4), requestId);
+            BinaryPrimitives.WriteInt32LittleEndian(responseData.AsSpan(4, 4), 0); //status code
+            block.CopyTo(responseData.AsSpan(8));
+            Send(Opcode.RESPONSE, (byte)ResponseOpcode.CONNECTION_INFO, responseData, 0, 8 + block.Length);
+        }
+        finally
+        {
+            Utilities.ReturnBytes(responseData);
+        }
+    }
+
+    private void HandleRequestTransport(int requestId, ReadOnlySpan<byte> data)
+    {
+        Interlocked.Increment(ref _server.Metrics.TotalRelayedConnectionsRequested);
+
+        if (data.Length < 40)
+        {
+            Logger.Error<SyncSession>("REQUEST_TRANSPORT packet too short");
+            SendEmptyResponse(ResponseOpcode.TRANSPORT_RELAYED, requestId, (int)TransportResponseCode.GeneralError);
+            return;
+        }
+
+        string targetPublicKey = Convert.ToBase64String(data.Slice(0, 32));
+        int pairingMessageLength = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(32, 4));
+        int offset = 36;
 
         if (pairingMessageLength > 0)
         {
             if (data.Length < offset + pairingMessageLength + 4)
             {
                 Logger.Error<SyncSession>("REQUEST_TRANSPORT packet too short for pairing message");
+                SendEmptyResponse(ResponseOpcode.TRANSPORT_RELAYED, requestId, (int)TransportResponseCode.PairingCodeDataMismatch);
                 return;
             }
             offset += pairingMessageLength;
@@ -981,10 +1008,11 @@ public class SyncSession
         if (data.Length != offset + 4 + channelMessageLength)
         {
             Logger.Error<SyncSession>($"Invalid REQUEST_TRANSPORT packet size. Expected {offset + 4 + channelMessageLength}, got {data.Length}");
+            SendEmptyResponse(ResponseOpcode.TRANSPORT_RELAYED, requestId, (int)TransportResponseCode.ChannelMessageDataLengthMismatch);
             return;
         }
 
-        byte[] pairingMessage = pairingMessageLength > 0 ? data.Slice(40, pairingMessageLength).ToArray() : Array.Empty<byte>();
+        byte[] pairingMessage = pairingMessageLength > 0 ? data.Slice(36, pairingMessageLength).ToArray() : Array.Empty<byte>();
         byte[] channelHandshakeMessage = data.Slice(offset + 4, channelMessageLength).ToArray();
 
         Logger.Verbose<SyncSession>($"Transport request received (from = {RemotePublicKey}, to = {targetPublicKey}).");
@@ -992,7 +1020,7 @@ public class SyncSession
         if (_server.IsBlacklisted(RemotePublicKey!, targetPublicKey))
         {
             Logger.Info<SyncSession>($"Relay request from {RemotePublicKey} to {targetPublicKey} rejected due to blacklist.");
-            SendEmptyResponse(ResponseOpcode.TRANSPORT_RELAYED, requestId, 1);
+            SendEmptyResponse(ResponseOpcode.TRANSPORT_RELAYED, requestId, (int)TransportResponseCode.Blacklisted);
             return;
         }
 
@@ -1000,14 +1028,14 @@ public class SyncSession
         if (!_server.IsRelayRequestAllowedByIP(ipAddress))
         {
             Logger.Error<SyncSession>($"IP {ipAddress} exceeded relay request limit");
-            SendEmptyResponse(ResponseOpcode.TRANSPORT_RELAYED, requestId, 2);
+            SendEmptyResponse(ResponseOpcode.TRANSPORT_RELAYED, requestId, (int)TransportResponseCode.RateLimitExceeded);
             return;
         }
 
         if (!_server.IsRelayRequestAllowedByKey(RemotePublicKey!))
         {
             Logger.Error<SyncSession>($"Remote public key {RemotePublicKey!} exceeded relay request limit");
-            SendEmptyResponse(ResponseOpcode.TRANSPORT_RELAYED, requestId, 2);
+            SendEmptyResponse(ResponseOpcode.TRANSPORT_RELAYED, requestId, (int)TransportResponseCode.RateLimitExceeded);
             return;
         }
 
@@ -1015,7 +1043,7 @@ public class SyncSession
         if (targetSession == null)
         {
             Logger.Info<SyncSession>($"Target {targetPublicKey} not found for relay request.");
-            SendEmptyResponse(ResponseOpcode.TRANSPORT_RELAYED, requestId, 1);
+            SendEmptyResponse(ResponseOpcode.TRANSPORT_RELAYED, requestId, (int)TransportResponseCode.GeneralError);
             return;
         }
 
@@ -1056,29 +1084,29 @@ public class SyncSession
         }
     }
 
-    private void HandleRequestPublishRecord(ReadOnlySpan<byte> data)
+    private void HandleRequestPublishRecord(int requestId, ReadOnlySpan<byte> data)
     {
         Interlocked.Increment(ref _server.Metrics.TotalPublishRecordRequests);
 
-        if (data.Length < 41)
+        if (data.Length < 37)
         {
             Logger.Error<SyncSession>("REQUEST_PUBLISH_RECORD packet too short");
+            SendEmptyResponse(ResponseOpcode.PUBLISH_RECORD, requestId, (int)PublishRecordResponseCode.InvalidRequest); 
             return;
         }
-        int requestId = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(0, 4));
-        byte[] consumerPublicKey = data.Slice(4, 32).ToArray();
-        int keyLength = data[36];
+        byte[] consumerPublicKey = data.Slice(0, 32).ToArray();
+        int keyLength = data[32];
         if (keyLength > 32)
         {
-            SendEmptyResponse(ResponseOpcode.PUBLISH_RECORD, requestId, 1);
+            SendEmptyResponse(ResponseOpcode.PUBLISH_RECORD, requestId, (int)PublishRecordResponseCode.ConsumerPublicKeyDataLengthMismatch);
             return;
         }
-        string key = Encoding.UTF8.GetString(data.Slice(37, keyLength));
-        int blobLengthOffset = 37 + keyLength;
+        string key = Encoding.UTF8.GetString(data.Slice(33, keyLength));
+        int blobLengthOffset = 33 + keyLength;
         int blobLength = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(blobLengthOffset, 4));
         if (data.Length < blobLengthOffset + 4 + blobLength)
         {
-            SendEmptyResponse(ResponseOpcode.PUBLISH_RECORD, requestId, 1);
+            SendEmptyResponse(ResponseOpcode.PUBLISH_RECORD, requestId, (int)PublishRecordResponseCode.BlobPublicKeyDataLengthMismatch);
             return;
         }
         byte[] encryptedBlob = data.Slice(blobLengthOffset + 4, blobLength).ToArray();
@@ -1088,7 +1116,7 @@ public class SyncSession
         if (!_server.IsPublishRequestAllowed(ipAddress))
         {
             Logger.Error<SyncSession>($"IP {ipAddress} exceeded publish request rate limit");
-            SendEmptyResponse(ResponseOpcode.PUBLISH_RECORD, requestId, 3);
+            SendEmptyResponse(ResponseOpcode.PUBLISH_RECORD, requestId, (int)PublishRecordResponseCode.RateLimitExceeded); 
             return;
         }
 
@@ -1102,7 +1130,7 @@ public class SyncSession
                 {
                     Logger.Error<SyncSession>($"KV_STORAGE_LIMIT_PER_PUBLISHER exceeded for key '{publisherPublicKey}'.");
                     Interlocked.Increment(ref _server.Metrics.TotalStorageLimitExceedances);
-                    SendEmptyResponse(ResponseOpcode.PUBLISH_RECORD, requestId, 2);
+                    SendEmptyResponse(ResponseOpcode.PUBLISH_RECORD, requestId, (int)PublishRecordResponseCode.StorageLimitExceeded); 
                     return;
                 }
                 await _server.RecordRepository.InsertOrUpdateAsync(publisherPublicKey, consumerPublicKey, key, encryptedBlob);
@@ -1110,7 +1138,7 @@ public class SyncSession
                 Interlocked.Add(ref _server.Metrics.TotalPublishRecordTimeMs, stopwatch.ElapsedMilliseconds);
                 Interlocked.Increment(ref _server.Metrics.PublishRecordCount);
                 Interlocked.Increment(ref _server.Metrics.TotalPublishRecordSuccesses);
-                SendEmptyResponse(ResponseOpcode.PUBLISH_RECORD, requestId, 0);
+                SendEmptyResponse(ResponseOpcode.PUBLISH_RECORD, requestId, (int)PublishRecordResponseCode.Success);
             }
             catch (Exception ex)
             {
@@ -1119,7 +1147,7 @@ public class SyncSession
                 Interlocked.Increment(ref _server.Metrics.PublishRecordCount);
                 Interlocked.Increment(ref _server.Metrics.TotalPublishRecordFailures);
                 Logger.Error<SyncSession>("Error publishing record", ex);
-                SendEmptyResponse(ResponseOpcode.PUBLISH_RECORD, requestId, 1);
+                SendEmptyResponse(ResponseOpcode.PUBLISH_RECORD, requestId, (int)PublishRecordResponseCode.GeneralError);
             }
         });
     }
@@ -1129,32 +1157,32 @@ public class SyncSession
         return ((IPEndPoint)Socket.RemoteEndPoint!).Address.ToString();
     }
 
-    private void HandleRequestDeleteRecord(ReadOnlySpan<byte> data)
+    private void HandleRequestDeleteRecord(int requestId, ReadOnlySpan<byte> data)
     {
         Interlocked.Increment(ref _server.Metrics.TotalDeleteRecordRequests);
 
-        // Parse request: requestId (4), publisherPublicKey (32), consumerPublicKey (32), keyLength (1), key (variable)
-        if (data.Length < 69) // Minimum size: 4 + 32 + 32 + 1 + 0
+        // Parse request: publisherPublicKey (32), consumerPublicKey (32), keyLength (1), key (variable)
+        if (data.Length < 65) // Minimum size: 32 + 32 + 1 + 0
         {
             Logger.Error<SyncSession>("REQUEST_DELETE_RECORD packet too short");
+            SendEmptyResponse(ResponseOpcode.DELETE_RECORD, requestId, (int)DeleteRecordResponseCode.InvalidRequest);
             return;
         }
-        int requestId = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(0, 4));
-        byte[] publisherPublicKey = data.Slice(4, 32).ToArray();
-        byte[] consumerPublicKey = data.Slice(36, 32).ToArray();
-        int keyLength = data[68];
+        byte[] publisherPublicKey = data.Slice(0, 32).ToArray();
+        byte[] consumerPublicKey = data.Slice(32, 32).ToArray();
+        int keyLength = data[64];
         if (keyLength > 32)
         {
-            SendEmptyResponse(ResponseOpcode.DELETE_RECORD, requestId, 1);
+            SendEmptyResponse(ResponseOpcode.DELETE_RECORD, requestId, (int)DeleteRecordResponseCode.InvalidRequest);
             return;
         }
-        string key = Encoding.UTF8.GetString(data.Slice(69, keyLength));
+        string key = Encoding.UTF8.GetString(data.Slice(65, keyLength));
         byte[] senderPublicKey = Convert.FromBase64String(RemotePublicKey!);
 
         // Authorization: Sender must be publisher or consumer
         if (!senderPublicKey.SequenceEqual(publisherPublicKey) && !senderPublicKey.SequenceEqual(consumerPublicKey))
         {
-            SendEmptyResponse(ResponseOpcode.DELETE_RECORD, requestId, 1);
+            SendEmptyResponse(ResponseOpcode.DELETE_RECORD, requestId, (int)DeleteRecordResponseCode.Unauthorized);
             return;
         }
 
@@ -1165,7 +1193,7 @@ public class SyncSession
             {
                 await _server.RecordRepository.DeleteAsync(publisherPublicKey, consumerPublicKey, key);
                 stopwatch.Stop();
-                SendEmptyResponse(ResponseOpcode.DELETE_RECORD, requestId, 0);
+                SendEmptyResponse(ResponseOpcode.DELETE_RECORD, requestId, (int)DeleteRecordResponseCode.Success);
 
                 Interlocked.Add(ref _server.Metrics.TotalDeleteRecordTimeMs, stopwatch.ElapsedMilliseconds);
                 Interlocked.Increment(ref _server.Metrics.DeleteRecordCount);
@@ -1175,7 +1203,7 @@ public class SyncSession
             {
                 stopwatch.Stop();
                 Logger.Error<SyncSession>("Error deleting record", ex);
-                SendEmptyResponse(ResponseOpcode.DELETE_RECORD, requestId, 1);
+                SendEmptyResponse(ResponseOpcode.DELETE_RECORD, requestId, (int)DeleteRecordResponseCode.GeneralError);
 
                 Interlocked.Add(ref _server.Metrics.TotalDeleteRecordTimeMs, stopwatch.ElapsedMilliseconds);
                 Interlocked.Increment(ref _server.Metrics.DeleteRecordCount);
@@ -1184,25 +1212,25 @@ public class SyncSession
         });
     }
 
-    private void HandleRequestListKeys(ReadOnlySpan<byte> data)
+    private void HandleRequestListKeys(int requestId, ReadOnlySpan<byte> data)
     {
         Interlocked.Increment(ref _server.Metrics.TotalListKeysRequests);
 
-        // Parse request: requestId (4), publisherPublicKey (32), consumerPublicKey (32)
-        if (data.Length != 68)
+        // Parse request: publisherPublicKey (32), consumerPublicKey (32)
+        if (data.Length != 64)
         {
             Logger.Error<SyncSession>("REQUEST_LIST_KEYS packet invalid size");
+            SendEmptyResponse(ResponseOpcode.LIST_RECORD_KEYS, requestId, (int)ListRecordKeysResponseCode.InvalidRequest);
             return;
         }
-        int requestId = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(0, 4));
-        byte[] publisherPublicKey = data.Slice(4, 32).ToArray();
-        byte[] consumerPublicKey = data.Slice(36, 32).ToArray();
+        byte[] publisherPublicKey = data.Slice(0, 32).ToArray();
+        byte[] consumerPublicKey = data.Slice(32, 32).ToArray();
         byte[] senderPublicKey = Convert.FromBase64String(RemotePublicKey!);
 
         // Authorization: Sender must be publisher or consumer
         if (!senderPublicKey.SequenceEqual(publisherPublicKey) && !senderPublicKey.SequenceEqual(consumerPublicKey))
         {
-            SendEmptyResponse(ResponseOpcode.LIST_RECORD_KEYS, requestId, 1);
+            SendEmptyResponse(ResponseOpcode.LIST_RECORD_KEYS, requestId, (int)ListRecordKeysResponseCode.Unauthorized);
             return;
         }
 
@@ -1217,7 +1245,7 @@ public class SyncSession
                 using var ms = new MemoryStream();
                 using var writer = new BinaryWriter(ms);
                 writer.Write(requestId);
-                writer.Write((int)0); //Status code
+                writer.Write((int)ListRecordKeysResponseCode.Success); //Status code
                 writer.Write(keys.Count());
                 foreach (var (key, timestamp) in keys)
                 {
@@ -1238,7 +1266,7 @@ public class SyncSession
                 stopwatch.Stop();
 
                 Logger.Error<SyncSession>("Error listing keys", ex);
-                SendEmptyResponse(ResponseOpcode.LIST_RECORD_KEYS, requestId, 1);
+                SendEmptyResponse(ResponseOpcode.LIST_RECORD_KEYS, requestId, (int)ListRecordKeysResponseCode.GeneralError);
 
                 Interlocked.Add(ref _server.Metrics.TotalListKeysTimeMs, stopwatch.ElapsedMilliseconds);
                 Interlocked.Increment(ref _server.Metrics.ListKeysCount);
@@ -1247,25 +1275,25 @@ public class SyncSession
         });
     }
 
-    private void HandleRequestGetRecord(ReadOnlySpan<byte> data)
+    private void HandleRequestGetRecord(int requestId, ReadOnlySpan<byte> data)
     {
         Interlocked.Increment(ref _server.Metrics.TotalGetRecordRequests);
 
-        // Parse request: requestId (4), publisherPublicKey (32), consumerPublicKey (32), keyLength (1), key (variable)
-        if (data.Length < 37) // Minimum size: 4 + 32 + 1 + 0
+        // Parse request: publisherPublicKey (32), consumerPublicKey (32), keyLength (1), key (variable)
+        if (data.Length < 33) // Minimum size: 32 + 1 + 0
         {
             Logger.Error<SyncSession>("REQUEST_GET_RECORD packet too short");
+            SendEmptyResponse(ResponseOpcode.GET_RECORD, requestId, (int)GetRecordResponseCode.InvalidRequest);
             return;
         }
-        int requestId = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(0, 4));
-        byte[] publisherPublicKey = data.Slice(4, 32).ToArray();
-        int keyLength = data[36];
+        byte[] publisherPublicKey = data.Slice(0, 32).ToArray();
+        int keyLength = data[32];
         if (keyLength > 32)
         {
-            SendEmptyResponse(ResponseOpcode.GET_RECORD, requestId, 1);
+            SendEmptyResponse(ResponseOpcode.GET_RECORD, requestId, (int)GetRecordResponseCode.InvalidRequest);
             return;
         }
-        string key = Encoding.UTF8.GetString(data.Slice(37, keyLength));
+        string key = Encoding.UTF8.GetString(data.Slice(33, keyLength));
         byte[] consumerPublicKey = Convert.FromBase64String(RemotePublicKey!);
 
         var stopwatch = Stopwatch.StartNew();
@@ -1281,7 +1309,7 @@ public class SyncSession
                     using var ms = new MemoryStream();
                     using var writer = new BinaryWriter(ms);
                     writer.Write(requestId);
-                    writer.Write((int)0);
+                    writer.Write((int)GetRecordResponseCode.Success);
                     writer.Write(record.EncryptedBlob.Length);
                     writer.Write(record.EncryptedBlob);
                     writer.Write(record.Timestamp.ToBinary());
@@ -1294,7 +1322,7 @@ public class SyncSession
                 }
                 else
                 {
-                    SendEmptyResponse(ResponseOpcode.GET_RECORD, requestId, 2);
+                    SendEmptyResponse(ResponseOpcode.GET_RECORD, requestId, (int)GetRecordResponseCode.NotFound);
 
                     Interlocked.Add(ref _server.Metrics.TotalGetRecordTimeMs, stopwatch.ElapsedMilliseconds);
                     Interlocked.Increment(ref _server.Metrics.GetRecordCount);
@@ -1304,7 +1332,7 @@ public class SyncSession
             catch (Exception ex)
             {
                 Logger.Error<SyncSession>("Error getting record", ex);
-                SendEmptyResponse(ResponseOpcode.GET_RECORD, requestId, 1);
+                SendEmptyResponse(ResponseOpcode.GET_RECORD, requestId, (int)GetRecordResponseCode.GeneralError);
             }
         });
     }
@@ -1533,7 +1561,7 @@ public class SyncSession
         Send(Opcode.RESPONSE, (byte)responseOpcode, responseData);
     }
 
-    private void SendRelayError(long connectionId, SyncErrorCode errorCode)
+    private void SendRelayError(long connectionId, RelayErrorCode errorCode)
     {
         Span<byte> errorPacket = stackalloc byte[12];
         BinaryPrimitives.WriteInt64LittleEndian(errorPacket.Slice(0, 8), connectionId);
