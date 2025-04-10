@@ -259,6 +259,18 @@ public class SqliteRecordRepository : IRecordRepository
             }
 
             await transaction.CommitAsync();
+
+            var cacheEntryOptions = new MemoryCacheEntryOptions()
+                .SetSize(1)
+                .SetSlidingExpiration(TimeSpan.FromMinutes(10));
+            foreach (var (publisherPublicKey, consumerPublicKey, key, encryptedBlob) in records)
+            {
+                var publisherId = await GetOrCreateUserIdAsync(publisherPublicKey, connection);
+                var consumerId = await GetOrCreateUserIdAsync(consumerPublicKey, connection);
+                var recordKey = new RecordKey(publisherId, consumerId, key);
+                var recordValue = new RecordValue { EncryptedBlob = encryptedBlob, Timestamp = DateTime.UtcNow };
+                _recordCache.Set(recordKey, recordValue, cacheEntryOptions);
+            }
         }
         catch (SqliteException ex) when (ex.SqliteErrorCode == SQLitePCL.raw.SQLITE_BUSY)
         {
