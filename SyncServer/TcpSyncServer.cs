@@ -409,7 +409,7 @@ public class TcpSyncServer : IDisposable
                     case SocketAsyncOperation.Receive:
                         if (e.BytesTransferred == 0)
                         {
-                            Logger.Error<TcpSyncServer>($"Soft disconnect");
+                            Logger.Info<TcpSyncServer>($"Soft disconnect");
                             CloseConnection(session);
                         }
                         else
@@ -420,7 +420,7 @@ public class TcpSyncServer : IDisposable
                     case SocketAsyncOperation.Send:
                         if (e.BytesTransferred == 0)
                         {
-                            Logger.Error<TcpSyncServer>($"Soft disconnect");
+                            Logger.Info<TcpSyncServer>($"Soft disconnect");
                             CloseConnection(session);
                         }
                         else
