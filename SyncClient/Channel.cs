@@ -10,6 +10,7 @@ public interface IChannel : IDisposable
     public string? RemotePublicKey { get; }
     public int? RemoteVersion { get; }
     public IAuthorizable? Authorizable { get; set; }
+    public object? SyncSession { get; set; } //TODO: Replace with SyncSession once library is properly structured
     public void SetDataHandler(Action<SyncSocketSession, IChannel, Opcode, byte, ReadOnlySpan<byte>>? onData);
     public Task SendAsync(Opcode opcode, byte subOpcode, byte[]? data = null, int offset = 0, int count = -1, CancellationToken cancellationToken = default);
     public void SetCloseHandler(Action<IChannel>? onClose);
@@ -28,6 +29,7 @@ public class ChannelSocket : IChannel
         get => _session.Authorizable;
         set => _session.Authorizable = value;
     }
+    public object? SyncSession { get; set; }
 
     public ChannelSocket(SyncSocketSession session)
     {
@@ -75,6 +77,7 @@ public class ChannelRelayed : IChannel
     public long ConnectionId { get; set; }
     public string? RemotePublicKey { get; private set; }
     public int? RemoteVersion { get; private set; }
+    public object? SyncSession { get; set; }
 
     private readonly KeyPair _localKeyPair;
     private readonly SyncSocketSession _session;
@@ -89,6 +92,7 @@ public class ChannelRelayed : IChannel
         _handshakeState = initiator
             ? Constants.Protocol.Create(initiator, s: _localKeyPair.PrivateKey, rs: Convert.FromBase64String(publicKey))
             : Constants.Protocol.Create(initiator, s: _localKeyPair.PrivateKey);
+        RemotePublicKey = publicKey;
     }
 
     public void SetDataHandler(Action<SyncSocketSession, IChannel, Opcode, byte, ReadOnlySpan<byte>>? onData)

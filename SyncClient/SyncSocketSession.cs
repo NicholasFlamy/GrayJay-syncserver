@@ -37,6 +37,7 @@ public class SyncSocketSession : IDisposable
     private readonly Action<SyncSocketSession>? _onClose;
     private readonly Action<SyncSocketSession>? _onHandshakeComplete;
     private readonly Action<SyncSocketSession, ChannelRelayed>? _onNewChannel;
+    private readonly Action<SyncSocketSession, ChannelRelayed, bool>? _onChannelEstablished;
     private readonly Func<SyncSocketSession, string, string?, bool>? _isHandshakeAllowed;
 
     private int _streamIdGenerator = 0;
@@ -64,12 +65,13 @@ public class SyncSocketSession : IDisposable
 
     public SyncSocketSession(string remoteAddress, KeyPair localKeyPair, Stream inputStream, Stream outputStream,
         Action<SyncSocketSession>? onClose = null, Action<SyncSocketSession>? onHandshakeComplete = null,
-        Action<SyncSocketSession, Opcode, byte, ReadOnlySpan<byte>>? onData = null, Action<SyncSocketSession, ChannelRelayed>? onNewChannel = null, Func<SyncSocketSession, string, string?, bool>? isHandshakeAllowed = null)
+        Action<SyncSocketSession, Opcode, byte, ReadOnlySpan<byte>>? onData = null, Action<SyncSocketSession, ChannelRelayed>? onNewChannel = null, Func<SyncSocketSession, string, string?, bool>? isHandshakeAllowed = null, Action<SyncSocketSession, ChannelRelayed, bool>? onChannelEstablished = null)
     {
         _inputStream = inputStream;
         _outputStream = outputStream;
         _onClose = onClose;
         _onHandshakeComplete = onHandshakeComplete;
+        _onChannelEstablished = onChannelEstablished;
         _localKeyPair = localKeyPair;
         _onData = onData;
         _onNewChannel = onNewChannel;
@@ -782,6 +784,7 @@ public class SyncSocketSession : IDisposable
                         channel.HandleTransportRelayed(remoteVersion, connectionId, handshakeMessage);
                         _channels[connectionId] = channel;
                         tcs.SetResult(channel);
+                        _onChannelEstablished?.Invoke(this, channel, false);
                     }
                     else
                         Logger.Error<SyncSocketSession>($"No pending channel for requestId {requestId}");
@@ -1509,9 +1512,8 @@ public class SyncSocketSession : IDisposable
         }
 
         var channel = new ChannelRelayed(this, _localKeyPair, publicKey, false);
-        _onNewChannel?.Invoke(this, channel);
-
         channel.ConnectionId = connectionId;
+        _onNewChannel?.Invoke(this, channel);
         _channels[connectionId] = channel;
 
         _ = Task.Run(async () =>
@@ -1519,6 +1521,7 @@ public class SyncSocketSession : IDisposable
             try
             {
                 await channel.SendResponseTransportAsync(remoteVersion, requestId, channelHandshakeMessage);
+                _onChannelEstablished?.Invoke(this, channel, true);
             }
             catch (Exception e)
             {
