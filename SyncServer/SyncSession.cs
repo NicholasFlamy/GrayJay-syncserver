@@ -243,6 +243,7 @@ public class SyncSession
                 string ipAddress = GetIpAddress();
                 if (!_server.TryRegisterNewKeypair(ipAddress))
                 {
+                    Interlocked.Increment(ref _server.Metrics.TotalKeypairRegistrationRateLimitExceedances);
                     Logger.Error<SyncSession>($"IP {ipAddress} exceeded keypair rate limit");
                     Dispose();
                     return;
@@ -684,7 +685,7 @@ public class SyncSession
         string ipAddress = GetIpAddress();
         if (!_server.IsRelayDataAllowedByIP(ipAddress, data.Length))
         {
-            Interlocked.Increment(ref _server.Metrics.TotalRateLimitExceedances);
+            Interlocked.Increment(ref _server.Metrics.TotalRelayDataByIpRateLimitExceedances);
             Logger.Error<SyncSession>($"IP {ipAddress} exceeded relay data rate limit");
             SendRelayError(connectionId, RelayErrorCode.RateLimitExceeded);
             _server.RemoveRelayedConnection(connectionId);
@@ -693,7 +694,7 @@ public class SyncSession
 
         if (!_server.IsRelayDataAllowedByConnectionId(connectionId, data.Length))
         {
-            Interlocked.Increment(ref _server.Metrics.TotalRateLimitExceedances);
+            Interlocked.Increment(ref _server.Metrics.TotalRelayDataByConnectionIdRateLimitExceedances);
             Logger.Error<SyncSession>($"Received data to relay but exceeded ConnectionId rate limit for connectionId {connectionId}, connection terminated.");
             SendRelayError(connectionId, RelayErrorCode.RateLimitExceeded);
             _server.RemoveRelayedConnection(connectionId);
@@ -1033,16 +1034,34 @@ public class SyncSession
         }
 
         string ipAddress = GetIpAddress();
-        if (!_server.IsRelayRequestAllowedByIP(ipAddress))
+        var (allowedByIp, reasonByIp) = _server.IsRelayRequestAllowedByIP(ipAddress);
+        if (!allowedByIp)
         {
-            Logger.Error<SyncSession>($"IP {ipAddress} exceeded relay request limit");
+            if (reasonByIp == RateLimitReason.TokenRateLimitExceeded)
+            {
+                Interlocked.Increment(ref _server.Metrics.TotalRelayRequestByIpTokenRateLimitExceedances);
+            }
+            else if (reasonByIp == RateLimitReason.ConnectionLimitExceeded)
+            {
+                Interlocked.Increment(ref _server.Metrics.TotalRelayRequestByIpConnectionLimitExceedances);
+            }
+            Logger.Error<SyncSession>($"IP {ipAddress} exceeded relay request limit: {reasonByIp}");
             SendEmptyResponse(ResponseOpcode.TRANSPORT_RELAYED, requestId, (int)TransportResponseCode.RateLimitExceeded);
             return;
         }
 
-        if (!_server.IsRelayRequestAllowedByKey(RemotePublicKey!))
+        var (allowedByKey, reasonByKey) = _server.IsRelayRequestAllowedByKey(RemotePublicKey!);
+        if (!allowedByKey)
         {
-            Logger.Error<SyncSession>($"Remote public key {RemotePublicKey!} exceeded relay request limit");
+            if (reasonByKey == RateLimitReason.TokenRateLimitExceeded)
+            {
+                Interlocked.Increment(ref _server.Metrics.TotalRelayRequestByKeyTokenRateLimitExceedances);
+            }
+            else if (reasonByKey == RateLimitReason.ConnectionLimitExceeded)
+            {
+                Interlocked.Increment(ref _server.Metrics.TotalRelayRequestByKeyConnectionLimitExceedances);
+            }
+            Logger.Error<SyncSession>($"Remote public key {RemotePublicKey!} exceeded relay request limit: {reasonByKey}");
             SendEmptyResponse(ResponseOpcode.TRANSPORT_RELAYED, requestId, (int)TransportResponseCode.RateLimitExceeded);
             return;
         }
@@ -1148,6 +1167,7 @@ public class SyncSession
         string ipAddress = GetIpAddress();
         if (!_server.IsPublishRequestAllowed(ipAddress))
         {
+            Interlocked.Increment(ref _server.Metrics.TotalPublishRequestRateLimitExceedances);
             Logger.Error<SyncSession>($"IP {ipAddress} exceeded publish request rate limit");
             SendEmptyResponse(ResponseOpcode.PUBLISH_RECORD, requestId, (int)PublishRecordResponseCode.RateLimitExceeded); 
             return;

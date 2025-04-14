@@ -34,7 +34,14 @@ public class TcpSyncServerMetrics
     public long TotalRelayedDataBytes;
     public long TotalRelayedErrorBytes;
 
-    public long TotalRateLimitExceedances;
+    public long TotalKeypairRegistrationRateLimitExceedances;
+    public long TotalRelayRequestByIpTokenRateLimitExceedances;
+    public long TotalRelayRequestByIpConnectionLimitExceedances;
+    public long TotalRelayRequestByKeyTokenRateLimitExceedances;
+    public long TotalRelayRequestByKeyConnectionLimitExceedances;
+    public long TotalRelayDataByIpRateLimitExceedances;
+    public long TotalRelayDataByConnectionIdRateLimitExceedances;
+    public long TotalPublishRequestRateLimitExceedances;
 
     public long TotalPublishRecordRequests;
     public long TotalDeleteRecordRequests;
@@ -554,22 +561,45 @@ public class TcpSyncServer : IDisposable
         return bucket.TryConsume(1);
     }
 
-    public bool IsRelayRequestAllowedByIP(string ipAddress)
+    public enum RateLimitReason
+    {
+        Allowed,
+        TokenRateLimitExceeded,
+        ConnectionLimitExceeded
+    }
+
+    public (bool allowed, RateLimitReason reason) IsRelayRequestAllowedByIP(string ipAddress)
     {
         var bucket = _ipTokenBuckets.GetOrAdd(
             $"{ipAddress}:relays",
             _ => new TokenBucket(100, 10)
         );
-        return bucket.TryConsume(1) && GetRelayedConnectionCountByIP(ipAddress) < MaxRelayedConnectionsPerIp;
+        if (!bucket.TryConsume(1))
+        {
+            return (false, RateLimitReason.TokenRateLimitExceeded);
+        }
+        if (GetRelayedConnectionCountByIP(ipAddress) >= MaxRelayedConnectionsPerIp)
+        {
+            return (false, RateLimitReason.ConnectionLimitExceeded);
+        }
+        return (true, RateLimitReason.Allowed);
     }
 
-    public bool IsRelayRequestAllowedByKey(string remotePublicKey)
+    public (bool allowed, RateLimitReason reason) IsRelayRequestAllowedByKey(string remotePublicKey)
     {
         var bucket = _keyTokenBuckets.GetOrAdd(
             $"{remotePublicKey}:relays",
             _ => new TokenBucket(10, 1)
         );
-        return bucket.TryConsume(1) && GetRelayedConnectionCountByKey(remotePublicKey) < MaxRelayedConnectionsPerKey;
+        if (!bucket.TryConsume(1))
+        {
+            return (false, RateLimitReason.TokenRateLimitExceeded);
+        }
+        if (GetRelayedConnectionCountByKey(remotePublicKey) >= MaxRelayedConnectionsPerKey)
+        {
+            return (false, RateLimitReason.ConnectionLimitExceeded);
+        }
+        return (true, RateLimitReason.Allowed);
     }
 
     public bool IsRelayDataAllowedByIP(string ipAddress, int dataSize)
