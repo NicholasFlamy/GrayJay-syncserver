@@ -26,7 +26,8 @@ public enum TransportResponseCode
     RateLimitExceeded = 2, // Rate limit exceeded by IP or key
     PairingCodeDataMismatch = 3,
     ChannelMessageDataLengthMismatch = 4,
-    Blacklisted = 5
+    Blacklisted = 5,
+    DuplicateConnection = 6
 }
 
 public enum PublishRecordResponseCode

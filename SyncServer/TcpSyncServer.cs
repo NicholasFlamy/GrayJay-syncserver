@@ -7,6 +7,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Text.Json.Serialization;
 using static SyncServer.SyncSession;
+using static SyncServer.TcpSyncServer;
 using LogLevel = SyncShared.LogLevel;
 
 namespace SyncServer;
@@ -127,6 +128,7 @@ public class TcpSyncServer : IDisposable
     private readonly ConcurrentDictionary<string, TokenBucket> _ipTokenBuckets = new();
     private readonly ConcurrentDictionary<string, TokenBucket> _keyTokenBuckets = new();
     private readonly ConcurrentDictionary<long, TokenBucket> _connectionTokenBuckets = new();
+    private readonly ConcurrentDictionary<(string, string), long> _activeRelayPairs = new();
     public int MaxRelayedConnectionsPerIp = 100;
     public int MaxRelayedConnectionsPerKey = 10;
     public int MaxKeypairsPerHour = 50;
@@ -159,10 +161,6 @@ public class TcpSyncServer : IDisposable
             Target = target,
             IsActive = isActive
         };
-    }
-    public void RemoveRelayedConnection(long connectionId)
-    {
-        RelayedConnections.TryRemove(connectionId, out _);
     }
 
     public RelayedConnection? GetRelayedConnection(long connectionId)
@@ -618,5 +616,57 @@ public class TcpSyncServer : IDisposable
     private string GetIpAddress(SyncSession session)
     {
         return ((IPEndPoint)session.Socket.RemoteEndPoint!).Address.ToString();
+    }
+
+    private static (string, string) GetOrderedKeyPair(string key1, string key2)
+    {
+        return string.CompareOrdinal(key1, key2) <= 0 ? (key1, key2) : (key2, key1);
+    }
+
+    internal bool TryReserveRelayPair(string initiatorPublicKey, string targetPublicKey, long connectionId, out (string, string) pair)
+    {
+        pair = GetOrderedKeyPair(initiatorPublicKey, targetPublicKey);
+        return _activeRelayPairs.TryAdd(pair, connectionId);
+    }
+
+    internal void RemoveRelayPairByConnectionId(long connectionId)
+    {
+        var pairToRemove = default(KeyValuePair<(string, string), long>);
+        foreach (var pair in _activeRelayPairs)
+        {
+            if (pair.Value == connectionId)
+            {
+                pairToRemove = pair;
+                break;
+            }
+        }
+        if (pairToRemove.Key != default)
+        {
+            _activeRelayPairs.TryRemove(pairToRemove.Key, out _);
+        }
+    }
+
+    internal void RemoveRelayedConnection(long connectionId)
+    {
+        if (RelayedConnections.TryRemove(connectionId, out var connection))
+            RemoveRelayPairByConnectionId(connectionId);
+    }
+
+    internal void RemoveRelayedConnectionsByPublicKey(string publicKey)
+    {
+        if (string.IsNullOrEmpty(publicKey))
+            return;
+
+        var connectionIds = RelayedConnections.Keys.ToList();
+        foreach (var connId in connectionIds)
+        {
+            if (RelayedConnections.TryGetValue(connId, out var conn) &&
+                conn != null &&
+                ((conn.Initiator?.RemotePublicKey == publicKey) ||
+                 (conn.Target?.RemotePublicKey == publicKey)))
+            {
+                RemoveRelayedConnection(connId);
+            }
+        }
     }
 }

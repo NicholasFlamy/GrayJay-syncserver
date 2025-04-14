@@ -83,6 +83,10 @@ public class SyncSession
                 pair.Value.Dispose();
             _syncStreams.Clear();
         }
+        if (RemotePublicKey != null)
+        {
+            _server.RemoveRelayedConnectionsByPublicKey(RemotePublicKey);
+        }
     }
 
     public void HandleData(int bytesReceived)
@@ -535,8 +539,22 @@ public class SyncSession
                 int statusCode = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(0, 4));
                 long connectionId = BinaryPrimitives.ReadInt64LittleEndian(data.Slice(4, 8));
                 int requestId = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(12, 4));
+                var connection = _server.GetRelayedConnection(connectionId);
+                if (connection == null)
+                {
+                    Logger.Error<SyncSession>($"No relayed connection found for connectionId {connectionId}");
+                    _server.RemoveRelayPairByConnectionId(connectionId);
+                    return;
+                }
+
                 if (statusCode == 0)
                 {
+                    if (data.Length < 20)
+                    {
+                        Logger.Error<SyncSession>("ResponseOpcode.TRANSPORT packet too short for message length");
+                        _server.RemoveRelayedConnection(connectionId);
+                        return;
+                    }
                     int messageLength = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(16, 4));
                     if (data.Length != 20 + messageLength)
                     {
@@ -544,51 +562,37 @@ public class SyncSession
                         return;
                     }
 
-                    var responseHandshakeMessage = data.Slice(20, messageLength);
-                    var connection = _server.GetRelayedConnection(connectionId);
-                    if (connection != null)
+                    connection.Target = this;
+                    connection.IsActive = true;
+                    var packetSize = 24 + messageLength;
+                    var packetToInitiator = Utilities.RentBytes(packetSize);
+                    try
                     {
-                        connection.Target = this;
-                        connection.IsActive = true;
-                        var packetSize = 24 + messageLength;
-                        var packetToInitiator = Utilities.RentBytes(packetSize);
-                        try
-                        {
-                            BinaryPrimitives.WriteInt32LittleEndian(packetToInitiator.AsSpan(0, 4), requestId);
-                            BinaryPrimitives.WriteInt32LittleEndian(packetToInitiator.AsSpan(4, 4), statusCode);
-                            BinaryPrimitives.WriteInt32LittleEndian(packetToInitiator.AsSpan(8, 4), RemoteVersion);
-                            BinaryPrimitives.WriteInt64LittleEndian(packetToInitiator.AsSpan(12, 8), connectionId);
-                            BinaryPrimitives.WriteInt32LittleEndian(packetToInitiator.AsSpan(20, 4), messageLength);
-                            responseHandshakeMessage.CopyTo(packetToInitiator.AsSpan(24));
-                            connection.Initiator.Send(Opcode.RESPONSE, (byte)ResponseOpcode.TRANSPORT_RELAYED, packetToInitiator.AsSpan(0, packetSize));
-                            Interlocked.Increment(ref _server.Metrics.TotalRelayedConnectionsEstablished);
-                        }
-                        finally
-                        {
-                            Utilities.ReturnBytes(packetToInitiator);
-                        }
+                        BinaryPrimitives.WriteInt32LittleEndian(packetToInitiator.AsSpan(0, 4), requestId);
+                        BinaryPrimitives.WriteInt32LittleEndian(packetToInitiator.AsSpan(4, 4), statusCode);
+                        BinaryPrimitives.WriteInt32LittleEndian(packetToInitiator.AsSpan(8, 4), RemoteVersion);
+                        BinaryPrimitives.WriteInt64LittleEndian(packetToInitiator.AsSpan(12, 8), connectionId);
+                        BinaryPrimitives.WriteInt32LittleEndian(packetToInitiator.AsSpan(20, 4), messageLength);
+                        data.Slice(20, messageLength).CopyTo(packetToInitiator.AsSpan(24));
+                        connection.Initiator.Send(Opcode.RESPONSE, (byte)ResponseOpcode.TRANSPORT_RELAYED, packetToInitiator.AsSpan(0, packetSize));
+                        Interlocked.Increment(ref _server.Metrics.TotalRelayedConnectionsEstablished);
                     }
-                    else
+                    finally
                     {
-                        Logger.Error<SyncSession>($"No relayed connection found for connectionId {connectionId}");
-                        _server.RemoveRelayedConnection(connectionId);
-                        Interlocked.Increment(ref _server.Metrics.TotalRelayedConnectionsFailed);
+                        Utilities.ReturnBytes(packetToInitiator);
                     }
                 }
                 else
                 {
-                    var connection = _server.GetRelayedConnection(connectionId);
-                    if (connection != null)
+                    Span<byte> packetToInitiator = stackalloc byte[8];
+                    BinaryPrimitives.WriteInt32LittleEndian(packetToInitiator.Slice(0, 4), requestId);
+                    BinaryPrimitives.WriteInt32LittleEndian(packetToInitiator.Slice(4, 4), statusCode);
+                    connection.Initiator.Send(Opcode.RESPONSE, (byte)ResponseOpcode.TRANSPORT_RELAYED, packetToInitiator);
+                    _server.RemoveRelayedConnection(connectionId);
+                    if (statusCode != (int)TransportResponseCode.DuplicateConnection)
                     {
-                        //TODO: Maybe make RequestId -> StatusCode a generic pattern and have a general flow for Request->Response
-                        Span<byte> packetToInitiator = stackalloc byte[8];
-                        BinaryPrimitives.WriteInt32LittleEndian(packetToInitiator.Slice(0, 4), requestId);
-                        BinaryPrimitives.WriteInt32LittleEndian(packetToInitiator.Slice(4, 4), statusCode);
-                        connection.Initiator.Send(Opcode.RESPONSE, (byte)ResponseOpcode.TRANSPORT_RELAYED, packetToInitiator);
-                        _server.RemoveRelayedConnection(connectionId);
-
                         string initiatorPublicKey = connection.Initiator.RemotePublicKey!;
-                        string targetPublicKey = this.RemotePublicKey!;
+                        string targetPublicKey = RemotePublicKey!;
                         _server.AddToBlacklist(initiatorPublicKey, targetPublicKey, TimeSpan.FromMinutes(5));
                         Logger.Info<SyncSession>($"Added relay from {initiatorPublicKey} to {targetPublicKey} to blacklist for 5 minutes due to rejection.");
                     }
@@ -700,12 +704,14 @@ public class SyncSession
         {
             Logger.Error<SyncSession>($"Received data to relay but no relayed connection for connectionId {connectionId}");
             SendRelayError(connectionId, RelayErrorCode.NotFound);
+            _server.RemoveRelayedConnection(connectionId);
             return;
         }
         if (connection.Initiator != this && connection.Target != this)
         {
             Logger.Error<SyncSession>($"Received data to relay but unauthorized access to relayed connection {connectionId} by {this.RemotePublicKey}");
             SendRelayError(connectionId, RelayErrorCode.Unauthorized);
+            _server.RemoveRelayedConnection(connectionId);
             return;
         }
         SyncSession? otherClient = connection.Initiator == this ? connection.Target : connection.Initiator;
@@ -742,12 +748,14 @@ public class SyncSession
         {
             Logger.Error<SyncSession>($"Received error to relay but no active relayed connection for connectionId {connectionId}");
             SendRelayError(connectionId, RelayErrorCode.NotFound);
+            _server.RemoveRelayPairByConnectionId(connectionId);
             return;
         }
         if (connection.Initiator != this && connection.Target != this)
         {
             Logger.Error<SyncSession>($"Received error to relay but unauthorized access to relayed connection {connectionId} by {this.RemotePublicKey}");
             SendRelayError(connectionId, RelayErrorCode.Unauthorized);
+            _server.RemoveRelayPairByConnectionId(connectionId);
             return;
         }
         SyncSession? otherClient = connection.Initiator == this ? connection.Target : connection.Initiator;
@@ -785,12 +793,14 @@ public class SyncSession
         {
             Logger.Error<SyncSession>($"Received relay error but no active relayed connection for connectionId {connectionId}");
             SendRelayError(connectionId, RelayErrorCode.RateLimitExceeded);
+            _server.RemoveRelayPairByConnectionId(connectionId);
             return;
         }
         if (connection.Initiator != this && connection.Target != this)
         {
             Logger.Error<SyncSession>($"Received relay error but it was unauthorized access to relayed connection {connectionId} by {this.RemotePublicKey}");
             SendRelayError(connectionId, RelayErrorCode.Unauthorized);
+            _server.RemoveRelayPairByConnectionId(connectionId);
             return;
         }
 
@@ -1004,6 +1014,9 @@ public class SyncSession
             }
             offset += pairingMessageLength;
         }
+
+        Logger.Verbose<SyncSession>($"Transport request received (from = {RemotePublicKey}, to = {targetPublicKey}).");
+
         int channelMessageLength = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(offset, 4));
         if (data.Length != offset + 4 + channelMessageLength)
         {
@@ -1011,11 +1024,6 @@ public class SyncSession
             SendEmptyResponse(ResponseOpcode.TRANSPORT_RELAYED, requestId, (int)TransportResponseCode.ChannelMessageDataLengthMismatch);
             return;
         }
-
-        byte[] pairingMessage = pairingMessageLength > 0 ? data.Slice(36, pairingMessageLength).ToArray() : Array.Empty<byte>();
-        byte[] channelHandshakeMessage = data.Slice(offset + 4, channelMessageLength).ToArray();
-
-        Logger.Verbose<SyncSession>($"Transport request received (from = {RemotePublicKey}, to = {targetPublicKey}).");
 
         if (_server.IsBlacklisted(RemotePublicKey!, targetPublicKey))
         {
@@ -1048,39 +1056,64 @@ public class SyncSession
         }
 
         long connectionId = _server.GetNextConnectionId();
-        _server.SetRelayedConnection(connectionId, this);
+        if (!_server.TryReserveRelayPair(RemotePublicKey!, targetPublicKey, connectionId, out var pair))
+        {
+            Logger.Info<SyncSession>($"Relay request from {RemotePublicKey} to {targetPublicKey} rejected due to existing connection.");
+            SendEmptyResponse(ResponseOpcode.TRANSPORT_RELAYED, requestId, (int)TransportResponseCode.DuplicateConnection);
+            return;
+        }
 
-        byte[] initiatorPublicKeyBytes = Convert.FromBase64String(RemotePublicKey!);
-
-        var packetSize = 4 + 8 + 4 + 32 + 4 + pairingMessageLength + 4 + channelMessageLength;
-        var packetToTarget = Utilities.RentBytes(packetSize);
+        bool setupFailed = true;
         try
         {
-            int packetOffset = 0;
-            BinaryPrimitives.WriteInt32LittleEndian(packetToTarget.AsSpan(packetOffset, 4), RemoteVersion);
-            packetOffset += 4;
-            BinaryPrimitives.WriteInt64LittleEndian(packetToTarget.AsSpan(packetOffset, 8), connectionId);
-            packetOffset += 8;
-            BinaryPrimitives.WriteInt32LittleEndian(packetToTarget.AsSpan(packetOffset, 4), requestId);
-            packetOffset += 4;
-            initiatorPublicKeyBytes.CopyTo(packetToTarget.AsSpan(packetOffset, 32));
-            packetOffset += 32;
-            BinaryPrimitives.WriteInt32LittleEndian(packetToTarget.AsSpan(packetOffset, 4), pairingMessageLength);
-            packetOffset += 4;
-            if (pairingMessageLength > 0)
-            {
-                pairingMessage.CopyTo(packetToTarget.AsSpan(packetOffset));
-                packetOffset += pairingMessageLength;
-            }
-            BinaryPrimitives.WriteInt32LittleEndian(packetToTarget.AsSpan(packetOffset, 4), channelMessageLength);
-            packetOffset += 4;
-            channelHandshakeMessage.CopyTo(packetToTarget.AsSpan(packetOffset));
+            _server.SetRelayedConnection(connectionId, this);
 
-            targetSession.Send(Opcode.REQUEST, (byte)RequestOpcode.TRANSPORT_RELAYED, packetToTarget.AsSpan(0, packetSize));
+            byte[] initiatorPublicKeyBytes = Convert.FromBase64String(RemotePublicKey!);
+            byte[] pairingMessage = pairingMessageLength > 0 ? data.Slice(36, pairingMessageLength).ToArray() : Array.Empty<byte>();
+            byte[] channelHandshakeMessage = data.Slice(offset + 4, channelMessageLength).ToArray();
+
+            var packetSize = 4 + 8 + 4 + 32 + 4 + pairingMessageLength + 4 + channelMessageLength;
+            var packetToTarget = Utilities.RentBytes(packetSize);
+
+            try
+            {
+                int packetOffset = 0;
+                BinaryPrimitives.WriteInt32LittleEndian(packetToTarget.AsSpan(packetOffset, 4), RemoteVersion);
+                packetOffset += 4;
+                BinaryPrimitives.WriteInt64LittleEndian(packetToTarget.AsSpan(packetOffset, 8), connectionId);
+                packetOffset += 8;
+                BinaryPrimitives.WriteInt32LittleEndian(packetToTarget.AsSpan(packetOffset, 4), requestId);
+                packetOffset += 4;
+                initiatorPublicKeyBytes.CopyTo(packetToTarget.AsSpan(packetOffset, 32));
+                packetOffset += 32;
+                BinaryPrimitives.WriteInt32LittleEndian(packetToTarget.AsSpan(packetOffset, 4), pairingMessageLength);
+                packetOffset += 4;
+                if (pairingMessageLength > 0)
+                {
+                    pairingMessage.CopyTo(packetToTarget.AsSpan(packetOffset));
+                    packetOffset += pairingMessageLength;
+                }
+                BinaryPrimitives.WriteInt32LittleEndian(packetToTarget.AsSpan(packetOffset, 4), channelMessageLength);
+                packetOffset += 4;
+                channelHandshakeMessage.CopyTo(packetToTarget.AsSpan(packetOffset));
+
+                targetSession.Send(Opcode.REQUEST, (byte)RequestOpcode.TRANSPORT_RELAYED, packetToTarget.AsSpan(0, packetSize));
+                setupFailed = false;
+            }
+            finally
+            {
+                Utilities.ReturnBytes(packetToTarget);
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.Error<SyncSession>($"Failed to setup relay connection {connectionId}: {ex.Message}");
+            throw;
         }
         finally
         {
-            Utilities.ReturnBytes(packetToTarget);
+            if (setupFailed)
+                _server.RemoveRelayedConnection(connectionId);
         }
     }
 
