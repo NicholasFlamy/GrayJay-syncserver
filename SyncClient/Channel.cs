@@ -14,6 +14,7 @@ public interface IChannel : IDisposable
     public void SetDataHandler(Action<SyncSocketSession, IChannel, Opcode, byte, ReadOnlySpan<byte>>? onData);
     public Task SendAsync(Opcode opcode, byte subOpcode, byte[]? data = null, int offset = 0, int count = -1, CancellationToken cancellationToken = default);
     public void SetCloseHandler(Action<IChannel>? onClose);
+    public LinkType LinkType { get; }
 }
 
 public class ChannelSocket : IChannel
@@ -23,7 +24,8 @@ public class ChannelSocket : IChannel
     private readonly SyncSocketSession _session;
     private Action<SyncSocketSession, IChannel, Opcode, byte, ReadOnlySpan<byte>>? _onData;
     private Action<IChannel>? _onClose;
-    
+    public LinkType LinkType => LinkType.Direct;
+
     public IAuthorizable? Authorizable
     {
         get => _session.Authorizable;
@@ -78,6 +80,7 @@ public class ChannelRelayed : IChannel
     public string? RemotePublicKey { get; private set; }
     public int? RemoteVersion { get; private set; }
     public object? SyncSession { get; set; }
+    public LinkType LinkType => LinkType.Relayed;
 
     private readonly KeyPair _localKeyPair;
     private readonly SyncSocketSession _session;
