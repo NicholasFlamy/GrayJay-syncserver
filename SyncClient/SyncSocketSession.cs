@@ -20,7 +20,7 @@ public record ConnectionInfo(
     bool AllowLocalDirect,
     bool AllowRemoteDirect,
     bool AllowRemoteHolePunched,
-    bool AllowRemoteProxied
+    bool AllowRemoteRelayed
 );
 
 //TODO: Cancellation token source and cancel on dispose
@@ -38,7 +38,7 @@ public class SyncSocketSession : IDisposable
     private readonly Action<SyncSocketSession>? _onHandshakeComplete;
     private readonly Action<SyncSocketSession, ChannelRelayed>? _onNewChannel;
     private readonly Action<SyncSocketSession, ChannelRelayed, bool>? _onChannelEstablished;
-    private readonly Func<SyncSocketSession, string, string?, bool>? _isHandshakeAllowed;
+    private readonly Func<LinkType, SyncSocketSession, string, string?, bool>? _isHandshakeAllowed;
 
     private int _streamIdGenerator = 0;
     private Transport? _transport = null;
@@ -65,7 +65,7 @@ public class SyncSocketSession : IDisposable
 
     public SyncSocketSession(string remoteAddress, KeyPair localKeyPair, Stream inputStream, Stream outputStream,
         Action<SyncSocketSession>? onClose = null, Action<SyncSocketSession>? onHandshakeComplete = null,
-        Action<SyncSocketSession, Opcode, byte, ReadOnlySpan<byte>>? onData = null, Action<SyncSocketSession, ChannelRelayed>? onNewChannel = null, Func<SyncSocketSession, string, string?, bool>? isHandshakeAllowed = null, Action<SyncSocketSession, ChannelRelayed, bool>? onChannelEstablished = null)
+        Action<SyncSocketSession, Opcode, byte, ReadOnlySpan<byte>>? onData = null, Action<SyncSocketSession, ChannelRelayed>? onNewChannel = null, Func<LinkType, SyncSocketSession, string, string?, bool>? isHandshakeAllowed = null, Action<SyncSocketSession, ChannelRelayed, bool>? onChannelEstablished = null)
     {
         _inputStream = inputStream;
         _outputStream = outputStream;
@@ -275,7 +275,7 @@ public class SyncSocketSession : IDisposable
             var (bytesWritten, _, transport) = handshakeState.WriteMessage(null, message.AsSpan(4));
             var remotePublicKey = Convert.ToBase64String(handshakeState.RemoteStaticPublicKey);
 
-            var isAllowedToConnect = remotePublicKey != _localPublicKey && (_isHandshakeAllowed?.Invoke(this, remotePublicKey, receivedPairingCode) ?? true);
+            var isAllowedToConnect = remotePublicKey != _localPublicKey && (_isHandshakeAllowed?.Invoke(LinkType.Direct, this, remotePublicKey, receivedPairingCode) ?? true);
             if (!isAllowedToConnect)
             {
                 Logger.Info<SyncSocketSession>($"HandshakeAsResponder: Handshake is not allowed. Closing connection.");
@@ -619,7 +619,7 @@ public class SyncSocketSession : IDisposable
         return tcs.Task;
     }
 
-    public async Task PublishConnectionInformationAsync(string[] authorizedKeys, int port, bool allowLocalDirect, bool allowRemoteDirect, bool allowRemoteHolePunched, bool allowRemoteProxied, CancellationToken cancellationToken = default)
+    public async Task PublishConnectionInformationAsync(string[] authorizedKeys, int port, bool allowLocalDirect, bool allowRemoteDirect, bool allowRemoteHolePunched, bool allowRemoteRelayed, CancellationToken cancellationToken = default)
     {
         const int MAX_AUTHORIZED_KEYS = 255;
         if (authorizedKeys.Length > MAX_AUTHORIZED_KEYS)
@@ -665,7 +665,7 @@ public class SyncSocketSession : IDisposable
             writer.Write((byte)(allowLocalDirect ? 1 : 0));
             writer.Write((byte)(allowRemoteDirect ? 1 : 0));
             writer.Write((byte)(allowRemoteHolePunched ? 1 : 0));
-            writer.Write((byte)(allowRemoteProxied ? 1 : 0));
+            writer.Write((byte)(allowRemoteRelayed ? 1 : 0));
         }
 
         // Precalculate total size
@@ -1490,7 +1490,7 @@ public class SyncSocketSession : IDisposable
             pairingCode = Encoding.UTF8.GetString(plaintextBuffer, 0, Array.IndexOf(plaintextBuffer, (byte)0, 0, Math.Min(32, plaintextBuffer.Length)));
         }
 
-        var isAllowedToConnect = publicKey != _localPublicKey && (_isHandshakeAllowed?.Invoke(this, publicKey, pairingCode) ?? true);
+        var isAllowedToConnect = publicKey != _localPublicKey && (_isHandshakeAllowed?.Invoke(LinkType.Relayed, this, publicKey, pairingCode) ?? true);
         if (!isAllowedToConnect)
         {
             var rp = new byte[16];
@@ -1596,7 +1596,7 @@ public class SyncSocketSession : IDisposable
         infoSpan = infoSpan.Slice(1);
         bool allowRemoteHolePunched = infoSpan[0] != 0;
         infoSpan = infoSpan.Slice(1);
-        bool allowRemoteProxied = infoSpan[0] != 0;
+        bool allowRemoteRelayed = infoSpan[0] != 0;
 
         return new ConnectionInfo(
             port,
@@ -1607,7 +1607,7 @@ public class SyncSocketSession : IDisposable
             allowLocalDirect,
             allowRemoteDirect,
             allowRemoteHolePunched,
-            allowRemoteProxied
+            allowRemoteRelayed
         );
     }
 

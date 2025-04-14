@@ -80,7 +80,7 @@ Clients publish connection information to the server, which other authorized cli
 
 - **Client:**
   - Collects connection details (port, IP addresses, etc.).
-  - Serializes into a byte array: `[Port (2 bytes)] [NameLength (1 byte)] [Name (variable)] [IPv4Count (1 byte)] [IPv4Addresses (4 bytes each)] [IPv6Count (1 byte)] [IPv6Addresses (16 bytes each)] [AllowLocal (1 byte)] [AllowRemoteDirect (1 byte)] [AllowRemoteHolePunched (1 byte)] [AllowRemoteProxied (1 byte)]`.
+  - Serializes into a byte array: `[Port (2 bytes)] [NameLength (1 byte)] [Name (variable)] [IPv4Count (1 byte)] [IPv4Addresses (4 bytes each)] [IPv6Count (1 byte)] [IPv6Addresses (16 bytes each)] [AllowLocal (1 byte)] [AllowRemoteDirect (1 byte)] [AllowRemoteHolePunched (1 byte)] [AllowRemoteRelayed (1 byte)]`.
   - For each authorized public key:
     - Performs a Noise N handshake (one-way authentication) using the authorized key as the remote static key.
     - Encrypts the serialized data with the derived transport.
