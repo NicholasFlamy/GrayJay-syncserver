@@ -1,5 +1,6 @@
 ﻿using Noise;
 using SyncClient;
+using SyncServerTests;
 using SyncShared;
 using System.IO.Pipes;
 
@@ -30,20 +31,21 @@ public class SyncSocketTests
         KeyPair initiatorKeyPair, KeyPair responderKeyPair,
         Action<SyncSocketSession> onInitiatorHandshakeComplete,
         Action<SyncSocketSession> onResponderHandshakeComplete,
-        Func<SyncSocketSession, string, string?, bool>? isHandshakeAllowed = null,
+        Action<SyncSocketSession>? onClose = null,
+        Func<LinkType, SyncSocketSession, string, string?, uint, bool>? isHandshakeAllowed = null,
         Action<SyncSocketSession, Opcode, byte, ReadOnlySpan<byte>>? onDataA = null,
         Action<SyncSocketSession, Opcode, byte, ReadOnlySpan<byte>>? onDataB = null)
     {
         var initiatorSession = new SyncSocketSession(
             "", initiatorKeyPair, initiatorInput, initiatorOutput,
-            onClose: (session) => { },
+            onClose: (session) => onClose?.Invoke(session),
             onHandshakeComplete: onInitiatorHandshakeComplete,
             onData: onDataA,
             isHandshakeAllowed: isHandshakeAllowed);
 
         var responderSession = new SyncSocketSession(
             "", responderKeyPair, responderInput, responderOutput,
-            onClose: (session) => { },
+            onClose: (session) => onClose?.Invoke(session),
             onHandshakeComplete: onResponderHandshakeComplete,
             onData: onDataB,
             isHandshakeAllowed: isHandshakeAllowed);
@@ -69,9 +71,9 @@ public class SyncSocketTests
             initiatorKeyPair, responderKeyPair,
             (session) => handshakeInitiatorCompleted.Set(),
             (session) => handshakeResponderCompleted.Set(),
-            (session, publicKey, pairingCode) => pairingCode == validPairingCode);
+            isHandshakeAllowed: (linkType, session, publicKey, pairingCode, appId) => pairingCode == validPairingCode);
 
-        _ = initiatorSession.StartAsInitiatorAsync(responderSession.LocalPublicKey, validPairingCode);
+        _ = initiatorSession.StartAsInitiatorAsync(responderSession.LocalPublicKey, pairingCode: validPairingCode);
         _ = responderSession.StartAsResponderAsync();
 
         Assert.IsTrue(handshakeInitiatorCompleted.Wait(10000), "Initiator handshake did not complete within 10 seconds.");
@@ -95,9 +97,9 @@ public class SyncSocketTests
             initiatorKeyPair, responderKeyPair,
             (session) => handshakeInitiatorCompleted.Set(),
             (session) => handshakeResponderCompleted.Set(),
-            (session, publicKey, pairingCode) => pairingCode == validPairingCode);
+            isHandshakeAllowed: (linkType, session, publicKey, pairingCode, appId) => pairingCode == validPairingCode);
 
-        _ = initiatorSession.StartAsInitiatorAsync(responderSession.LocalPublicKey, invalidPairingCode);
+        _ = initiatorSession.StartAsInitiatorAsync(responderSession.LocalPublicKey, pairingCode: invalidPairingCode);
         _ = responderSession.StartAsResponderAsync();
 
         await Task.Delay(1000); // Allow time for handshake to fail
@@ -122,7 +124,7 @@ public class SyncSocketTests
             initiatorKeyPair, responderKeyPair,
             (session) => handshakeInitiatorCompleted.Set(),
             (session) => handshakeResponderCompleted.Set(),
-            (session, publicKey, pairingCode) => pairingCode == validPairingCode);
+            isHandshakeAllowed: (linkType, session, publicKey, pairingCode, appId) => pairingCode == validPairingCode);
 
         _ = initiatorSession.StartAsInitiatorAsync(responderSession.LocalPublicKey); // No pairing code
         _ = responderSession.StartAsResponderAsync();
@@ -149,9 +151,9 @@ public class SyncSocketTests
             initiatorKeyPair, responderKeyPair,
             (session) => handshakeInitiatorCompleted.Set(),
             (session) => handshakeResponderCompleted.Set(),
-            (session, publicKey, pairingCode) => true); // Always allow
+            isHandshakeAllowed: (linkType, session, publicKey, pairingCode, appId) => true); // Always allow
 
-        _ = initiatorSession.StartAsInitiatorAsync(responderSession.LocalPublicKey, pairingCode);
+        _ = initiatorSession.StartAsInitiatorAsync(responderSession.LocalPublicKey, pairingCode: pairingCode);
         _ = responderSession.StartAsResponderAsync();
 
         Assert.IsTrue(handshakeInitiatorCompleted.Wait(10000), "Initiator handshake did not complete within 10 seconds.");
@@ -369,6 +371,94 @@ public class SyncSocketTests
         await Task.Delay(1000); // Allow time for processing
 
         Assert.IsFalse(dataReceived.IsSet, "Data should not be received when responder is unauthorized.");
+    }
+
+    [TestMethod]
+    public async Task DirectHandshake_WithValidAppId_Succeeds()
+    {
+        // Arrange: Set up pipe streams and key pairs
+        var (initiatorInput, initiatorOutput, responderInput, responderOutput) = CreatePipeStreams();
+        var initiatorKeyPair = KeyPair.Generate();
+        var responderKeyPair = KeyPair.Generate();
+        const uint allowedAppId = 1234;
+
+        var handshakeInitiatorCompleted = new TaskCompletionSource<bool>();
+        var handshakeResponderCompleted = new TaskCompletionSource<bool>();
+
+        // Responder requires a specific appId
+        var responderIsHandshakeAllowed = (LinkType linkType, SyncSocketSession session, string publicKey, string? pairingCode, uint appId) =>
+            linkType == LinkType.Direct && appId == allowedAppId;
+
+        var (initiatorSession, responderSession) = CreateSessions(
+            initiatorInput, initiatorOutput, responderInput, responderOutput,
+            initiatorKeyPair, responderKeyPair,
+            (session) => handshakeInitiatorCompleted.SetResult(true),
+            (session) => handshakeResponderCompleted.SetResult(true),
+            isHandshakeAllowed: responderIsHandshakeAllowed);
+
+        // Act: Start handshake with valid appId
+        _ = initiatorSession.StartAsInitiatorAsync(responderSession.LocalPublicKey, appId: allowedAppId);
+        _ = responderSession.StartAsResponderAsync();
+
+        // Assert: Handshake completes successfully
+        await Task.WhenAll(handshakeInitiatorCompleted.Task, handshakeResponderCompleted.Task)
+            .WithTimeout(5000, "Handshake timed out");
+
+        Assert.IsNotNull(initiatorSession.RemotePublicKey, "Initiator should have completed handshake");
+        Assert.IsNotNull(responderSession.RemotePublicKey, "Responder should have completed handshake");
+
+        // Clean up
+        initiatorSession.Dispose();
+        responderSession.Dispose();
+    }
+
+    [TestMethod]
+    public async Task DirectHandshake_WithInvalidAppId_Fails()
+    {
+        // Arrange: Set up pipe streams and key pairs
+        var (initiatorInput, initiatorOutput, responderInput, responderOutput) = CreatePipeStreams();
+        var initiatorKeyPair = KeyPair.Generate();
+        var responderKeyPair = KeyPair.Generate();
+        const uint allowedAppId = 1234;
+        const uint invalidAppId = 5678;
+
+        var handshakeInitiatorCompleted = new TaskCompletionSource<bool>();
+        var handshakeResponderCompleted = new TaskCompletionSource<bool>();
+        var initiatorClosed = new TaskCompletionSource<bool>();
+        var responderClosed = new TaskCompletionSource<bool>();
+
+        // Responder requires a specific appId
+        var responderIsHandshakeAllowed = (LinkType linkType, SyncSocketSession session, string publicKey, string? pairingCode, uint appId) =>
+            linkType == LinkType.Direct && appId == allowedAppId;
+
+        SyncSocketSession? initiatorSession = null;
+        SyncSocketSession? responderSession = null;
+        (initiatorSession, responderSession) = CreateSessions(
+            initiatorInput, initiatorOutput, responderInput, responderOutput,
+            initiatorKeyPair, responderKeyPair,
+            (session) => handshakeInitiatorCompleted.SetResult(true),
+            (session) => handshakeResponderCompleted.SetResult(true),
+            isHandshakeAllowed: responderIsHandshakeAllowed,
+            onClose: (session) =>
+            {
+                if (session == initiatorSession) initiatorClosed.TrySetResult(true);
+                else if (session == responderSession) responderClosed.TrySetResult(true);
+            });
+
+        // Act: Start handshake with invalid appId
+        _ = initiatorSession.StartAsInitiatorAsync(responderSession.LocalPublicKey, appId: invalidAppId);
+        _ = responderSession.StartAsResponderAsync();
+
+        // Assert: Sessions close due to handshake failure
+        await Task.WhenAll(initiatorClosed.Task, responderClosed.Task)
+            .WithTimeout(5000, "Session close timed out");
+
+        Assert.IsFalse(handshakeInitiatorCompleted.Task.IsCompleted, "Initiator handshake should not complete with invalid appId");
+        Assert.IsFalse(handshakeResponderCompleted.Task.IsCompleted, "Responder handshake should not complete with invalid appId");
+
+        // Clean up (sessions should already be disposed, but ensure resources are released)
+        initiatorSession.Dispose();
+        responderSession.Dispose();
     }
 
     #endregion

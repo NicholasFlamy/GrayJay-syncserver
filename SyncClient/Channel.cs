@@ -278,7 +278,7 @@ public class ChannelRelayed : IChannel
         }
     }
 
-    public async Task SendRequestTransportAsync(int requestId, string publicKey, string? pairingCode = null, CancellationToken cancellationToken = default)
+    public async Task SendRequestTransportAsync(int requestId, string publicKey, uint appId, string? pairingCode = null, CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
 
@@ -315,11 +315,13 @@ public class ChannelRelayed : IChannel
                 pairingMessage = Array.Empty<byte>();
             }
 
-            var packetSize = 4 + 32 + 4 + pairingMessageLength + 4 + channelBytesWritten;
+            var packetSize = 4 + 32 + 4 + 4 + pairingMessageLength + 4 + channelBytesWritten;
             var packet = new byte[packetSize];
 
             int offset = 0;
             BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(offset, 4), requestId);
+            offset += 4;
+            BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(offset, 4), appId);
             offset += 4;
             publicKeyBytes.CopyTo(packet.AsSpan(offset, 32));
             offset += 32;

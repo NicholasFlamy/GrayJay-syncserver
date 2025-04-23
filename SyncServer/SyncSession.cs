@@ -194,9 +194,12 @@ public class SyncSession
                 Interlocked.Increment(ref _server.Metrics.TotalHandshakeAttempts);
 
                 int offset = 0;
+
+                uint appId = BinaryPrimitives.ReadUInt32LittleEndian(data.Slice(offset, 4));
+                offset += 4;
                 int pairingMessageLength = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(offset, 4));
                 if (pairingMessageLength > 128)
-                    throw new InvalidDataException($"Received pairing message length ({pairingMessageLength}) exceeds maximum allowed size (128).");
+                    throw new InvalidDataException($"Received pairing message length ({pairingMessageLength}) exceeds maximum allowed size (128) (app id: {appId}).");
 
                 offset += 4;
 
@@ -204,7 +207,7 @@ public class SyncSession
                 if (pairingMessageLength > 0)
                 {
                     if (data.Length < offset + pairingMessageLength)
-                        throw new InvalidDataException("Message too short for specified pairing message length.");
+                        throw new InvalidDataException($"Message too short for specified pairing message length (app id: {appId}).");
                     var pairingProtocol = new Protocol(HandshakePattern.N, CipherFunction.ChaChaPoly, HashFunction.Blake2b);
                     using var pairingHandshakeState = pairingProtocol.Create(false, s: _server.LocalKeyPair.PrivateKey);
                     var pairingMessage = data.Slice(offset, pairingMessageLength);
@@ -212,7 +215,7 @@ public class SyncSession
                     var pairingPlaintext = new byte[512];
                     var (_, _, _) = pairingHandshakeState.ReadMessage(pairingMessage, pairingPlaintext);
                     receivedPairingCode = Encoding.UTF8.GetString(pairingPlaintext, 0, Array.IndexOf(pairingPlaintext, (byte)0, 0, Math.Min(32, pairingPlaintext.Length)));
-                    Logger.Info<SyncSession>($"HandshakeAsResponder: Received pairing code '{receivedPairingCode}' from client");
+                    Logger.Info<SyncSession>($"HandshakeAsResponder: Received pairing code '{receivedPairingCode}' from client (app id: {appId})");
                 }
 
                 if (data.Length < offset)
@@ -220,7 +223,7 @@ public class SyncSession
                 var channelMessage = data.Slice(offset);
                 var (_, _, _) = HandshakeState.ReadMessage(channelMessage, _decryptionBuffer);
                 var (bytesWritten, _, transport) = HandshakeState.WriteMessage(null, _decryptionBuffer);
-                Logger.Info<SyncSession>($"HandshakeAsResponder: Read channel message size {channelMessage.Length}");
+                Logger.Info<SyncSession>($"HandshakeAsResponder: Read channel message size {channelMessage.Length} (app id: {appId})");
 
                 BinaryPrimitives.WriteInt32LittleEndian(_sessionBuffer, bytesWritten);
                 _decryptionBuffer.AsSpan(0, bytesWritten).CopyTo(_sessionBuffer.AsSpan(4));
@@ -230,11 +233,11 @@ public class SyncSession
                     Send(_sessionBuffer, 0, bytesWritten + 4);
                 }
 
-                Logger.Info<SyncSession>($"HandshakeAsResponder: Wrote response message size {bytesWritten}");
+                Logger.Info<SyncSession>($"HandshakeAsResponder: Wrote response message size {bytesWritten} (app id: {appId})");
 
                 _transport = transport;
                 RemotePublicKey = Convert.ToBase64String(HandshakeState.RemoteStaticPublicKey);
-                Logger.Info<SyncSession>($"HandshakeAsResponder: Remote public key {RemotePublicKey}");
+                Logger.Info<SyncSession>($"HandshakeAsResponder: Remote public key {RemotePublicKey} (app id: {appId})");
 
                 PrimaryState = SessionPrimaryState.DataTransfer;
                 _onHandshakeComplete?.Invoke(this);
@@ -244,13 +247,13 @@ public class SyncSession
                 if (!_server.TryRegisterNewKeypair(ipAddress))
                 {
                     Interlocked.Increment(ref _server.Metrics.TotalKeypairRegistrationRateLimitExceedances);
-                    Logger.Error<SyncSession>($"IP {ipAddress} exceeded keypair rate limit");
+                    Logger.Error<SyncSession>($"IP {ipAddress} exceeded keypair rate limit (app id: {appId})");
                     Dispose();
                     return;
                 }
 
                 if (receivedPairingCode != null)
-                    Logger.Info<SyncSession>($"Accepted pairing code '{receivedPairingCode}' from {RemotePublicKey}");
+                    Logger.Info<SyncSession>($"Accepted pairing code '{receivedPairingCode}' from {RemotePublicKey} (app id: {appId})");
             }
             else
             {
@@ -1001,34 +1004,40 @@ public class SyncSession
             return;
         }
 
-        string targetPublicKey = Convert.ToBase64String(data.Slice(0, 32));
-        int pairingMessageLength = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(32, 4));
-        int offset = 36;
+        int offset = 0;
+        uint appId = BinaryPrimitives.ReadUInt32LittleEndian(data.Slice(offset, 4));
+        offset += 4;
+
+        string targetPublicKey = Convert.ToBase64String(data.Slice(offset, 32));
+        offset += 32;
+
+        int pairingMessageLength = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(offset, 4));
+        offset += 4;
 
         if (pairingMessageLength > 0)
         {
             if (data.Length < offset + pairingMessageLength + 4)
             {
-                Logger.Error<SyncSession>("REQUEST_TRANSPORT packet too short for pairing message");
+                Logger.Error<SyncSession>($"REQUEST_TRANSPORT packet too short for pairing message (app id: {appId})");
                 SendEmptyResponse(ResponseOpcode.TRANSPORT_RELAYED, requestId, (int)TransportResponseCode.PairingCodeDataMismatch);
                 return;
             }
             offset += pairingMessageLength;
         }
 
-        Logger.Verbose<SyncSession>($"Transport request received (from = {RemotePublicKey}, to = {targetPublicKey}).");
+        Logger.Verbose<SyncSession>($"Transport request received (from = {RemotePublicKey}, to = {targetPublicKey}) (app id: {appId}).");
 
         int channelMessageLength = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(offset, 4));
         if (data.Length != offset + 4 + channelMessageLength)
         {
-            Logger.Error<SyncSession>($"Invalid REQUEST_TRANSPORT packet size. Expected {offset + 4 + channelMessageLength}, got {data.Length}");
+            Logger.Error<SyncSession>($"Invalid REQUEST_TRANSPORT packet size. Expected {offset + 4 + channelMessageLength}, got {data.Length} (app id: {appId})");
             SendEmptyResponse(ResponseOpcode.TRANSPORT_RELAYED, requestId, (int)TransportResponseCode.ChannelMessageDataLengthMismatch);
             return;
         }
 
         if (_server.IsBlacklisted(RemotePublicKey!, targetPublicKey))
         {
-            Logger.Info<SyncSession>($"Relay request from {RemotePublicKey} to {targetPublicKey} rejected due to blacklist.");
+            Logger.Info<SyncSession>($"Relay request from {RemotePublicKey} to {targetPublicKey} rejected due to blacklist (app id: {appId}).");
             SendEmptyResponse(ResponseOpcode.TRANSPORT_RELAYED, requestId, (int)TransportResponseCode.Blacklisted);
             return;
         }
@@ -1045,7 +1054,7 @@ public class SyncSession
             {
                 Interlocked.Increment(ref _server.Metrics.TotalRelayRequestByIpConnectionLimitExceedances);
             }
-            Logger.Error<SyncSession>($"IP {ipAddress} exceeded relay request limit: {reasonByIp}");
+            Logger.Error<SyncSession>($"IP {ipAddress} exceeded relay request limit: {reasonByIp} (app id: {appId})");
             SendEmptyResponse(ResponseOpcode.TRANSPORT_RELAYED, requestId, (int)TransportResponseCode.RateLimitExceeded);
             return;
         }
@@ -1061,7 +1070,7 @@ public class SyncSession
             {
                 Interlocked.Increment(ref _server.Metrics.TotalRelayRequestByKeyConnectionLimitExceedances);
             }
-            Logger.Error<SyncSession>($"Remote public key {RemotePublicKey!} exceeded relay request limit: {reasonByKey}");
+            Logger.Error<SyncSession>($"Remote public key {RemotePublicKey!} exceeded relay request limit: {reasonByKey} (app id: {appId})");
             SendEmptyResponse(ResponseOpcode.TRANSPORT_RELAYED, requestId, (int)TransportResponseCode.RateLimitExceeded);
             return;
         }
@@ -1069,7 +1078,7 @@ public class SyncSession
         var targetSession = _server.GetSession(targetPublicKey);
         if (targetSession == null)
         {
-            Logger.Info<SyncSession>($"Target {targetPublicKey} not found for relay request.");
+            Logger.Info<SyncSession>($"Target {targetPublicKey} not found for relay request (app id: {appId}).");
             SendEmptyResponse(ResponseOpcode.TRANSPORT_RELAYED, requestId, (int)TransportResponseCode.GeneralError);
             return;
         }
@@ -1077,7 +1086,7 @@ public class SyncSession
         long connectionId = _server.GetNextConnectionId();
         if (!_server.TryReserveRelayPair(RemotePublicKey!, targetPublicKey, connectionId, out var pair))
         {
-            Logger.Info<SyncSession>($"Relay request from {RemotePublicKey} to {targetPublicKey} rejected due to existing connection.");
+            Logger.Info<SyncSession>($"Relay request from {RemotePublicKey} to {targetPublicKey} rejected due to existing connection (app id: {appId}).");
             SendEmptyResponse(ResponseOpcode.TRANSPORT_RELAYED, requestId, (int)TransportResponseCode.DuplicateConnection);
             return;
         }
@@ -1088,10 +1097,10 @@ public class SyncSession
             _server.SetRelayedConnection(connectionId, this);
 
             byte[] initiatorPublicKeyBytes = Convert.FromBase64String(RemotePublicKey!);
-            byte[] pairingMessage = pairingMessageLength > 0 ? data.Slice(36, pairingMessageLength).ToArray() : Array.Empty<byte>();
+            byte[] pairingMessage = pairingMessageLength > 0 ? data.Slice(40, pairingMessageLength).ToArray() : Array.Empty<byte>();
             byte[] channelHandshakeMessage = data.Slice(offset + 4, channelMessageLength).ToArray();
 
-            var packetSize = 4 + 8 + 4 + 32 + 4 + pairingMessageLength + 4 + channelMessageLength;
+            var packetSize = 4 + 8 + 4 + 4 + 32 + 4 + pairingMessageLength + 4 + channelMessageLength;
             var packetToTarget = Utilities.RentBytes(packetSize);
 
             try
@@ -1102,6 +1111,8 @@ public class SyncSession
                 BinaryPrimitives.WriteInt64LittleEndian(packetToTarget.AsSpan(packetOffset, 8), connectionId);
                 packetOffset += 8;
                 BinaryPrimitives.WriteInt32LittleEndian(packetToTarget.AsSpan(packetOffset, 4), requestId);
+                packetOffset += 4;
+                BinaryPrimitives.WriteUInt32LittleEndian(packetToTarget.AsSpan(packetOffset, 4), appId);
                 packetOffset += 4;
                 initiatorPublicKeyBytes.CopyTo(packetToTarget.AsSpan(packetOffset, 32));
                 packetOffset += 32;
@@ -1126,7 +1137,7 @@ public class SyncSession
         }
         catch (Exception ex)
         {
-            Logger.Error<SyncSession>($"Failed to setup relay connection {connectionId}: {ex.Message}");
+            Logger.Error<SyncSession>($"Failed to setup relay connection {connectionId}: {ex.Message} (app id: {appId})");
             throw;
         }
         finally

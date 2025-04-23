@@ -32,7 +32,8 @@ namespace SyncServerTests
             Action<SyncSocketSession>? onHandshakeComplete = null,
             Action<SyncSocketSession, Opcode, byte, ReadOnlySpan<byte>>? onData = null,
             Action<SyncSocketSession, ChannelRelayed>? onNewChannel = null,
-            Func<SyncSocketSession, string, string?, bool>? isHandshakeAllowed = null)
+            Func<LinkType, SyncSocketSession, string, string?, uint, bool>? isHandshakeAllowed = null,
+            uint appId = 0)
         {
             var keyPair = KeyPair.Generate();
             var tcpClient = new TcpClient();
@@ -51,10 +52,10 @@ namespace SyncServerTests
                 },
                 onData: onData ?? ((s, o, so, d) => { }),
                 onNewChannel: onNewChannel ?? ((s, c) => { }),
-                isHandshakeAllowed: (s, pk, pw) => isHandshakeAllowed != null ? isHandshakeAllowed(s, pk, pw) : true
+                isHandshakeAllowed: (linkType, s, pk, pw, appId) => isHandshakeAllowed != null ? isHandshakeAllowed(linkType, s, pk, pw, appId) : true
             );
             socketSession.Authorizable = AlwaysAuthorized.Instance;
-            _ = socketSession.StartAsInitiatorAsync(serverPublicKey);
+            _ = socketSession.StartAsInitiatorAsync(serverPublicKey, appId);
             await tcs.Task.WithTimeout(500000, "Handshake timed out");
             return socketSession;
         }
@@ -1073,7 +1074,7 @@ namespace SyncServerTests
                     port,
                     serverPublicKey,
                     onNewChannel: (s, c) => tcsB.SetResult(c),
-                    isHandshakeAllowed: (s, pk, code) => code == validPairingCode
+                    isHandshakeAllowed: (linkType, s, pk, code, appId) => code == validPairingCode
                 );
 
                 using var clientA = await CreateClientAsync(
@@ -1083,7 +1084,7 @@ namespace SyncServerTests
                 );
 
                 // Start relayed channel with the correct pairing code
-                var channelTask = clientA.StartRelayedChannelAsync(clientB.LocalPublicKey, validPairingCode);
+                var channelTask = clientA.StartRelayedChannelAsync(clientB.LocalPublicKey, pairingCode: validPairingCode);
                 var channelA = await tcsA.Task.WithTimeout(5000, "Channel A creation timed out");
                 channelA.Authorizable = AlwaysAuthorized.Instance;
                 var channelB = await tcsB.Task.WithTimeout(5000, "Channel B creation timed out");
@@ -1115,14 +1116,14 @@ namespace SyncServerTests
                     port,
                     serverPublicKey,
                     onNewChannel: (s, c) => tcsB.SetResult(c),
-                    isHandshakeAllowed: (s, pk, code) => code == validPairingCode
+                    isHandshakeAllowed: (linkType, s, pk, code, appId) => code == validPairingCode
                 );
 
                 using var clientA = await CreateClientAsync(port, serverPublicKey);
 
                 // Attempt to start relayed channel with an incorrect pairing code
                 await Assert.ThrowsExceptionAsync<Exception>(
-                    async () => await clientA.StartRelayedChannelAsync(clientB.LocalPublicKey, invalidPairingCode),
+                    async () => await clientA.StartRelayedChannelAsync(clientB.LocalPublicKey, pairingCode: invalidPairingCode),
                     "Starting relayed channel with invalid pairing code should fail"
                 );
 
@@ -1147,7 +1148,7 @@ namespace SyncServerTests
                     port,
                     serverPublicKey,
                     onNewChannel: (s, c) => tcsB.SetResult(c),
-                    isHandshakeAllowed: (s, pk, code) => code == validPairingCode
+                    isHandshakeAllowed: (linkType, s, pk, code, appId) => code == validPairingCode
                 );
 
                 using var clientA = await CreateClientAsync(port, serverPublicKey);
@@ -1180,7 +1181,7 @@ namespace SyncServerTests
                     port,
                     serverPublicKey,
                     onNewChannel: (s, c) => tcsB.SetResult(c),
-                    isHandshakeAllowed: (s, pk, code) => true
+                    isHandshakeAllowed: (linkType, s, pk, code, appId) => true
                 );
 
                 using var clientA = await CreateClientAsync(
@@ -1190,7 +1191,7 @@ namespace SyncServerTests
                 );
 
                 // Start relayed channel with an unnecessary pairing code
-                var channelTask = clientA.StartRelayedChannelAsync(clientB.LocalPublicKey, pairingCode);
+                var channelTask = clientA.StartRelayedChannelAsync(clientB.LocalPublicKey, pairingCode: pairingCode);
                 var channelA = await tcsA.Task.WithTimeout(5000, "Channel A creation timed out");
                 channelA.Authorizable = AlwaysAuthorized.Instance;
                 var channelB = await tcsB.Task.WithTimeout(5000, "Channel B creation timed out");
@@ -1366,6 +1367,69 @@ namespace SyncServerTests
                     async () => await connectionTask,
                     "Connection attempt should fail if target session is disposed"
                 );
+            }
+        }
+
+        [TestMethod]
+        public async Task RelayedTransport_WithValidAppId_Success()
+        {
+            // Arrange: Set up server and clients
+            var (server, serverPublicKey, port) = SetupServer();
+            using (server)
+            {
+                const uint allowedAppId = 1234;
+                var tcsB = new TaskCompletionSource<ChannelRelayed>();
+
+                // Client B requires appId 1234
+                using var clientB = await CreateClientAsync(
+                    port,
+                    serverPublicKey,
+                    onNewChannel: (s, c) => tcsB.SetResult(c),
+                    isHandshakeAllowed: (linkType, s, pk, code, appId) => appId == allowedAppId
+                );
+
+                using var clientA = await CreateClientAsync(port, serverPublicKey);
+
+                // Act: Start relayed channel with valid appId
+                var channelTask = clientA.StartRelayedChannelAsync(clientB.LocalPublicKey, appId: allowedAppId);
+                var channelB = await tcsB.Task.WithTimeout(5000, "Channel B creation timed out");
+                await channelTask.WithTimeout(5000, "Channel establishment timed out");
+
+                // Assert: Channel is established
+                Assert.IsNotNull(channelB, "Channel should be created on target with valid appId");
+            }
+        }
+
+        [TestMethod]
+        public async Task RelayedTransport_WithInvalidAppId_Fails()
+        {
+            // Arrange: Set up server and clients
+            var (server, serverPublicKey, port) = SetupServer();
+            using (server)
+            {
+                const uint allowedAppId = 1234;
+                var tcsB = new TaskCompletionSource<ChannelRelayed>();
+
+                // Client B requires appId 1234
+                using var clientB = await CreateClientAsync(
+                    port,
+                    serverPublicKey,
+                    onNewChannel: (s, c) => tcsB.SetResult(c),
+                    isHandshakeAllowed: (linkType, s, pk, code, appId) => appId == allowedAppId
+                );
+
+                using var clientA = await CreateClientAsync(port, serverPublicKey);
+
+                // Act & Assert: Attempt with invalid appId should fail
+                await Assert.ThrowsExceptionAsync<Exception>(
+                    async () => await clientA.StartRelayedChannelAsync(clientB.LocalPublicKey, appId: 5678),
+                    "Starting relayed channel with invalid appId should fail"
+                );
+
+                // Ensure no channel was created on client B
+                var channelTask = tcsB.Task;
+                var completedTask = await Task.WhenAny(channelTask, Task.Delay(1000));
+                Assert.AreNotEqual(channelTask, completedTask, "No channel should be created with invalid appId");
             }
         }
     }
