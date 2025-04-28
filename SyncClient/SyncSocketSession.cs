@@ -276,8 +276,6 @@ public class SyncSocketSession : IDisposable
 
             var channelMessage = message.AsSpan(offset, messageSize - offset);
             var (_, _, _) = handshakeState.ReadMessage(channelMessage, plaintext);
-
-            var (bytesWritten, _, transport) = handshakeState.WriteMessage(null, message.AsSpan(4));
             var remotePublicKey = Convert.ToBase64String(handshakeState.RemoteStaticPublicKey);
 
             var isAllowedToConnect = remotePublicKey != _localPublicKey && (_isHandshakeAllowed?.Invoke(LinkType.Direct, this, remotePublicKey, receivedPairingCode, appId) ?? true);
@@ -288,6 +286,7 @@ public class SyncSocketSession : IDisposable
                 return false;
             }
 
+            var (bytesWritten, _, transport) = handshakeState.WriteMessage(null, message.AsSpan(4));
             BinaryPrimitives.WriteInt32LittleEndian(message.AsSpan(0, 4), bytesWritten);
             await SendAsync(message, 0, bytesWritten + 4, cancellationToken: cancellationToken);
             Logger.Info<SyncSocketSession>($"HandshakeAsResponder: Wrote message size {bytesWritten} (app id: {appId})");
