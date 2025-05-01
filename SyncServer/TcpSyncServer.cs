@@ -70,8 +70,6 @@ public class TcpSyncServerMetrics
     public long TotalRented => Utilities.TotalRented;
     public long TotalReturned => Utilities.TotalReturned;
 
-    public int BufferPoolAvailable => _server.ReadWritePool.Available;
-
     public long MemoryUsage => GC.GetTotalMemory(false);
     public int ActiveRelayedConnections => _server.RelayedConnections.Values.Count(conn => conn.IsActive);
 
@@ -123,7 +121,6 @@ public class TcpSyncServer : IDisposable
     private Socket? _listenSocket;
     private readonly SemaphoreSlim _maxConnections;
     private readonly int _maxConnectionCount;
-    public readonly SocketAsyncEventArgsPool ReadWritePool;
     private readonly ConcurrentDictionary<Socket, SyncSession> _clients = new();
     private readonly ConcurrentDictionary<string, SyncSession> _sessions = new();
     private readonly KeyPair _keyPair;
@@ -153,10 +150,8 @@ public class TcpSyncServer : IDisposable
         _port = port;
         _maxConnectionCount = maxConnections;
         _maxConnections = new SemaphoreSlim(maxConnections, maxConnections);
-        ReadWritePool = new SocketAsyncEventArgsPool(2 * maxConnections);
         _keyPair = keyPair;
         RecordRepository = recordRepository;
-        InitializeBufferPool();
     }
 
     public int GetNextConnectionId() => Interlocked.Increment(ref _nextConnectionId);
@@ -183,6 +178,35 @@ public class TcpSyncServer : IDisposable
 
     public void OnSessionClosed(SyncSession session)
     {
+        bool removed = false;
+        var socket = session.Socket;
+        if (socket != null)
+            removed = _clients.TryRemove(session.Socket, out _);
+
+        var remotePublicKey = session?.RemotePublicKey;
+        if (remotePublicKey != null)
+        {
+            _sessions.TryRemove(remotePublicKey, out _);
+            var keysToRemove = _connectionInfoStore.Keys.Where(k => k.Item1 == remotePublicKey).ToList();
+            foreach (var key in keysToRemove)
+                _connectionInfoStore.TryRemove(key, out _);
+        }
+
+        try
+        {
+            if (removed)
+            {
+                Interlocked.Increment(ref Metrics.TotalConnectionsClosed);
+                Interlocked.Decrement(ref Metrics.ActiveConnections);
+                _maxConnections.Release();
+            }
+        }
+        catch (Exception e)
+        {
+            Logger.Warning<TcpSyncServer>("Failed to release max connections", e);
+        }
+
+        var notification = new byte[12];
         foreach (var kvp in RelayedConnections.ToArray())
         {
             var connection = kvp.Value;
@@ -192,13 +216,26 @@ public class TcpSyncServer : IDisposable
                 var otherSession = connection.Initiator == session ? connection.Target : connection.Initiator;
                 if (otherSession != null)
                 {
-                    var notification = new byte[12];
                     BinaryPrimitives.WriteInt64LittleEndian(notification.AsSpan(0, 8), kvp.Key);
                     BinaryPrimitives.WriteInt32LittleEndian(notification.AsSpan(8, 4), 2);
-                    otherSession.Send(Opcode.RELAY, (byte)RelayOpcode.RELAY_ERROR, notification);
+
+                    _ = Task.Run(async () =>
+                    {
+                        try
+                        {
+                            await otherSession.SendAsync(Opcode.RELAY, (byte)RelayOpcode.RELAY_ERROR, notification);
+                        }
+                        catch (Exception e)
+                        {
+                            otherSession.Dispose();
+                            Logger.Info<TcpSyncServer>("Failed to send relay error", e);
+                        }
+                    });
                 }
             }
         }
+
+        Logger.Info<TcpSyncServer>($"Client disconnected");
     }
 
     public void RemoveSession(SyncSession session)
@@ -235,18 +272,6 @@ public class TcpSyncServer : IDisposable
         return null;
     }
 
-    private void InitializeBufferPool()
-    {
-        for (int i = 0; i < 2 * _maxConnectionCount; i++)
-        {
-            var args = new SocketAsyncEventArgs();
-            args.SetBuffer(new byte[BUFFER_SIZE], 0, BUFFER_SIZE);
-            args.Completed += IO_Completed;
-            args.UserToken = new ArgsPair();
-            ReadWritePool.Push(args);
-        }
-    }
-
     public void Start()
     {
         _listenSocket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
@@ -258,252 +283,41 @@ public class TcpSyncServer : IDisposable
         _listenSocket.Listen(1000);
 
         Logger.Info<TcpSyncServer>("Server started. Listening on port 9000...");
-        StartAccept();
-    }
 
-    private void StartAccept()
-    {
-        var acceptEventArg = new SocketAsyncEventArgs();
-        acceptEventArg.Completed += Accept_Completed;
-
-        bool pending = _listenSocket!.AcceptAsync(acceptEventArg);
-        if (!pending)
-            ProcessAccept(acceptEventArg);
-    }
-
-    private void Accept_Completed(object? sender, SocketAsyncEventArgs e)
-    {
-        ProcessAccept(e);
-    }
-
-    private void ProcessAccept(SocketAsyncEventArgs e)
-    {
-        if (e.SocketError != SocketError.Success)
-        {
-            Logger.Error<TcpSyncServer>($"Accept error, stopped accepting sockets: {e.SocketError}");
-            return;
-        }
-
-        try
-        {
-            _maxConnections.Wait();
-            var clientSocket = e.AcceptSocket;
-            if (clientSocket == null)
-            {
-                Logger.Info<TcpSyncServer>("Accepted socket is null.");
-                _maxConnections.Release();
-                return;
-            }
-
-            if (ReadWritePool.IsEmpty)
-                throw new Exception("Read write pool should never be empty because maxConnections should block");
-
-            var readArgs = ReadWritePool.Pop();
-            var writeArgs = ReadWritePool.Pop();
-            var session = new SyncSession(this, (s) => _sessions[s.RemotePublicKey!] = s)
-            {
-                Socket = clientSocket,
-                ReadArgs = readArgs,
-                WriteArgs = writeArgs,
-                HandshakeState = NoiseProtocol.Create(false, s: _keyPair.PrivateKey)
-            };
-            ((ArgsPair)readArgs.UserToken!).Session = session;
-            ((ArgsPair)writeArgs.UserToken!).Session = session;
-            _clients.TryAdd(clientSocket, session);
-            Interlocked.Increment(ref Metrics.TotalConnectionsAccepted);
-            Interlocked.Increment(ref Metrics.ActiveConnections);
-
-            Logger.Info<TcpSyncServer>($"Client connected: {clientSocket.RemoteEndPoint}");
-
-            session.SendVersion();
-
-            readArgs.SetBuffer(new byte[1024], 0, 1024);
-            bool pending = clientSocket.ReceiveAsync(readArgs);
-            if (!pending)
-                ThreadPool.QueueUserWorkItem((_) => OnReceiveCompleted(session));
-        }
-        catch (Exception ex)
-        {
-            Logger.Error<TcpSyncServer>($"Accept processing error: {ex.Message}");
-            _maxConnections.Release();
-        }
-        finally
-        {
-            e.AcceptSocket = null;
-            bool acceptPending = _listenSocket!.AcceptAsync(e);
-            if (!acceptPending)
-                ProcessAccept(e);
-        }
-    }
-
-    private void OnReceiveCompleted(SyncSession session)
-    {
-        try
+        _ = Task.Run(async () =>
         {
             while (true)
             {
-                if (Logger.WillLog(LogLevel.Debug))
-                    Logger.Debug<TcpSyncServer>($"Received {session.ReadArgs!.BytesTransferred} bytes.");
-
-                if (session.ReadArgs!.BytesTransferred == 0)
+                try
                 {
-                    Logger.Info<TcpSyncServer>($"OnReceiveCompleted (bytesReceived = {session.ReadArgs!.BytesTransferred}) soft disconnect.");
-                    CloseConnection(session);
-                    return;
+                    _maxConnections.Wait();
+                    var clientSocket = await _listenSocket.AcceptAsync();
+                    if (clientSocket == null)
+                    {
+                        Logger.Info<TcpSyncServer>("Accepted socket is null.");
+                        _maxConnections.Release();
+                        return;
+                    }
+
+                    var session = new SyncSession(this, (s) => _sessions[s.RemotePublicKey!] = s, OnSessionClosed)
+                    {
+                        Socket = clientSocket,
+                        HandshakeState = NoiseProtocol.Create(false, s: _keyPair.PrivateKey)
+                    };
+                    _clients.TryAdd(clientSocket, session);
+                    Interlocked.Increment(ref Metrics.TotalConnectionsAccepted);
+                    Interlocked.Increment(ref Metrics.ActiveConnections);
+
+                    Logger.Info<TcpSyncServer>($"Client connected: {clientSocket.RemoteEndPoint}");
+                    session.Start();
                 }
-
-                session.HandleData(session.ReadArgs!.BytesTransferred);
-
-                bool pending = session.Socket!.ReceiveAsync(session.ReadArgs!);
-                if (pending)
-                    break;
-            }
-        }
-        catch (Exception e)
-        {
-            Logger.Error<TcpSyncServer>($"OnReceiveCompleted (bytesReceived = {session.ReadArgs!.BytesTransferred}) unhandled exception.", e);
-            CloseConnection(session);
-        }
-    }
-
-    private void OnSendCompleted(SyncSession session, int bytesSent)
-    {
-        try
-        {
-            if (Logger.WillLog(LogLevel.Verbose))
-                Logger.Verbose<TcpSyncServer>($"Sent {bytesSent} bytes.");
-
-            if (bytesSent == 0)
-            {
-                Logger.Info<TcpSyncServer>($"OnSendCompleted (bytesSent = {bytesSent}) soft disconnect.");
-                CloseConnection(session);
-                return;
-            }
-
-            session.OnWriteCompleted();
-        }
-        catch (Exception e)
-        {
-            Logger.Error<TcpSyncServer>($"OnSendCompleted (bytesSent = {bytesSent}) unhandled exception.", e);
-            CloseConnection(session);
-        }
-    }
-
-    private void IO_Completed(object? sender, SocketAsyncEventArgs e)
-    {
-        var argsPair = (ArgsPair)e.UserToken!;
-        var session = argsPair.Session;
-        if (session == null || session.Socket == null)
-        {
-            Logger.Info<TcpSyncServer>("Session or socket is null in IO_Completed.");
-            return;
-        }
-
-        ThreadPool.QueueUserWorkItem((_) =>
-        {
-            try
-            {
-                if (e.SocketError != SocketError.Success)
+                catch (Exception ex)
                 {
-                    CloseConnection(session);
-                    return;
+                    Logger.Error<TcpSyncServer>($"Accept processing error", ex);
+                    _maxConnections.Release();
                 }
-
-                switch (e.LastOperation)
-                {
-                    case SocketAsyncOperation.Receive:
-                        if (e.BytesTransferred == 0)
-                        {
-                            Logger.Info<TcpSyncServer>($"Soft disconnect");
-                            CloseConnection(session);
-                        }
-                        else
-                        {
-                            OnReceiveCompleted(session);
-                        }
-                        break;
-                    case SocketAsyncOperation.Send:
-                        if (e.BytesTransferred == 0)
-                        {
-                            Logger.Info<TcpSyncServer>($"Soft disconnect");
-                            CloseConnection(session);
-                        }
-                        else
-                        {
-                            OnSendCompleted(session, e.BytesTransferred);
-                        }                        
-                        break;
-                    default:
-                        throw new InvalidOperationException("Unexpected operation");
-                }
-            }
-            catch (Exception ex)
-            {
-                Logger.Error<TcpSyncServer>($"IO_Completed error: {ex.Message}");
-                CloseConnection(session);
             }
         });
-    }
-
-    private void CloseConnection(SyncSession? session)
-    {
-        if (session == null || session.Socket == null)
-        {
-            Logger.Info<TcpSyncServer>("Session or socket is null in CloseConnection.");
-            return;
-        }
-
-        bool removed = _clients.TryRemove(session.Socket, out _);
-        session.Socket.Dispose();
-        var remotePublicKey = session?.RemotePublicKey;
-        if (remotePublicKey != null)
-        {
-            _sessions.TryRemove(remotePublicKey, out _);
-            var keysToRemove = _connectionInfoStore.Keys.Where(k => k.Item1 == remotePublicKey).ToList();
-            foreach (var key in keysToRemove)
-                _connectionInfoStore.TryRemove(key, out _);
-        }
-
-        Span<byte> notification = stackalloc byte[12];
-        foreach (var kvp in RelayedConnections.ToArray())
-        {
-            var connection = kvp.Value;
-            if (connection.Initiator == session || connection.Target == session)
-            {
-                if (RelayedConnections.TryRemove(kvp.Key, out _))
-                {
-                    var otherSession = connection.Initiator == session ? connection.Target : connection.Initiator;
-                    if (otherSession != null && otherSession.PrimaryState != SessionPrimaryState.Closed)
-                    {                        
-                        BinaryPrimitives.WriteInt64LittleEndian(notification.Slice(0, 8), kvp.Key);
-                        BinaryPrimitives.WriteInt32LittleEndian(notification.Slice(8, 4), 1);
-                        otherSession.Send(Opcode.RELAY, (byte)RelayOpcode.RELAY_ERROR, notification);
-                    }
-                }
-            }
-        }
-
-        if (session?.ReadArgs != null)
-            ReadWritePool.Push(session.ReadArgs);
-        if (session?.WriteArgs != null)
-            ReadWritePool.Push(session.WriteArgs);
-        session?.Dispose();
-
-        try
-        {
-            if (removed)
-            {
-                Interlocked.Increment(ref Metrics.TotalConnectionsClosed);
-                Interlocked.Decrement(ref Metrics.ActiveConnections);
-                _maxConnections.Release();
-            }
-        }
-        catch (Exception e)
-        {
-            Logger.Warning<TcpSyncServer>("Failed to release max connections", e);
-        }
-
-        Logger.Info<TcpSyncServer>($"Client disconnected");
     }
 
     public bool IsBlacklisted(string initiator, string target)
@@ -536,9 +350,7 @@ public class TcpSyncServer : IDisposable
         {
             _listenSocket?.Close();
             foreach (var client in _clients.Values)
-            {
-                CloseConnection(client);
-            }
+                client.Dispose();
         }
         catch (Exception ex)
         {

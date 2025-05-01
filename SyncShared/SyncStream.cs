@@ -34,11 +34,11 @@ public class SyncStream : IDisposable
         IsComplete = BytesReceived == _expectedSize;
     }
 
-    public Span<byte> GetBytes()
+    public ArraySegment<byte> GetBytes()
     {
         if (!IsComplete)
             throw new Exception("Data is not complete yet");
-        return _buffer.AsSpan().Slice(0, _expectedSize);
+        return new ArraySegment<byte>(_buffer, 0, _expectedSize);
     }
 
     public void Dispose()
