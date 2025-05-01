@@ -729,6 +729,11 @@ public class SyncSession
                 otherClient.Send(Opcode.RELAY, (byte)RelayOpcode.RELAYED_DATA, packet.AsSpan(0, data.Length));
                 Interlocked.Add(ref _server.Metrics.TotalRelayedDataBytes, data.Length - 8);
             }
+            catch (Exception e)
+            {
+                Logger.Warning<SyncSession>($"Failed to relay data from {RemotePublicKey} to {otherClient}. Closing connection.", e);
+                otherClient.Dispose();
+            }
             finally
             {
                 Utilities.ReturnBytes(packet);
@@ -772,6 +777,11 @@ public class SyncSession
                 data.Slice(8).CopyTo(packet.AsSpan(8));
                 otherClient.Send(Opcode.RELAY, (byte)RelayOpcode.RELAYED_ERROR, packet.AsSpan(0, data.Length));
                 Interlocked.Add(ref _server.Metrics.TotalRelayedErrorBytes, data.Length - 8);
+            }
+            catch (Exception e)
+            {
+                Logger.Warning<SyncSession>($"Failed to relay data from {RemotePublicKey} to {otherClient}. Closing connection.", e);
+                otherClient.Dispose();
             }
             finally
             {
@@ -1084,12 +1094,12 @@ public class SyncSession
         }
 
         long connectionId = _server.GetNextConnectionId();
-        if (!_server.TryReserveRelayPair(RemotePublicKey!, targetPublicKey, connectionId, out var pair))
+        /* TODO REIMPLEMENT if (!_server.TryReserveRelayPair(RemotePublicKey!, targetPublicKey, connectionId, out var pair))
         {
             Logger.Info<SyncSession>($"Relay request from {RemotePublicKey} to {targetPublicKey} rejected due to existing connection (app id: {appId}).");
             SendEmptyResponse(ResponseOpcode.TRANSPORT_RELAYED, requestId, (int)TransportResponseCode.DuplicateConnection);
             return;
-        }
+        }*/
 
         bool setupFailed = true;
         try

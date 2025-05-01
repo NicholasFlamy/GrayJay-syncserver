@@ -195,7 +195,7 @@ public class TcpSyncServer : IDisposable
                     var notification = new byte[12];
                     BinaryPrimitives.WriteInt64LittleEndian(notification.AsSpan(0, 8), kvp.Key);
                     BinaryPrimitives.WriteInt32LittleEndian(notification.AsSpan(8, 4), 2);
-                    otherSession.Send(Opcode.RELAY, (byte)RelayOpcode.RELAYED_ERROR, notification);
+                    otherSession.Send(Opcode.RELAY, (byte)RelayOpcode.RELAY_ERROR, notification);
                 }
             }
         }
@@ -477,7 +477,7 @@ public class TcpSyncServer : IDisposable
                     {                        
                         BinaryPrimitives.WriteInt64LittleEndian(notification.Slice(0, 8), kvp.Key);
                         BinaryPrimitives.WriteInt32LittleEndian(notification.Slice(8, 4), 1);
-                        otherSession.Send(Opcode.RELAY, (byte)RelayOpcode.RELAYED_ERROR, notification);
+                        otherSession.Send(Opcode.RELAY, (byte)RelayOpcode.RELAY_ERROR, notification);
                     }
                 }
             }
