@@ -144,7 +144,9 @@ public class TcpSyncServer : IDisposable
 
     public readonly TcpSyncServerMetrics Metrics;
 
-    public TcpSyncServer(int port, KeyPair keyPair, IRecordRepository recordRepository, int maxConnections = MAX_CONNECTIONS)
+    public bool _useRateLimits;
+
+    public TcpSyncServer(int port, KeyPair keyPair, IRecordRepository recordRepository, int maxConnections = MAX_CONNECTIONS, bool useRateLimits = true)
     {
         Metrics = new TcpSyncServerMetrics(this);
         _port = port;
@@ -152,6 +154,7 @@ public class TcpSyncServer : IDisposable
         _maxConnections = new SemaphoreSlim(maxConnections, maxConnections);
         _keyPair = keyPair;
         RecordRepository = recordRepository;
+        _useRateLimits = useRateLimits;
     }
 
     public int GetNextConnectionId() => Interlocked.Increment(ref _nextConnectionId);
@@ -299,7 +302,7 @@ public class TcpSyncServer : IDisposable
                         return;
                     }
 
-                    var session = new SyncSession(this, (s) => _sessions[s.RemotePublicKey!] = s, OnSessionClosed)
+                    var session = new SyncSession(this, (s) => _sessions[s.RemotePublicKey!] = s, OnSessionClosed, _useRateLimits)
                     {
                         Socket = clientSocket,
                         HandshakeState = NoiseProtocol.Create(false, s: _keyPair.PrivateKey)

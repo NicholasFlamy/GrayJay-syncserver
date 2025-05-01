@@ -1,4 +1,5 @@
 ﻿using System.Buffers;
+using System.Collections.Concurrent;
 using System.Text;
 
 namespace SyncShared;
@@ -7,6 +8,10 @@ public static class Utilities
 {
     public static long TotalRented = 0;
     public static long TotalReturned = 0;
+/*
+#if DEBUG
+    private static ConcurrentDictionary<byte[], Guid> OutstandingBorrows = new ConcurrentDictionary<byte[], Guid>();
+#endif*/
 
     public static string HexDump(this ReadOnlySpan<byte> data)
     {
@@ -60,19 +65,37 @@ public static class Utilities
     public static byte[] RentBytes(int minimumSize)
     {
         var rentedBytes = ArrayPool<byte>.Shared.Rent(minimumSize);
-        if (Logger.WillLog(LogLevel.Debug))
-            Logger.Debug(nameof(Utilities), $"Rented {rentedBytes.Length} bytes (requested: {minimumSize}, total rented: {TotalRented}, total returned: {TotalReturned})");
-
         Interlocked.Add(ref TotalRented, rentedBytes.Length);
+
+        if (Logger.WillLog(LogLevel.Debug))
+        {
+/*#if DEBUG
+            var id = Guid.NewGuid();
+            OutstandingBorrows[rentedBytes] = id;
+            Logger.Debug(nameof(Utilities), $"Rented {rentedBytes.Length} bytes (requested: {minimumSize}, total rented: {TotalRented}, total returned: {TotalReturned}, delta: {TotalRented - TotalReturned}) with id {id}:\n{Environment.StackTrace}");
+#else*/
+            Logger.Debug(nameof(Utilities), $"Rented {rentedBytes.Length} bytes (requested: {minimumSize}, total rented: {TotalRented}, total returned: {TotalReturned}, delta: {TotalRented - TotalReturned})");
+//#endif
+        }
+
         return rentedBytes;
     }
 
     public static void ReturnBytes(byte[] rentedBytes, bool clearArray = false)
     {
-        if (Logger.WillLog(LogLevel.Debug))
-            Logger.Debug(nameof(Utilities), $"Returned {rentedBytes.Length} bytes (total rented: {TotalRented}, total returned: {TotalReturned})");
-
         Interlocked.Add(ref TotalReturned, rentedBytes.Length);
         ArrayPool<byte>.Shared.Return(rentedBytes, clearArray);
+
+        if (Logger.WillLog(LogLevel.Debug))
+        {
+/*#if DEBUG
+            OutstandingBorrows.TryRemove(rentedBytes, out var id);
+            Logger.Debug(nameof(Utilities), $"Returned {rentedBytes.Length} bytes (total rented: {TotalRented}, total returned: {TotalReturned}, delta: {TotalRented - TotalReturned}) with id {id}");
+            foreach (var outstandingBorrow in OutstandingBorrows)
+                Logger.Debug(nameof(Utilities), $"Outstanding borrow ({outstandingBorrow.Value}).");
+#else*/
+            Logger.Debug(nameof(Utilities), $"Returned {rentedBytes.Length} bytes (total rented: {TotalRented}, total returned: {TotalReturned}, delta: {TotalRented - TotalReturned})");
+//#endif
+        }
     }
 }

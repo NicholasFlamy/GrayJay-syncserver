@@ -48,12 +48,14 @@ public class SyncSession
     private readonly Dictionary<int, SyncStream> _syncStreams = new();
     private int _streamIdGenerator = 0;
     private readonly SemaphoreSlim _sendSemaphore = new SemaphoreSlim(1);
+    private readonly bool _useRateLimits;
 
-    public SyncSession(TcpSyncServer server, Action<SyncSession> onHandshakeComplete, Action<SyncSession> onClose)
+    public SyncSession(TcpSyncServer server, Action<SyncSession> onHandshakeComplete, Action<SyncSession> onClose, bool useRateLimits = true)
     {
         _server = server;
         _onHandshakeComplete = onHandshakeComplete;
         _onClose = onClose;
+        _useRateLimits = useRateLimits;
     }
 
     public void Dispose()
@@ -164,7 +166,7 @@ public class SyncSession
                 Interlocked.Increment(ref _server.Metrics.TotalHandshakeSuccesses);
 
                 string ipAddress = GetIpAddress();
-                if (!_server.TryRegisterNewKeypair(ipAddress))
+                if (_useRateLimits && !_server.TryRegisterNewKeypair(ipAddress))
                 {
                     Interlocked.Increment(ref _server.Metrics.TotalKeypairRegistrationRateLimitExceedances);
                     Logger.Error<SyncSession>($"IP {ipAddress} exceeded keypair rate limit (app id: {appId})");
@@ -651,7 +653,7 @@ public class SyncSession
         var connection = _server.GetRelayedConnection(connectionId);
 
         string ipAddress = GetIpAddress();
-        if (!_server.IsRelayDataAllowedByIP(ipAddress, data.Count))
+        if (_useRateLimits && !_server.IsRelayDataAllowedByIP(ipAddress, data.Count))
         {
             Interlocked.Increment(ref _server.Metrics.TotalRelayDataByIpRateLimitExceedances);
             Logger.Error<SyncSession>($"IP {ipAddress} exceeded relay data rate limit");
@@ -660,7 +662,7 @@ public class SyncSession
             return;
         }
 
-        if (!_server.IsRelayDataAllowedByConnectionId(connectionId, data.Count))
+        if (_useRateLimits && !_server.IsRelayDataAllowedByConnectionId(connectionId, data.Count))
         {
             Interlocked.Increment(ref _server.Metrics.TotalRelayDataByConnectionIdRateLimitExceedances);
             Logger.Error<SyncSession>($"Received data to relay but exceeded ConnectionId rate limit for connectionId {connectionId}, connection terminated.");
@@ -771,7 +773,7 @@ public class SyncSession
         if (connection == null || !connection.IsActive)
         {
             Logger.Error<SyncSession>($"Received relay error but no active relayed connection for connectionId {connectionId}");
-            await SendRelayErrorAsync(connectionId, RelayErrorCode.RateLimitExceeded);
+            await SendRelayErrorAsync(connectionId, RelayErrorCode.ConnectionClosed);
             _server.RemoveRelayPairByConnectionId(connectionId);
             return;
         }
@@ -1017,37 +1019,40 @@ public class SyncSession
             return;
         }
 
-        string ipAddress = GetIpAddress();
-        var (allowedByIp, reasonByIp) = _server.IsRelayRequestAllowedByIP(ipAddress);
-        if (!allowedByIp)
+        if (_useRateLimits)
         {
-            if (reasonByIp == RateLimitReason.TokenRateLimitExceeded)
+            string ipAddress = GetIpAddress();
+            var (allowedByIp, reasonByIp) = _server.IsRelayRequestAllowedByIP(ipAddress);
+            if (!allowedByIp)
             {
-                Interlocked.Increment(ref _server.Metrics.TotalRelayRequestByIpTokenRateLimitExceedances);
+                if (reasonByIp == RateLimitReason.TokenRateLimitExceeded)
+                {
+                    Interlocked.Increment(ref _server.Metrics.TotalRelayRequestByIpTokenRateLimitExceedances);
+                }
+                else if (reasonByIp == RateLimitReason.ConnectionLimitExceeded)
+                {
+                    Interlocked.Increment(ref _server.Metrics.TotalRelayRequestByIpConnectionLimitExceedances);
+                }
+                Logger.Error<SyncSession>($"IP {ipAddress} exceeded relay request limit: {reasonByIp} (app id: {appId})");
+                await SendEmptyResponseAsync(ResponseOpcode.TRANSPORT_RELAYED, requestId, (int)TransportResponseCode.RateLimitExceeded);
+                return;
             }
-            else if (reasonByIp == RateLimitReason.ConnectionLimitExceeded)
-            {
-                Interlocked.Increment(ref _server.Metrics.TotalRelayRequestByIpConnectionLimitExceedances);
-            }
-            Logger.Error<SyncSession>($"IP {ipAddress} exceeded relay request limit: {reasonByIp} (app id: {appId})");
-            await SendEmptyResponseAsync(ResponseOpcode.TRANSPORT_RELAYED, requestId, (int)TransportResponseCode.RateLimitExceeded);
-            return;
-        }
 
-        var (allowedByKey, reasonByKey) = _server.IsRelayRequestAllowedByKey(RemotePublicKey!);
-        if (!allowedByKey)
-        {
-            if (reasonByKey == RateLimitReason.TokenRateLimitExceeded)
+            var (allowedByKey, reasonByKey) = _server.IsRelayRequestAllowedByKey(RemotePublicKey!);
+            if (!allowedByKey)
             {
-                Interlocked.Increment(ref _server.Metrics.TotalRelayRequestByKeyTokenRateLimitExceedances);
+                if (reasonByKey == RateLimitReason.TokenRateLimitExceeded)
+                {
+                    Interlocked.Increment(ref _server.Metrics.TotalRelayRequestByKeyTokenRateLimitExceedances);
+                }
+                else if (reasonByKey == RateLimitReason.ConnectionLimitExceeded)
+                {
+                    Interlocked.Increment(ref _server.Metrics.TotalRelayRequestByKeyConnectionLimitExceedances);
+                }
+                Logger.Error<SyncSession>($"Remote public key {RemotePublicKey!} exceeded relay request limit: {reasonByKey} (app id: {appId})");
+                await SendEmptyResponseAsync(ResponseOpcode.TRANSPORT_RELAYED, requestId, (int)TransportResponseCode.RateLimitExceeded);
+                return;
             }
-            else if (reasonByKey == RateLimitReason.ConnectionLimitExceeded)
-            {
-                Interlocked.Increment(ref _server.Metrics.TotalRelayRequestByKeyConnectionLimitExceedances);
-            }
-            Logger.Error<SyncSession>($"Remote public key {RemotePublicKey!} exceeded relay request limit: {reasonByKey} (app id: {appId})");
-            await SendEmptyResponseAsync(ResponseOpcode.TRANSPORT_RELAYED, requestId, (int)TransportResponseCode.RateLimitExceeded);
-            return;
         }
 
         var targetSession = _server.GetSession(targetPublicKey);
@@ -1151,7 +1156,7 @@ public class SyncSession
         byte[] publisherPublicKey = Convert.FromBase64String(RemotePublicKey!);
 
         string ipAddress = GetIpAddress();
-        if (!_server.IsPublishRequestAllowed(ipAddress))
+        if (_useRateLimits && !_server.IsPublishRequestAllowed(ipAddress))
         {
             Interlocked.Increment(ref _server.Metrics.TotalPublishRequestRateLimitExceedances);
             Logger.Error<SyncSession>($"IP {ipAddress} exceeded publish request rate limit");
