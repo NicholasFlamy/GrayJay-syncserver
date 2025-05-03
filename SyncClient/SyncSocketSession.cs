@@ -1665,7 +1665,7 @@ public class SyncSocketSession : IDisposable
     }
 
     //TODO: Not return bool?
-    public async Task<bool> PublishRecordsAsync(IEnumerable<string> consumerPublicKeys, string key, byte[] data, CancellationToken cancellationToken = default)
+    public async Task<bool> PublishRecordsAsync(IEnumerable<string> consumerPublicKeys, string key, byte[] data, ContentEncoding contentEncoding = ContentEncoding.Raw, CancellationToken cancellationToken = default)
     {
         var keyBytes = Encoding.UTF8.GetBytes(key);
         if (string.IsNullOrEmpty(key) || keyBytes.Length > 32)
@@ -1756,7 +1756,7 @@ public class SyncSocketSession : IDisposable
             }
 
             ArrayPool<byte>.Shared.Return(encryptedChunkBuffer);
-            await SendAsync(Opcode.REQUEST, (byte)RequestOpcode.BULK_PUBLISH_RECORD, packet, cancellationToken: cancellationToken);
+            await SendAsync(Opcode.REQUEST, (byte)RequestOpcode.BULK_PUBLISH_RECORD, packet, contentEncoding: contentEncoding, cancellationToken: cancellationToken);
         }
         catch (Exception ex)
         {
