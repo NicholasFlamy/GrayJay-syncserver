@@ -1,6 +1,7 @@
 ﻿using Noise;
 using SyncShared;
 using System.Buffers.Binary;
+using System.IO.Compression;
 using System.Text;
 namespace SyncClient;
 
@@ -11,7 +12,7 @@ public interface IChannel : IDisposable
     public IAuthorizable? Authorizable { get; set; }
     public object? SyncSession { get; set; } //TODO: Replace with SyncSession once library is properly structured
     public void SetDataHandler(Action<SyncSocketSession, IChannel, Opcode, byte, ReadOnlySpan<byte>>? onData);
-    public Task SendAsync(Opcode opcode, byte subOpcode, byte[]? data = null, int offset = 0, int count = -1, CancellationToken cancellationToken = default);
+    public Task SendAsync(Opcode opcode, byte subOpcode, byte[]? data = null, int offset = 0, int count = -1, ContentEncoding contentEncoding = ContentEncoding.Raw, CancellationToken cancellationToken = default);
     public void SetCloseHandler(Action<IChannel>? onClose);
     public LinkType LinkType { get; }
 }
@@ -58,7 +59,7 @@ public class ChannelSocket : IChannel
         _onData?.Invoke(_session, this, opcode, subOpcode, data);
     }
 
-    public async Task SendAsync(Opcode opcode, byte subOpcode, byte[]? data = null, int offset = 0, int count = -1, CancellationToken cancellationToken = default)
+    public async Task SendAsync(Opcode opcode, byte subOpcode, byte[]? data = null, int offset = 0, int count = -1, ContentEncoding contentEncoding = ContentEncoding.Raw, CancellationToken cancellationToken = default)
     {
         if (data != null)
             await _session.SendAsync(opcode, subOpcode, data, offset, count, cancellationToken: cancellationToken);
@@ -206,7 +207,7 @@ public class ChannelRelayed : IChannel
         }
     }
 
-    public async Task SendAsync(Opcode opcode, byte subOpcode, byte[]? data = null, int offset = 0, int count = -1, CancellationToken cancellationToken = default)
+    public async Task SendAsync(Opcode opcode, byte subOpcode, byte[]? data = null, int offset = 0, int count = -1, ContentEncoding contentEncoding = ContentEncoding.Raw, CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
 
@@ -216,12 +217,27 @@ public class ChannelRelayed : IChannel
         if (count != 0 && data == null)
             throw new Exception("Data must be set if count is not 0");
 
+        byte[]? processedData = data;
+        if (data != null && contentEncoding == ContentEncoding.Gzip)
+        {
+            using (var compressedStream = new MemoryStream())
+            {
+                using (var gzipStream = new GZipStream(compressedStream, CompressionMode.Compress))
+                {
+                    await gzipStream.WriteAsync(data.AsMemory(offset, count), cancellationToken);
+                }
+                processedData = compressedStream.ToArray();
+                count = processedData.Length;
+                offset = 0;
+            }
+        }
+
         const int ENCRYPTION_OVERHEAD = 16;
         const int CONNECTION_ID_SIZE = 8;
-        const int HEADER_SIZE = 6;
+        const int HEADER_SIZE = 7;
         const int MAX_DATA_PER_PACKET = SyncSocketSession.MAXIMUM_PACKET_SIZE - HEADER_SIZE - CONNECTION_ID_SIZE - ENCRYPTION_OVERHEAD - 16;
 
-        if (count > MAX_DATA_PER_PACKET && data != null)
+        if (count > MAX_DATA_PER_PACKET && processedData != null)
         {
             var streamId = _session.GenerateStreamId();
             int totalSize = count;
@@ -230,7 +246,7 @@ public class ChannelRelayed : IChannel
             while (sendOffset < totalSize)
             {
                 int bytesRemaining = totalSize - sendOffset;
-                int bytesToSend = Math.Min(MAX_DATA_PER_PACKET - 8 - 2, bytesRemaining);
+                int bytesToSend = Math.Min(MAX_DATA_PER_PACKET - 8 - HEADER_SIZE + 4, bytesRemaining);
 
                 // Prepare stream data
                 byte[] streamData;
@@ -238,27 +254,29 @@ public class ChannelRelayed : IChannel
                 if (sendOffset == 0)
                 {
                     streamOpcode = StreamOpcode.START;
-                    streamData = new byte[4 + 4 + 1 + 1 + bytesToSend];
+                    streamData = new byte[4 + HEADER_SIZE + bytesToSend];
                     BinaryPrimitives.WriteInt32LittleEndian(streamData.AsSpan(0, 4), streamId);
                     BinaryPrimitives.WriteInt32LittleEndian(streamData.AsSpan(4, 4), totalSize);
                     streamData[8] = (byte)opcode;
                     streamData[9] = subOpcode;
-                    Array.Copy(data, offset + sendOffset, streamData, 10, bytesToSend);
+                    streamData[10] = (byte)contentEncoding;
+                    Array.Copy(processedData, offset + sendOffset, streamData, 4 + HEADER_SIZE, bytesToSend);
                 }
                 else
                 {
                     streamData = new byte[4 + 4 + bytesToSend];
                     BinaryPrimitives.WriteInt32LittleEndian(streamData.AsSpan(0, 4), streamId);
                     BinaryPrimitives.WriteInt32LittleEndian(streamData.AsSpan(4, 4), sendOffset);
-                    Array.Copy(data, offset + sendOffset, streamData, 8, bytesToSend);
+                    Array.Copy(processedData, offset + sendOffset, streamData, 8, bytesToSend);
                     streamOpcode = (bytesToSend < bytesRemaining) ? StreamOpcode.DATA : StreamOpcode.END;
                 }
 
                 // Wrap with header
                 var fullPacket = new byte[HEADER_SIZE + streamData.Length];
-                BinaryPrimitives.WriteInt32LittleEndian(fullPacket.AsSpan(0, 4), streamData.Length + 2);
+                BinaryPrimitives.WriteInt32LittleEndian(fullPacket.AsSpan(0, 4), streamData.Length + 3);
                 fullPacket[4] = (byte)Opcode.STREAM;
                 fullPacket[5] = (byte)streamOpcode;
+                fullPacket[6] = (byte)ContentEncoding.Raw;
                 Array.Copy(streamData, 0, fullPacket, HEADER_SIZE, streamData.Length);
 
                 await SendPacketAsync(fullPacket, cancellationToken);
@@ -268,11 +286,12 @@ public class ChannelRelayed : IChannel
         else
         {
             var packet = new byte[HEADER_SIZE + count];
-            BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(0, 4), count + 2);
+            BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(0, 4), count + HEADER_SIZE - 4);
             packet[4] = (byte)opcode;
             packet[5] = subOpcode;
-            if (count > 0 && data != null)
-                Array.Copy(data, offset, packet, HEADER_SIZE, count);
+            packet[6] = (byte)contentEncoding;
+            if (count > 0 && processedData != null)
+                Array.Copy(processedData, offset, packet, HEADER_SIZE, count);
 
             await SendPacketAsync(packet, cancellationToken);
         }

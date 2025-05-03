@@ -220,6 +220,38 @@ namespace SyncServerTests
         }
 
         [TestMethod]
+        public async Task RelayedTransport_Bidirectional_Gzip_Success()
+        {
+            var (server, serverPublicKey, port) = SetupServer();
+            using (server)
+            {
+                var tcsA = new TaskCompletionSource<ChannelRelayed>();
+                var tcsB = new TaskCompletionSource<ChannelRelayed>();
+                using var clientA = await CreateClientAsync(port, serverPublicKey, onNewChannel: (s, c) => tcsA.SetResult(c));
+                using var clientB = await CreateClientAsync(port, serverPublicKey, onNewChannel: (s, c) => tcsB.SetResult(c));
+                var channelTask = clientA.StartRelayedChannelAsync(clientB.LocalPublicKey);
+                var channelA = await tcsA.Task.WithTimeout(5000, "Channel A creation timed out");
+                channelA.Authorizable = AlwaysAuthorized.Instance;
+                var channelB = await tcsB.Task.WithTimeout(5000, "Channel B creation timed out");
+                channelB.Authorizable = AlwaysAuthorized.Instance;
+                await channelTask;
+
+                var tcsDataB = new TaskCompletionSource<byte[]>();
+                channelB.SetDataHandler((s, c, o, so, d) => tcsDataB.SetResult(d.ToArray()));
+                await channelA.SendAsync(Opcode.DATA, 0, new byte[] { 1, 2, 3 }, contentEncoding: ContentEncoding.Gzip);
+
+                var tcsDataA = new TaskCompletionSource<byte[]>();
+                channelA.SetDataHandler((s, c, o, so, d) => tcsDataA.SetResult(d.ToArray()));
+                await channelB.SendAsync(Opcode.DATA, 0, new byte[] { 4, 5, 6 }, contentEncoding: ContentEncoding.Gzip);
+
+                var receivedB = await tcsDataB.Task.WithTimeout(5000, "Data to B timed out");
+                var receivedA = await tcsDataA.Task.WithTimeout(5000, "Data to A timed out");
+                CollectionAssert.AreEqual(new byte[] { 1, 2, 3 }, receivedB);
+                CollectionAssert.AreEqual(new byte[] { 4, 5, 6 }, receivedA);
+            }
+        }
+
+        [TestMethod]
         public async Task RelayedTransport_MaximumMessageSize_Success()
         {
             var (server, serverPublicKey, port) = SetupServer();
@@ -354,6 +386,26 @@ namespace SyncServerTests
 
         [TestMethod]
         public async Task PublishAndGetRecord_Success()
+        {
+            var (server, serverPublicKey, port) = SetupServer();
+            using (server)
+            {
+                using var clientA = await CreateClientAsync(port, serverPublicKey);
+                using var clientB = await CreateClientAsync(port, serverPublicKey);
+                using var clientC = await CreateClientAsync(port, serverPublicKey);
+                var data = new byte[] { 1, 2, 3 };
+                bool success = await clientA.PublishRecordAsync(clientB.LocalPublicKey, "testKey", data);
+                var recordB = await clientB.GetRecordAsync(clientA.LocalPublicKey, "testKey");
+                var recordC = await clientC.GetRecordAsync(clientA.LocalPublicKey, "testKey");
+                Assert.IsTrue(success);
+                Assert.IsNotNull(recordB);
+                CollectionAssert.AreEqual(data, recordB!.Value.Data);
+                Assert.IsNull(recordC, "Unauthorized client should not access record");
+            }
+        }
+
+        [TestMethod]
+        public async Task PublishAndGetRecord_Gzip_Success()
         {
             var (server, serverPublicKey, port) = SetupServer();
             using (server)
@@ -548,6 +600,33 @@ namespace SyncServerTests
                 var tcsDataB = new TaskCompletionSource<byte[]>();
                 channelB.SetDataHandler((s, c, o, so, d) => tcsDataB.SetResult(d.ToArray()));
                 await channelA.SendAsync(Opcode.DATA, 0, largeData);
+                var receivedData = await tcsDataB.Task.WithTimeout(10000, "Receiving large data timed out");
+                CollectionAssert.AreEqual(largeData, receivedData);
+            }
+        }
+
+        [TestMethod]
+        public async Task SingleLargeMessageViaRelayedChannel_Gzip_Success()
+        {
+            var (server, serverPublicKey, port) = SetupServer();
+            using (server)
+            {
+                var largeData = new byte[100000];
+                new Random().NextBytes(largeData);
+                var tcsA = new TaskCompletionSource<ChannelRelayed>();
+                var tcsB = new TaskCompletionSource<ChannelRelayed>();
+                using var clientA = await CreateClientAsync(port, serverPublicKey, onNewChannel: (s, c) => tcsA.SetResult(c));
+                using var clientB = await CreateClientAsync(port, serverPublicKey, onNewChannel: (s, c) => tcsB.SetResult(c));
+                var channelTask = clientA.StartRelayedChannelAsync(clientB.LocalPublicKey);
+                var channelA = await tcsA.Task.WithTimeout(5000, "Channel A creation timed out");
+                channelA.Authorizable = AlwaysAuthorized.Instance;
+                var channelB = await tcsB.Task.WithTimeout(5000, "Channel B creation timed out");
+                channelB.Authorizable = AlwaysAuthorized.Instance;
+                await channelTask;
+
+                var tcsDataB = new TaskCompletionSource<byte[]>();
+                channelB.SetDataHandler((s, c, o, so, d) => tcsDataB.SetResult(d.ToArray()));
+                await channelA.SendAsync(Opcode.DATA, 0, largeData, contentEncoding: ContentEncoding.Gzip);
                 var receivedData = await tcsDataB.Task.WithTimeout(10000, "Receiving large data timed out");
                 CollectionAssert.AreEqual(largeData, receivedData);
             }

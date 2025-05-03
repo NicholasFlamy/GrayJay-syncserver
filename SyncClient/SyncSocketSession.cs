@@ -8,6 +8,7 @@ using System.Text;
 using System.Collections.Concurrent;
 using System.Buffers;
 using System.Diagnostics;
+using System.IO.Compression;
 
 namespace SyncClient;
 
@@ -287,7 +288,7 @@ public class SyncSocketSession : IDisposable
     {
         int encryptedLength = _transport!.WriteMessage(source, destination);
         if (Logger.WillLog(LogLevel.Debug))
-            Logger.Debug<SyncSocketSession>($"Encrypted message bytes (source size: {source.Length}, destination size: {encryptedLength})\n{Utilities.HexDump(source)}");
+            Logger.Debug<SyncSocketSession>($"Encrypted message bytes (source size: {source.Length}, destination size: {encryptedLength})");
         return encryptedLength;
     }
 
@@ -295,7 +296,7 @@ public class SyncSocketSession : IDisposable
     {
         int plen = _transport!.ReadMessage(source, destination);
         if (Logger.WillLog(LogLevel.Debug))
-            Logger.Debug<SyncSocketSession>($"Decrypted message bytes (source size: {source.Length}, destination size: {plen})\n{Utilities.HexDump(destination.Slice(0, plen))}");
+            Logger.Debug<SyncSocketSession>($"Decrypted message bytes (source size: {source.Length}, destination size: {plen})");
         return plen;
     }
 
@@ -320,7 +321,7 @@ public class SyncSocketSession : IDisposable
         }
 
         if (Logger.WillLog(LogLevel.Debug))
-            Logger.Debug<SyncSocketSession>($"Received {totalBytesReceived} bytes.\n{Utilities.HexDump(buffer.AsSpan().Slice(0, totalBytesReceived))}");
+            Logger.Debug<SyncSocketSession>($"Received {totalBytesReceived} bytes.");
     }
 
     private async ValueTask SendAsync(byte[] data, int offset = 0, int count = -1, CancellationToken cancellationToken = default)
@@ -329,9 +330,7 @@ public class SyncSocketSession : IDisposable
             count = data.Length;
 
         if (Logger.WillLog(LogLevel.Debug))
-            Logger.Debug<SyncSocketSession>($"Sending {count} bytes.\n{Utilities.HexDump(data.AsSpan().Slice(offset, count))}");
-        else if (Logger.WillLog(LogLevel.Verbose))
-            Logger.Verbose<SyncSocketSession>($"Sending {count} bytes.");
+            Logger.Debug<SyncSocketSession>($"Sending {count} bytes.");
 
         Stopwatch? sw = null;
         if (Logger.WillLog(LogLevel.Debug))
@@ -357,17 +356,33 @@ public class SyncSocketSession : IDisposable
     }
 
     public int GenerateStreamId() => Interlocked.Increment(ref _streamIdGenerator);
-    public async Task SendAsync(Opcode opcode, byte subOpcode, byte[] data, int offset = 0, int size = -1, CancellationToken cancellationToken = default) =>
-        await SendAsync((byte)opcode, subOpcode, data, offset, size, cancellationToken);
-    public async Task SendAsync(byte opcode, byte subOpcode, byte[] data, int offset = 0, int size = -1, CancellationToken cancellationToken = default)
+    public async Task SendAsync(Opcode opcode, byte subOpcode, byte[] data, int offset = 0, int size = -1, ContentEncoding contentEncoding = ContentEncoding.Raw, CancellationToken cancellationToken = default) =>
+        await SendAsync((byte)opcode, subOpcode, data, offset, size, contentEncoding, cancellationToken);
+    public async Task SendAsync(byte opcode, byte subOpcode, byte[] data, int offset = 0, int size = -1, ContentEncoding contentEncoding = ContentEncoding.Raw, CancellationToken cancellationToken = default)
     {
         if (size == -1)
             size = data.Length;
 
         if (Logger.WillLog(LogLevel.Debug))
-            Logger.Debug<SyncSocketSession>($"SendAsync (opcode = {opcode}, subOpcode = {subOpcode}, size = {size})");
+            Logger.Debug<SyncSocketSession>($"SendAsync (opcode = {opcode}, subOpcode = {subOpcode}, contentEncoding = {contentEncoding}, size = {size})");
 
-        if (size + HEADER_SIZE > MAXIMUM_PACKET_SIZE)
+        byte[] processedData = data;
+        int processedSize = size;
+
+        if (contentEncoding == ContentEncoding.Gzip)
+        {
+            using (var compressedStream = new MemoryStream())
+            {
+                using (var gzipStream = new GZipStream(compressedStream, CompressionMode.Compress))
+                {
+                    await gzipStream.WriteAsync(data.AsMemory(offset, size), cancellationToken);
+                }
+                processedData = compressedStream.ToArray();
+                processedSize = processedData.Length;
+            }
+        }
+
+        if (processedSize + HEADER_SIZE > MAXIMUM_PACKET_SIZE)
         {
             var segmentSize = MAXIMUM_PACKET_SIZE - HEADER_SIZE;
             var id = GenerateStreamId();
@@ -375,9 +390,9 @@ public class SyncSocketSession : IDisposable
 
             try
             {
-                for (var sendOffset = 0; sendOffset < size;)
+                for (var sendOffset = 0; sendOffset < processedSize;)
                 {
-                    var bytesRemaining = size - sendOffset;
+                    var bytesRemaining = processedSize - sendOffset;
                     int bytesToSend;
                     int segmentPacketSize;
 
@@ -385,8 +400,8 @@ public class SyncSocketSession : IDisposable
                     if (sendOffset == 0)
                     {
                         op = StreamOpcode.START;
-                        bytesToSend = segmentSize - 4 - 4 - 1 - 1;
-                        segmentPacketSize = bytesToSend + 4 + 4 + 1 + 1;
+                        bytesToSend = segmentSize - 4 - HEADER_SIZE;
+                        segmentPacketSize = bytesToSend + 4 + HEADER_SIZE;
                     }
                     else
                     {
@@ -401,23 +416,22 @@ public class SyncSocketSession : IDisposable
 
                     if (op == StreamOpcode.START)
                     {
-                        //TODO: replace segmentData.AsSpan() into a local variable once C# 13
                         BinaryPrimitives.WriteInt32LittleEndian(segmentData.AsSpan().Slice(0, 4), id);
-                        BinaryPrimitives.WriteInt32LittleEndian(segmentData.AsSpan().Slice(4, 4), size);
+                        BinaryPrimitives.WriteInt32LittleEndian(segmentData.AsSpan().Slice(4, 4), processedSize);
                         segmentData[8] = (byte)opcode;
                         segmentData[9] = (byte)subOpcode;
-                        data.AsSpan(offset, size).Slice(sendOffset, bytesToSend).CopyTo(segmentData.AsSpan().Slice(10));
+                        segmentData[10] = (byte)contentEncoding;
+                        processedData.AsSpan(offset, processedSize).Slice(sendOffset, bytesToSend).CopyTo(segmentData.AsSpan().Slice(4 + HEADER_SIZE));
                     }
                     else
                     {
-                        //TODO: replace segmentData.AsSpan() into a local variable once C# 13
                         BinaryPrimitives.WriteInt32LittleEndian(segmentData.AsSpan().Slice(0, 4), id);
                         BinaryPrimitives.WriteInt32LittleEndian(segmentData.AsSpan().Slice(4, 4), sendOffset);
-                        data.AsSpan(offset, size).Slice(sendOffset, bytesToSend).CopyTo(segmentData.AsSpan().Slice(8));
+                        processedData.AsSpan(offset, processedSize).Slice(sendOffset, bytesToSend).CopyTo(segmentData.AsSpan().Slice(8));
                     }
 
                     sendOffset += bytesToSend;
-                    await SendAsync((byte)Opcode.STREAM, (byte)op, segmentData.AsSpan().Slice(0, segmentPacketSize).ToArray(), cancellationToken: cancellationToken);
+                    await SendAsync((byte)Opcode.STREAM, (byte)op, segmentData.AsSpan().Slice(0, segmentPacketSize).ToArray(), contentEncoding: ContentEncoding.Raw, cancellationToken: cancellationToken);
                 }
             }
             finally
@@ -431,15 +445,16 @@ public class SyncSocketSession : IDisposable
             {
                 await _sendSemaphore.WaitAsync();
 
-                BinaryPrimitives.WriteInt32LittleEndian(_sendBuffer.AsSpan(0, 4), data.Length + 2);
+                BinaryPrimitives.WriteInt32LittleEndian(_sendBuffer.AsSpan(0, 4), processedSize + HEADER_SIZE - 4);
                 _sendBuffer[4] = (byte)opcode;
                 _sendBuffer[5] = (byte)subOpcode;
-                data.CopyTo(_sendBuffer.AsSpan().Slice(HEADER_SIZE));
+                _sendBuffer[6] = (byte)contentEncoding;
+                processedData.CopyTo(_sendBuffer.AsSpan().Slice(HEADER_SIZE));
 
                 if (Logger.WillLog(LogLevel.Debug))
-                    Logger.Debug<SyncSocketSession>($"Encrypted message bytes {data.Length + HEADER_SIZE}");
+                    Logger.Debug<SyncSocketSession>($"Encrypted message bytes {processedSize + HEADER_SIZE}");
 
-                var len = Encrypt(_sendBuffer.AsSpan().Slice(0, data.Length + HEADER_SIZE), _sendBufferEncrypted.AsSpan(4));
+                var len = Encrypt(_sendBuffer.AsSpan().Slice(0, processedSize + HEADER_SIZE), _sendBufferEncrypted.AsSpan(4));
 
                 BinaryPrimitives.WriteInt32LittleEndian(_sendBufferEncrypted.AsSpan(0, 4), len);
                 await SendAsync(_sendBufferEncrypted, 0, len + 4, cancellationToken: cancellationToken);
@@ -465,6 +480,7 @@ public class SyncSocketSession : IDisposable
             Array.Copy(BitConverter.GetBytes(2), 0, _sendBuffer, 0, 4);
             _sendBuffer[4] = (byte)opcode;
             _sendBuffer[5] = (byte)subOpcode;
+            _sendBuffer[6] = (byte)ContentEncoding.Raw;
 
             if (Logger.WillLog(LogLevel.Debug))
                 Logger.Debug<SyncSocketSession>($"Encrypted message bytes {HEADER_SIZE}");
@@ -489,7 +505,7 @@ public class SyncSocketSession : IDisposable
     private void HandleData(byte[] data, int length, ChannelRelayed? sourceChannel = null)
     {
         if (length < HEADER_SIZE)
-            throw new Exception("Packet must be at least 6 bytes (header size)");
+            throw new Exception($"Packet must be at least {HEADER_SIZE} bytes (header size)");
 
         int size = BitConverter.ToInt32(data, 0);
         if (size != length - 4)
@@ -497,8 +513,10 @@ public class SyncSocketSession : IDisposable
 
         byte opcode = data[4];
         byte subOpcode = data[5];
-        ReadOnlySpan<byte> packetData = data.AsSpan(HEADER_SIZE, size - 2);
-        HandlePacket((Opcode)opcode, subOpcode, packetData, sourceChannel);
+        ContentEncoding contentEncoding = (ContentEncoding)data[6];
+        ReadOnlySpan<byte> packetData = data.AsSpan(HEADER_SIZE, size - HEADER_SIZE + 4);
+
+        HandlePacket((Opcode)opcode, subOpcode, packetData, contentEncoding, sourceChannel);
     }
 
     private int GenerateRequestId() => Interlocked.Increment(ref _requestIdGenerator);
@@ -813,6 +831,8 @@ public class SyncSocketSession : IDisposable
                 return;
             case ResponseOpcode.PUBLISH_RECORD:
                 {
+                    Logger.Info<SyncSocketSession>($"Received publishing record response requestId = {requestId}.");
+
                     if (_pendingPublishRequests.TryRemove(requestId, out var tcs))
                     {
                         if (statusCode == 0)
@@ -1171,7 +1191,9 @@ public class SyncSocketSession : IDisposable
                     span = span.Slice(1);
                     byte subOp = span[0];
                     span = span.Slice(1);
-                    var syncStream = new SyncStream(expectedSize, (Opcode)op, subOp);
+                    ContentEncoding contentEncoding = (ContentEncoding)span[0];
+                    span = span.Slice(1);
+                    var syncStream = new SyncStream(expectedSize, (Opcode)op, subOp, contentEncoding);
                     if (span.Length > 0)
                         syncStream.Add(span);
                     lock (_syncStreams)
@@ -1223,7 +1245,7 @@ public class SyncSocketSession : IDisposable
                         if (!syncStream.IsComplete)
                             throw new Exception("After sync stream end, the stream must be complete");
 
-                        HandlePacket(syncStream.Opcode, syncStream.SubOpcode, syncStream.GetBytes(), sourceChannel);
+                        HandlePacket(syncStream.Opcode, syncStream.SubOpcode, syncStream.GetBytes(), syncStream.ContentEncoding, sourceChannel);
                     }
                     finally
                     {
@@ -1250,10 +1272,23 @@ public class SyncSocketSession : IDisposable
         }
     }
 
-    private void HandlePacket(Opcode opcode, byte subOpcode, ReadOnlySpan<byte> data, ChannelRelayed? sourceChannel = null)
+    private void HandlePacket(Opcode opcode, byte subOpcode, ReadOnlySpan<byte> data, ContentEncoding contentEncoding, ChannelRelayed? sourceChannel = null)
     {
         if (Logger.WillLog(LogLevel.Debug))
-            Logger.Debug<SyncSocketSession>($"HandlePacket (opcode = {opcode}, subOpcode = {subOpcode}, data.length = {data.Length}, sourceChannel.ConnectionId = {sourceChannel?.ConnectionId})");
+            Logger.Debug<SyncSocketSession>($"HandlePacket (opcode = {opcode}, subOpcode = {subOpcode}, data.length = {data.Length}, contentEncoding = {contentEncoding}, sourceChannel.ConnectionId = {sourceChannel?.ConnectionId})");
+
+        if (contentEncoding == ContentEncoding.Gzip)
+        {
+            using (var compressedStream = new MemoryStream(data.ToArray()))
+            using (var decompressedStream = new MemoryStream())
+            {
+                using (var gzipStream = new GZipStream(compressedStream, CompressionMode.Decompress))
+                {
+                    gzipStream.CopyTo(decompressedStream);
+                }
+                data = decompressedStream.ToArray();
+            }
+        }
 
         switch (opcode)
         {
@@ -1733,7 +1768,7 @@ public class SyncSocketSession : IDisposable
         return await tcs.Task;
     }
 
-    public async Task<bool> PublishRecordAsync(string consumerPublicKey, string key, byte[] data, CancellationToken cancellationToken = default)
+    public async Task<bool> PublishRecordAsync(string consumerPublicKey, string key, byte[] data, ContentEncoding contentEncoding = ContentEncoding.Raw, CancellationToken cancellationToken = default)
     {
         var keyBytes = Encoding.UTF8.GetBytes(key);
         if (string.IsNullOrEmpty(key) || keyBytes.Length > 32)
@@ -1808,7 +1843,8 @@ public class SyncSocketSession : IDisposable
             }
 
             ArrayPool<byte>.Shared.Return(encryptedChunkBuffer);
-            await SendAsync(Opcode.REQUEST, (byte)RequestOpcode.PUBLISH_RECORD, packet, cancellationToken: cancellationToken);
+            Logger.Verbose<SyncSocketSession>($"Sent publish request with requestId {requestId}");
+            await SendAsync(Opcode.REQUEST, (byte)RequestOpcode.PUBLISH_RECORD, packet, contentEncoding: contentEncoding, cancellationToken: cancellationToken);
         }
         catch (Exception ex)
         {
@@ -2141,5 +2177,5 @@ public class SyncSocketSession : IDisposable
 
     public const int MAXIMUM_PACKET_SIZE = 65535 - 16;
     public const int MAXIMUM_PACKET_SIZE_ENCRYPTED = MAXIMUM_PACKET_SIZE + 16;
-    public const int HEADER_SIZE = 6;
+    public const int HEADER_SIZE = 7;
 }

@@ -1,9 +1,12 @@
 ﻿using System.Buffers;
 using System.Buffers.Binary;
 using System.Diagnostics;
+using System.Drawing;
+using System.IO.Compression;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using Noise;
 using SyncShared;
@@ -29,7 +32,7 @@ public class SyncSession
         WaitingForData
     }
 
-    public const int HEADER_SIZE = 6;
+    public const int HEADER_SIZE = 7;
     public const int MAXIMUM_PACKET_SIZE = 65535 - 16;
     public const int MAXIMUM_PACKET_SIZE_ENCRYPTED = MAXIMUM_PACKET_SIZE + 16;
     private const long KV_STORAGE_LIMIT_PER_PUBLISHER = 10 * 1024 * 1024; // 10MB
@@ -96,7 +99,7 @@ public class SyncSession
         }
 
         if (Logger.WillLog(LogLevel.Debug))
-            Logger.Debug<SyncSession>($"Received {totalBytesReceived} bytes.\n{Utilities.HexDump(buffer.AsSpan().Slice(0, totalBytesReceived))}");
+            Logger.Debug<SyncSession>($"Received {totalBytesReceived} bytes.");
     }
 
     public void Start()
@@ -252,7 +255,9 @@ public class SyncSession
                     span = span.Slice(1);
                     byte subOp = span[0];
                     span = span.Slice(1);
-                    var syncStream = new SyncStream(expectedSize, (Opcode)op, subOp);
+                    ContentEncoding contentEncoding = (ContentEncoding)span[0];
+                    span = span.Slice(1);
+                    var syncStream = new SyncStream(expectedSize, (Opcode)op, subOp, contentEncoding);
                     if (span.Length > 0)
                         syncStream.Add(span);
                     lock (_syncStreams)
@@ -307,7 +312,7 @@ public class SyncSession
                         syncStream.Add(span);
                     if (!syncStream.IsComplete)
                         throw new Exception("After sync stream end, the stream must be complete");
-                    await HandleDecryptedPacketAsync(syncStream.Opcode, syncStream.SubOpcode, syncStream.GetBytes());
+                    await HandleDecryptedPacketAsync(syncStream.Opcode, syncStream.SubOpcode, syncStream.GetBytes(), syncStream.ContentEncoding);
                     break;
                 }
         }
@@ -471,7 +476,7 @@ public class SyncSession
                                 writer.Write(record.EncryptedBlob);
                                 writer.Write(record.Timestamp.ToBinary());
                             }
-                            await SendAsync(Opcode.RESPONSE, (byte)ResponseOpcode.BULK_GET_RECORD, ms.ToArray());
+                            await SendAsync(Opcode.RESPONSE, (byte)ResponseOpcode.BULK_GET_RECORD, ms.ToArray(), ContentEncoding.Gzip);
                         }
                         catch (Exception ex)
                         {
@@ -607,8 +612,21 @@ public class SyncSession
         }
     }
 
-    private async ValueTask HandleDecryptedPacketAsync(Opcode opcode, byte subOpcode, ArraySegment<byte> data)
+    private async ValueTask HandleDecryptedPacketAsync(Opcode opcode, byte subOpcode, ArraySegment<byte> data, ContentEncoding contentEncoding)
     {
+        if (contentEncoding == ContentEncoding.Gzip)
+        {
+            using (var compressedStream = new MemoryStream(data.Array!, data.Offset, data.Count))
+            using (var decompressedStream = new MemoryStream())
+            {
+                using (var gzipStream = new GZipStream(compressedStream, CompressionMode.Decompress))
+                {
+                    gzipStream.CopyTo(decompressedStream);
+                }
+                data = decompressedStream.ToArray();
+            }
+        }
+
         switch (opcode)
         {
             case Opcode.STREAM:
@@ -643,11 +661,12 @@ public class SyncSession
 
         Opcode opcode = (Opcode)data[4];
         byte subOpcode = data[5];
-        var packetData = data.Slice(6);
+        ContentEncoding contentEncoding = (ContentEncoding)data[6];
+        var packetData = data.Slice(HEADER_SIZE);
 
         if (Logger.WillLog(LogLevel.Debug))
             Logger.Debug<SyncSession>($"HandleDecryptedPacket (opcode = {opcode}, subOpcode = {subOpcode}, size = {packetData.Count})");
-        await HandleDecryptedPacketAsync(opcode, subOpcode, packetData);
+        await HandleDecryptedPacketAsync(opcode, subOpcode, packetData, contentEncoding);
     }
 
     private async ValueTask ForwardRelayDataAsync(ArraySegment<byte> data)
@@ -1138,6 +1157,8 @@ public class SyncSession
 
     private async ValueTask HandleRequestPublishRecordAsync(int requestId, ArraySegment<byte> data)
     {
+        Logger.Verbose<SyncSession>($"Received publish request with requestId {requestId}");
+
         Interlocked.Increment(ref _server.Metrics.TotalPublishRecordRequests);
 
         if (data.Count < 37)
@@ -1191,6 +1212,7 @@ public class SyncSession
                 Interlocked.Add(ref _server.Metrics.TotalPublishRecordTimeMs, stopwatch.ElapsedMilliseconds);
                 Interlocked.Increment(ref _server.Metrics.PublishRecordCount);
                 Interlocked.Increment(ref _server.Metrics.TotalPublishRecordSuccesses);
+                Logger.Verbose<SyncSession>($"Publish request succeeded with requestId {requestId}");
                 await SendEmptyResponseAsync(ResponseOpcode.PUBLISH_RECORD, requestId, (int)PublishRecordResponseCode.Success);
             }
             catch (Exception ex)
@@ -1200,6 +1222,7 @@ public class SyncSession
                 Interlocked.Increment(ref _server.Metrics.PublishRecordCount);
                 Interlocked.Increment(ref _server.Metrics.TotalPublishRecordFailures);
                 Logger.Error<SyncSession>("Error publishing record", ex);
+                Logger.Verbose<SyncSession>($"Publish request failed with requestId {requestId}");
                 await SendEmptyResponseAsync(ResponseOpcode.PUBLISH_RECORD, requestId, (int)PublishRecordResponseCode.GeneralError);
             }
         });
@@ -1419,7 +1442,7 @@ public class SyncSession
 
     public async ValueTask SendAsync(Opcode opcode, byte subOpcode)
     {
-        var decryptedSize = 4 + 1 + 1;
+        var decryptedSize = HEADER_SIZE;
         var encryptedSize = decryptedSize + 4 + 16;
         byte[] decryptedPacket = Utilities.RentBytes(decryptedSize);
         byte[] encryptedPacket = Utilities.RentBytes(encryptedSize);
@@ -1431,6 +1454,7 @@ public class SyncSession
                 BinaryPrimitives.WriteInt32LittleEndian(decryptedPacket.AsSpan(0, 4), decryptedSize - 4);
                 decryptedPacket[4] = (byte)opcode;
                 decryptedPacket[5] = (byte)subOpcode;
+                decryptedPacket[6] = (byte)ContentEncoding.Raw;
 
                 if (Logger.WillLog(LogLevel.Debug))
                     Logger.Debug<SyncSession>($"Send (opcode = {opcode}, subOpcode = {subOpcode}, size = 0)");
@@ -1465,12 +1489,25 @@ public class SyncSession
         }
     }
 
-    public async ValueTask SendAsync(Opcode opcode, byte subOpcode, ArraySegment<byte> data)
+    public async ValueTask SendAsync(Opcode opcode, byte subOpcode, ArraySegment<byte> data, ContentEncoding contentEncoding = ContentEncoding.Raw, CancellationToken cancellationToken = default)
     {
         if (Logger.WillLog(LogLevel.Debug))
             Logger.Debug<SyncSession>($"Send (opcode = {opcode}, subOpcode = {subOpcode}, size = {data.Count})");
 
-        if (data.Count + HEADER_SIZE > MAXIMUM_PACKET_SIZE)
+        ArraySegment<byte> processedData = data;
+        if (contentEncoding == ContentEncoding.Gzip)
+        {
+            using (var compressedStream = new MemoryStream())
+            {
+                using (var gzipStream = new GZipStream(compressedStream, CompressionMode.Compress))
+                {
+                    await gzipStream.WriteAsync(data.AsMemory(data.Offset, data.Count), cancellationToken);
+                }
+                processedData = compressedStream.ToArray();
+            }
+        }
+
+        if (processedData.Count + HEADER_SIZE > MAXIMUM_PACKET_SIZE)
         {
             var segmentSize = MAXIMUM_PACKET_SIZE - HEADER_SIZE;
             var segmentData = Utilities.RentBytes(segmentSize);
@@ -1478,9 +1515,9 @@ public class SyncSession
             {
                 var id = Interlocked.Increment(ref _streamIdGenerator);
 
-                for (var sendOffset = 0; sendOffset < data.Count;)
+                for (var sendOffset = 0; sendOffset < processedData.Count;)
                 {
-                    var bytesRemaining = data.Count - sendOffset;
+                    var bytesRemaining = processedData.Count - sendOffset;
                     int bytesToSend;
                     int segmentPacketSize;
 
@@ -1488,8 +1525,8 @@ public class SyncSession
                     if (sendOffset == 0)
                     {
                         op = StreamOpcode.START;
-                        bytesToSend = segmentSize - 4 - 4 - 1 - 1;
-                        segmentPacketSize = bytesToSend + 4 + 4 + 1 + 1;
+                        bytesToSend = segmentSize - 4 - HEADER_SIZE;
+                        segmentPacketSize = bytesToSend + 4 + HEADER_SIZE;
                     }
                     else
                     {
@@ -1507,21 +1544,22 @@ public class SyncSession
                     {
                         //TODO: replace segmentData.AsSpan() into a local variable once C# 13
                         BinaryPrimitives.WriteInt32LittleEndian(segmentData.AsSpan().Slice(0, 4), id);
-                        BinaryPrimitives.WriteInt32LittleEndian(segmentData.AsSpan().Slice(4, 4), data.Count);
+                        BinaryPrimitives.WriteInt32LittleEndian(segmentData.AsSpan().Slice(4, 4), processedData.Count);
                         segmentData[8] = (byte)opcode;
                         segmentData[9] = (byte)subOpcode;
-                        data.Slice(sendOffset, bytesToSend).CopyTo(segmentDataSegment.Slice(10));
+                        segmentData[10] = (byte)contentEncoding;
+                        processedData.Slice(sendOffset, bytesToSend).CopyTo(segmentDataSegment.Slice(4 + HEADER_SIZE));
                     }
                     else
                     {
                         //TODO: replace segmentData.AsSpan() into a local variable once C# 13
                         BinaryPrimitives.WriteInt32LittleEndian(segmentData.AsSpan().Slice(0, 4), id);
                         BinaryPrimitives.WriteInt32LittleEndian(segmentData.AsSpan().Slice(4, 4), sendOffset);
-                        data.Slice(sendOffset, bytesToSend).CopyTo(segmentDataSegment.Slice(8));
+                        processedData.Slice(sendOffset, bytesToSend).CopyTo(segmentDataSegment.Slice(8));
                     }
 
                     sendOffset += bytesToSend;
-                    await SendAsync(Opcode.STREAM, (byte)op, segmentDataSegment.Slice(0, segmentPacketSize));
+                    await SendAsync(Opcode.STREAM, (byte)op, segmentDataSegment.Slice(0, segmentPacketSize), ContentEncoding.Raw, cancellationToken);
                 }
             }
             finally
@@ -1531,7 +1569,7 @@ public class SyncSession
         }
         else
         {
-            var decryptedSize = 4 + 1 + 1 + data.Count;
+            var decryptedSize = HEADER_SIZE + processedData.Count;
             var encryptedSize = decryptedSize + 4 + 16;
             byte[] decryptedPacket = Utilities.RentBytes(decryptedSize);
             byte[] encryptedPacket = Utilities.RentBytes(encryptedSize);
@@ -1543,7 +1581,8 @@ public class SyncSession
                     BinaryPrimitives.WriteInt32LittleEndian(decryptedPacket.AsSpan().Slice(0, 4), decryptedSize - 4);
                     decryptedPacket[4] = (byte)opcode;
                     decryptedPacket[5] = (byte)subOpcode;
-                    data.CopyTo(new ArraySegment<byte>(decryptedPacket).Slice(HEADER_SIZE));
+                    decryptedPacket[6] = (byte)ContentEncoding.Raw;
+                    processedData.CopyTo(new ArraySegment<byte>(decryptedPacket).Slice(HEADER_SIZE));
                 }
                 finally
                 {
@@ -1551,15 +1590,15 @@ public class SyncSession
                 }
 
                 if (Logger.WillLog(LogLevel.Debug))
-                    Logger.Debug<SyncSession>($"Encrypted message bytes {data.Count + HEADER_SIZE}");
+                    Logger.Debug<SyncSession>($"Encrypted message bytes {processedData.Count + HEADER_SIZE}");
 
                 try
                 {
-                    await _sendSemaphore.WaitAsync();
+                    await _sendSemaphore.WaitAsync(cancellationToken);
 
-                    var len = Encrypt(decryptedPacket.AsSpan().Slice(0, data.Count + HEADER_SIZE), encryptedPacket.AsSpan().Slice(4));
+                    var len = Encrypt(decryptedPacket.AsSpan().Slice(0, processedData.Count + HEADER_SIZE), encryptedPacket.AsSpan().Slice(4));
                     BinaryPrimitives.WriteInt32LittleEndian(encryptedPacket.AsSpan().Slice(0, 4), len);
-                    await SendAsync(encryptedPacket, 0, encryptedSize);
+                    await SendAsync(encryptedPacket, 0, encryptedSize, cancellationToken);
 
                     if (Logger.WillLog(LogLevel.Debug))
                         Logger.Debug<SyncSession>($"Wrote message bytes {len}");
@@ -1576,13 +1615,13 @@ public class SyncSession
         }
     }
 
-    public async ValueTask SendAsync(Opcode opcode, byte subOpcode = 0, byte[]? data = null, int offset = 0, int count = -1)
+    public async ValueTask SendAsync(Opcode opcode, byte subOpcode = 0, byte[]? data = null, int offset = 0, int count = -1, ContentEncoding contentEncoding = ContentEncoding.Raw, CancellationToken cancellationToken = default)
     {
         if (count == -1)
             count = data?.Length ?? 0;
 
         if (data != null)
-            await SendAsync(opcode, subOpcode, new ArraySegment<byte>(data, offset, count));
+            await SendAsync(opcode, subOpcode, new ArraySegment<byte>(data, offset, count), contentEncoding, cancellationToken);
         else
             await SendAsync(opcode, subOpcode);
     }
@@ -1591,7 +1630,7 @@ public class SyncSession
     {
         int encryptedLength = _transport!.WriteMessage(source, destination);
         if (Logger.WillLog(LogLevel.Debug))
-            Logger.Debug<SyncSession>($"Encrypted message bytes (source size: {source.Length}, destination size: {encryptedLength})\n{Utilities.HexDump(source)}");
+            Logger.Debug<SyncSession>($"Encrypted message bytes (source size: {source.Length}, destination size: {encryptedLength})");
         return encryptedLength;
     }
 
@@ -1599,7 +1638,7 @@ public class SyncSession
     {
         int plen = _transport!.ReadMessage(source, destination);
         if (Logger.WillLog(LogLevel.Debug))
-            Logger.Debug<SyncSession>($"Decrypted message bytes (source size: {source.Length}, destination size: {plen})\n{Utilities.HexDump(destination.Slice(0, plen))}");
+            Logger.Debug<SyncSession>($"Decrypted message bytes (source size: {source.Length}, destination size: {plen})");
         return plen;
     }
 
@@ -1607,7 +1646,7 @@ public class SyncSession
     private async ValueTask SendAsync(byte[] data, int offset, int count, CancellationToken cancellationToken = default)
     {
         if (Logger.WillLog(LogLevel.Debug))
-            Logger.Debug<SyncSession>($"Sending {count} bytes.\n{Utilities.HexDump(data.AsSpan().Slice(offset, count))}");
+            Logger.Debug<SyncSession>($"Sending {count} bytes.");
 
         Stopwatch? sw = null;
         if (Logger.WillLog(LogLevel.Debug))
@@ -1634,6 +1673,8 @@ public class SyncSession
 
     private async ValueTask SendEmptyResponseAsync(ResponseOpcode responseOpcode, int requestId, int statusCode)
     {
+        Logger.Verbose<SyncSession>("SendEmptyResponse with requestId = " + requestId);
+
         byte[] responseData = Utilities.RentBytes(12);
         try
         {
