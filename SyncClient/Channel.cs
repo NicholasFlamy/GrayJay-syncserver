@@ -62,7 +62,7 @@ public class ChannelSocket : IChannel
     public async Task SendAsync(Opcode opcode, byte subOpcode, byte[]? data = null, int offset = 0, int count = -1, ContentEncoding contentEncoding = ContentEncoding.Raw, CancellationToken cancellationToken = default)
     {
         if (data != null)
-            await _session.SendAsync(opcode, subOpcode, data, offset, count, cancellationToken: cancellationToken);
+            await _session.SendAsync(opcode, subOpcode, data, offset, count, contentEncoding: contentEncoding, cancellationToken: cancellationToken);
         else
             await _session.SendAsync(opcode, subOpcode, cancellationToken: cancellationToken);
     }
