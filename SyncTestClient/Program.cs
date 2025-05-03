@@ -49,7 +49,7 @@ internal class Program
         {
             KeyPair keyPair = KeyPair.Generate(); // Generate in-memory key pair
             keyPairs.Add(keyPair);
-            var socket = new TcpClient("relay.grayjay.app", 9000); // Connect to server
+            var socket = Utilities.OpenTcpSocket("relay.grayjay.app", 9000); // Connect to server
             //var socket = new TcpClient("127.0.0.1", 9000); // Connect to server
             var session = CreateSocketSession(socket, keyPair, ServerPublicKey, sessionToPeer);
             sessions.Add(session);
@@ -87,17 +87,16 @@ internal class Program
     /// Creates a socket session with handlers for handshake, data, and channel events.
     /// </summary>
     private static SyncSocketSession CreateSocketSession(
-        TcpClient socket,
+        Socket socket,
         KeyPair keyPair,
         string serverPublicKey,
         Dictionary<SyncSocketSession, string> sessionToPeer)
     {
         var publicKey = Convert.ToBase64String(keyPair.PublicKey);
         var socketSession = new SyncSocketSession(
-            (socket.Client.RemoteEndPoint as System.Net.IPEndPoint)!.Address.ToString(),
+            (socket.RemoteEndPoint as System.Net.IPEndPoint)!.Address.ToString(),
             keyPair,
-            socket.GetStream(),
-            socket.GetStream(),
+            socket,
             onClose: s => { Metrics.Disconnections.Add(s.LocalPublicKey); }, // Track disconnections
             onHandshakeComplete: s =>
             {

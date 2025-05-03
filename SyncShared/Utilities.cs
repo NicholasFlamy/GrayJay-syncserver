@@ -1,5 +1,7 @@
 ﻿using System.Buffers;
 using System.Collections.Concurrent;
+using System.Net.Sockets;
+using System.Net;
 using System.Text;
 
 namespace SyncShared;
@@ -97,5 +99,33 @@ public static class Utilities
             Logger.Debug(nameof(Utilities), $"Returned {rentedBytes.Length} bytes (total rented: {TotalRented}, total returned: {TotalReturned}, delta: {TotalRented - TotalReturned})");
 //#endif
         }
+    }
+
+    public static Socket OpenTcpSocket(string host, int port)
+    {
+        IPHostEntry hostEntry = Dns.GetHostEntry(host);
+        var addresses = hostEntry.AddressList.OrderBy(a => a.AddressFamily == AddressFamily.InterNetwork ? 0 : 1).ToArray();
+
+        foreach (IPAddress address in addresses)
+        {
+            try
+            {
+                Socket socket = new Socket(
+                    address.AddressFamily,
+                    SocketType.Stream,
+                    ProtocolType.Tcp
+                );
+
+                socket.Connect(new IPEndPoint(address, port));
+                Console.WriteLine($"Connected to {host}:{port} using {address.AddressFamily}");
+                return socket;
+            }
+            catch
+            {
+                //Ignored
+            }
+        }
+
+        throw new Exception($"Could not connect to {host}:{port}");
     }
 }

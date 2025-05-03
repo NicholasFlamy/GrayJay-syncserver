@@ -36,15 +36,13 @@ namespace SyncServerTests
             uint appId = 0)
         {
             var keyPair = KeyPair.Generate();
-            var tcpClient = new TcpClient();
-            await tcpClient.ConnectAsync("127.0.0.1", port);
+            var socket = Utilities.OpenTcpSocket("127.0.0.1", port);
             var tcs = new TaskCompletionSource<bool>();
             var socketSession = new SyncSocketSession(
                 "127.0.0.1",
                 keyPair,
-                tcpClient.GetStream(),
-                tcpClient.GetStream(),
-                onClose: s => { tcpClient.Close(); },
+                socket,
+                onClose: s => { socket.Close(); },
                 onHandshakeComplete: s =>
                 {
                     onHandshakeComplete?.Invoke(s);
@@ -83,15 +81,12 @@ namespace SyncServerTests
             {
                 var incorrectPublicKey = Convert.ToBase64String(KeyPair.Generate().PublicKey);
                 var keyPair = KeyPair.Generate();
-                var tcpClient = new TcpClient();
-                await tcpClient.ConnectAsync("127.0.0.1", port);
-                var stream = tcpClient.GetStream();
+                var socket = Utilities.OpenTcpSocket("127.0.0.1", port);
                 var tcs = new TaskCompletionSource<bool>();
                 var socketSession = new SyncSocketSession(
                     "127.0.0.1",
                     keyPair,
-                    stream,
-                    stream,
+                    socket,
                     onClose: s => tcs.TrySetResult(true),
                     onHandshakeComplete: s => tcs.TrySetResult(false),
                     onData: (s, o, so, d) => { },
