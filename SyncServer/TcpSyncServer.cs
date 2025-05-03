@@ -288,9 +288,9 @@ public class TcpSyncServer : IDisposable
 
         _ = Task.Run(async () =>
         {
-            while (true)
+            try
             {
-                try
+                while (true)
                 {
                     _maxConnections.Wait();
                     var clientSocket = await _listenSocket.AcceptAsync();
@@ -301,27 +301,35 @@ public class TcpSyncServer : IDisposable
                         return;
                     }
 
-                    clientSocket.ReceiveBufferSize = MAXIMUM_PACKET_SIZE_ENCRYPTED;
-                    clientSocket.SendBufferSize = MAXIMUM_PACKET_SIZE_ENCRYPTED;
-                    clientSocket.NoDelay = true;
-
-                    var session = new SyncSession(this, (s) => _sessions[s.RemotePublicKey!] = s, OnSessionClosed, _useRateLimits)
+                    try
                     {
-                        Socket = clientSocket,
-                        HandshakeState = NoiseProtocol.Create(false, s: _keyPair.PrivateKey)
-                    };
-                    _clients.TryAdd(clientSocket, session);
-                    Interlocked.Increment(ref Metrics.TotalConnectionsAccepted);
-                    Interlocked.Increment(ref Metrics.ActiveConnections);
+                        clientSocket.ReceiveBufferSize = MAXIMUM_PACKET_SIZE_ENCRYPTED;
+                        clientSocket.SendBufferSize = MAXIMUM_PACKET_SIZE_ENCRYPTED;
+                        clientSocket.NoDelay = true;
 
-                    Logger.Info<TcpSyncServer>($"Client connected: {clientSocket.RemoteEndPoint}");
-                    session.Start();
+                        var session = new SyncSession(this, (s) => _sessions[s.RemotePublicKey!] = s, OnSessionClosed, _useRateLimits)
+                        {
+                            Socket = clientSocket,
+                            HandshakeState = NoiseProtocol.Create(false, s: _keyPair.PrivateKey)
+                        };
+                        _clients.TryAdd(clientSocket, session);
+                        Interlocked.Increment(ref Metrics.TotalConnectionsAccepted);
+                        Interlocked.Increment(ref Metrics.ActiveConnections);
+
+                        Logger.Info<TcpSyncServer>($"Client connected: {clientSocket.RemoteEndPoint}");
+                        session.Start();
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.Error<TcpSyncServer>($"Accept processing error", ex);
+                        _maxConnections.Release();
+                    }
                 }
-                catch (Exception ex)
-                {
-                    Logger.Error<TcpSyncServer>($"Accept processing error", ex);
-                    _maxConnections.Release();
-                }
+            }
+            catch (Exception e)
+            {
+                Logger.Error<TcpSyncServer>($"Unhandled exception in listening socket", e);
+                Dispose();
             }
         });
     }

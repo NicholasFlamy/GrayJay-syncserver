@@ -1,6 +1,7 @@
 ﻿using Noise;
 using SyncShared;
 using System.Buffers.Binary;
+using System.Drawing;
 using System.IO.Compression;
 using System.Text;
 namespace SyncClient;
@@ -220,15 +221,24 @@ public class ChannelRelayed : IChannel
         byte[]? processedData = data;
         if (data != null && contentEncoding == ContentEncoding.Gzip)
         {
-            using (var compressedStream = new MemoryStream())
+            var isGzipSupported = opcode == Opcode.DATA;
+            if (isGzipSupported)
             {
-                using (var gzipStream = new GZipStream(compressedStream, CompressionMode.Compress))
+                using (var compressedStream = new MemoryStream())
                 {
-                    await gzipStream.WriteAsync(data.AsMemory(offset, count), cancellationToken);
+                    using (var gzipStream = new GZipStream(compressedStream, CompressionMode.Compress))
+                    {
+                        await gzipStream.WriteAsync(data.AsMemory(offset, count), cancellationToken);
+                    }
+                    processedData = compressedStream.ToArray();
+                    count = processedData.Length;
+                    offset = 0;
                 }
-                processedData = compressedStream.ToArray();
-                count = processedData.Length;
-                offset = 0;
+            }
+            else
+            {
+                Logger.Warning<SyncSocketSession>($"Gzip requested but not supported on this (opcode = {opcode}, subOpcode = {subOpcode}), falling back.");
+                contentEncoding = ContentEncoding.Raw;
             }
         }
 

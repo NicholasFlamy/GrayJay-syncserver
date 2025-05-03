@@ -9,6 +9,8 @@ using System.Collections.Concurrent;
 using System.Buffers;
 using System.Diagnostics;
 using System.IO.Compression;
+using System.Drawing;
+using System.Threading;
 
 namespace SyncClient;
 
@@ -371,14 +373,23 @@ public class SyncSocketSession : IDisposable
 
         if (contentEncoding == ContentEncoding.Gzip)
         {
-            using (var compressedStream = new MemoryStream())
+            var isGzipSupported = opcode == (byte)Opcode.DATA;
+            if (isGzipSupported)
             {
-                using (var gzipStream = new GZipStream(compressedStream, CompressionMode.Compress))
+                using (var compressedStream = new MemoryStream())
                 {
-                    await gzipStream.WriteAsync(data.AsMemory(offset, size), cancellationToken);
+                    using (var gzipStream = new GZipStream(compressedStream, CompressionMode.Compress))
+                    {
+                        await gzipStream.WriteAsync(data.AsMemory(offset, size), cancellationToken);
+                    }
+                    processedData = compressedStream.ToArray();
+                    processedSize = processedData.Length;
                 }
-                processedData = compressedStream.ToArray();
-                processedSize = processedData.Length;
+            }
+            else
+            {
+                Logger.Warning<SyncSocketSession>($"Gzip requested but not supported on this (opcode = {opcode}, subOpcode = {subOpcode}), falling back.");
+                contentEncoding = ContentEncoding.Raw;
             }
         }
 
@@ -1279,6 +1290,10 @@ public class SyncSocketSession : IDisposable
 
         if (contentEncoding == ContentEncoding.Gzip)
         {
+            var isGzipSupported = opcode == Opcode.DATA;
+            if (!isGzipSupported)
+                throw new Exception($"Failed to handle packet, gzip is not supported for this opcode (opcode = {opcode}, subOpcode = {subOpcode}, data.length = {data.Length}).");
+
             using (var compressedStream = new MemoryStream(data.ToArray()))
             using (var decompressedStream = new MemoryStream())
             {

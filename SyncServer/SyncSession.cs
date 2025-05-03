@@ -476,7 +476,7 @@ public class SyncSession
                                 writer.Write(record.EncryptedBlob);
                                 writer.Write(record.Timestamp.ToBinary());
                             }
-                            await SendAsync(Opcode.RESPONSE, (byte)ResponseOpcode.BULK_GET_RECORD, ms.ToArray(), ContentEncoding.Gzip);
+                            await SendAsync(Opcode.RESPONSE, (byte)ResponseOpcode.BULK_GET_RECORD, ms.ToArray());
                         }
                         catch (Exception ex)
                         {
@@ -616,6 +616,10 @@ public class SyncSession
     {
         if (contentEncoding == ContentEncoding.Gzip)
         {
+            var isGzipSupported = opcode == Opcode.DATA;
+            if (!isGzipSupported)
+                throw new Exception($"Failed to handle packet, gzip is not supported for this opcode (opcode = {opcode}, subOpcode = {subOpcode}, data.length = {data.Count}).");
+
             using (var compressedStream = new MemoryStream(data.Array!, data.Offset, data.Count))
             using (var decompressedStream = new MemoryStream())
             {
@@ -1497,13 +1501,22 @@ public class SyncSession
         ArraySegment<byte> processedData = data;
         if (contentEncoding == ContentEncoding.Gzip)
         {
-            using (var compressedStream = new MemoryStream())
+            var isGzipSupported = opcode == Opcode.DATA;
+            if (isGzipSupported)
             {
-                using (var gzipStream = new GZipStream(compressedStream, CompressionMode.Compress))
+                using (var compressedStream = new MemoryStream())
                 {
-                    await gzipStream.WriteAsync(data.AsMemory(data.Offset, data.Count), cancellationToken);
+                    using (var gzipStream = new GZipStream(compressedStream, CompressionMode.Compress))
+                    {
+                        await gzipStream.WriteAsync(data.AsMemory(data.Offset, data.Count), cancellationToken);
+                    }
+                    processedData = compressedStream.ToArray();
                 }
-                processedData = compressedStream.ToArray();
+            }
+            else
+            {
+                Logger.Warning<SyncSession>($"Gzip requested but not supported on this (opcode = {opcode}, subOpcode = {subOpcode}), falling back.");
+                contentEncoding = ContentEncoding.Raw;
             }
         }
 
