@@ -302,6 +302,9 @@ public class TcpSyncServer : IDisposable
                         return;
                     }
 
+                    clientSocket.ReceiveBufferSize = 8 * 1024;
+                    clientSocket.SendBufferSize = 8 * 1024;
+
                     var session = new SyncSession(this, (s) => _sessions[s.RemotePublicKey!] = s, OnSessionClosed, _useRateLimits)
                     {
                         Socket = clientSocket,
@@ -421,7 +424,7 @@ public class TcpSyncServer : IDisposable
     {
         var bucket = _ipTokenBuckets.GetOrAdd(
             $"{ipAddress}:relay_data",
-            _ => new TokenBucket(100_000_000, 100_000)
+            _ => new TokenBucket(200_000_000, 200_000)
         );
         return bucket.TryConsume(dataSize);
     }
@@ -430,7 +433,7 @@ public class TcpSyncServer : IDisposable
     {
         var bucket = _connectionTokenBuckets.GetOrAdd(
             connectionId,
-            _ => new TokenBucket(10_000_000, 10_000)
+            _ => new TokenBucket(20_000_000, 20_000)
         );
         return bucket.TryConsume(dataSize);
     }

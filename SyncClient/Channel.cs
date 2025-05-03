@@ -1,7 +1,6 @@
 ﻿using Noise;
 using SyncShared;
 using System.Buffers.Binary;
-using System.Net.Sockets;
 using System.Text;
 namespace SyncClient;
 
@@ -274,6 +273,7 @@ public class ChannelRelayed : IChannel
             packet[5] = subOpcode;
             if (count > 0 && data != null)
                 Array.Copy(data, offset, packet, HEADER_SIZE, count);
+
             await SendPacketAsync(packet, cancellationToken);
         }
     }

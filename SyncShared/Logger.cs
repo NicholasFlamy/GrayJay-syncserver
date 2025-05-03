@@ -29,7 +29,7 @@ public static class Logger
 #endif
     };
 
-    public const LogLevel DefaultLogLevel = LogLevel.Error;
+    public const LogLevel DefaultLogLevel = LogLevel.Verbose;
     public static Func<LogLevel, bool> WillLog = (level) => (int)level <= (int)DefaultLogLevel;
     //public static Func<LogLevel, bool> WillLog = (level) => false;
 

@@ -39,8 +39,8 @@ public class SyncSession
     public required HandshakeState HandshakeState { get; init; }
     public string? RemotePublicKey { get; private set; }
     public int RemoteVersion { get; private set; } = -1;
-    private byte[] _sessionBuffer = new byte[1024];
-    private byte[] _decryptionBuffer = new byte[1024];
+    private byte[] _sessionBuffer = new byte[8 * 1024];
+    private byte[] _decryptionBuffer = new byte[8 * 1024];
     private readonly TcpSyncServer _server;
     private Transport? _transport;
     private Action<SyncSession> _onHandshakeComplete;
@@ -75,14 +75,23 @@ public class SyncSession
         }
     }
 
-    private async ValueTask ReceiveExactAsync(byte[] buffer, int offset, int size)
+    private async ValueTask ReceiveExactAsync(byte[] buffer, int offset, int size, CancellationToken cancellationToken = default)
     {
+        Stopwatch? sw = null;
+        if (Logger.WillLog(LogLevel.Debug))
+            sw = new Stopwatch();
+
         int totalBytesReceived = 0;
         while (totalBytesReceived < size)
         {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            sw?.Restart();
             int bytesReceived = await Socket.ReceiveAsync(new ArraySegment<byte>(buffer, offset + totalBytesReceived, size - totalBytesReceived));
             if (bytesReceived == 0)
                 throw new Exception("Connection closed");
+            if (Logger.WillLog(LogLevel.Debug))
+                Logger.Debug<SyncSession>($"Receive duration ({bytesReceived}/{size} bytes), requested {size - totalBytesReceived} bytes: {sw?.ElapsedMilliseconds}ms");
             totalBytesReceived += bytesReceived;
         }
 
@@ -104,8 +113,8 @@ public class SyncSession
 
                 await ReceiveExactAsync(_sessionBuffer, 0, 4);
                 int handshakeSize = BinaryPrimitives.ReadInt32LittleEndian(_sessionBuffer.AsSpan(0, 4));
-                if (handshakeSize > 1024)
-                    throw new Exception("Handshake size should be less than 1024 bytes.");
+                if (handshakeSize > _sessionBuffer.Length)
+                    throw new Exception($"Handshake size should be less than {_sessionBuffer.Length} bytes.");
 
                 await ReceiveExactAsync(_sessionBuffer, 0, handshakeSize);
                 Logger.Info<SyncSession>($"HandshakeAsResponder: Received handshake message ({handshakeSize} bytes)");
@@ -636,8 +645,8 @@ public class SyncSession
         byte subOpcode = data[5];
         var packetData = data.Slice(6);
 
-        if (Logger.WillLog(LogLevel.Verbose))
-            Logger.Verbose<SyncSession>($"HandleDecryptedPacket (opcode = {opcode}, subOpcode = {subOpcode}, size = {packetData.Count})");
+        if (Logger.WillLog(LogLevel.Debug))
+            Logger.Debug<SyncSession>($"HandleDecryptedPacket (opcode = {opcode}, subOpcode = {subOpcode}, size = {packetData.Count})");
         await HandleDecryptedPacketAsync(opcode, subOpcode, packetData);
     }
 
@@ -933,7 +942,7 @@ public class SyncSession
             _server.StoreConnectionInfo(RemotePublicKey, intendedPublicKey, block);
         }
 
-        Logger.Info<SyncSession>($"Published connection info for {numEntries} authorized keys.");
+        Logger.Info<SyncSession>($"Published connection info for {numEntries} authorized keys by {RemotePublicKey}.");
     }
 
     private async ValueTask HandleRequestConnectionInfoAsync(int requestId, ArraySegment<byte> data)
@@ -1423,8 +1432,8 @@ public class SyncSession
                 decryptedPacket[4] = (byte)opcode;
                 decryptedPacket[5] = (byte)subOpcode;
 
-                if (Logger.WillLog(LogLevel.Verbose))
-                    Logger.Verbose<SyncSession>($"Send (opcode = {opcode}, subOpcode = {subOpcode}, size = 0)");
+                if (Logger.WillLog(LogLevel.Debug))
+                    Logger.Debug<SyncSession>($"Send (opcode = {opcode}, subOpcode = {subOpcode}, size = 0)");
 
                 if (Logger.WillLog(LogLevel.Debug))
                     Logger.Debug<SyncSession>($"Encrypted message bytes {HEADER_SIZE}");
@@ -1458,8 +1467,8 @@ public class SyncSession
 
     public async ValueTask SendAsync(Opcode opcode, byte subOpcode, ArraySegment<byte> data)
     {
-        if (Logger.WillLog(LogLevel.Verbose))
-            Logger.Verbose<SyncSession>($"Send (opcode = {opcode}, subOpcode = {subOpcode}, size = {data.Count})");
+        if (Logger.WillLog(LogLevel.Debug))
+            Logger.Debug<SyncSession>($"Send (opcode = {opcode}, subOpcode = {subOpcode}, size = {data.Count})");
 
         if (data.Count + HEADER_SIZE > MAXIMUM_PACKET_SIZE)
         {
@@ -1595,23 +1604,32 @@ public class SyncSession
     }
 
     //TODO: Reuse buffer initially set by InitializeBufferPool
-    private async ValueTask SendAsync(byte[] data, int offset, int count)
+    private async ValueTask SendAsync(byte[] data, int offset, int count, CancellationToken cancellationToken = default)
     {
         if (Logger.WillLog(LogLevel.Debug))
             Logger.Debug<SyncSession>($"Sending {count} bytes.\n{Utilities.HexDump(data.AsSpan().Slice(offset, count))}");
 
+        Stopwatch? sw = null;
+        if (Logger.WillLog(LogLevel.Debug))
+            sw = new Stopwatch();
+
         int totalBytesSent = 0;
         while (totalBytesSent < count)
         {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            sw?.Restart();
+            if (Logger.WillLog(LogLevel.Debug))
+                Logger.Debug<SyncSession>($"Sending {count - totalBytesSent} bytes.");
+
             int bytesSent = await Socket.SendAsync(new ArraySegment<byte>(data, offset + totalBytesSent, count - totalBytesSent));
             if (bytesSent == 0)
                 throw new Exception("Failed to send.");
+            if (Logger.WillLog(LogLevel.Debug))
+                Logger.Debug<SyncSession>($"Send duration ({bytesSent} bytes): {sw?.ElapsedMilliseconds}ms");
 
             totalBytesSent += bytesSent;
         }
-
-        if (Logger.WillLog(LogLevel.Verbose))
-            Logger.Verbose<SyncSession>($"Sent {count} bytes.");
     }
 
     private async ValueTask SendEmptyResponseAsync(ResponseOpcode responseOpcode, int requestId, int statusCode)

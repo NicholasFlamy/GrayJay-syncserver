@@ -7,7 +7,7 @@ using SyncShared;
 using System.Text;
 using System.Collections.Concurrent;
 using System.Buffers;
-using System.Security.Cryptography.X509Certificates;
+using System.Diagnostics;
 
 namespace SyncClient;
 
@@ -26,8 +26,7 @@ public record ConnectionInfo(
 //TODO: Cancellation token source and cancel on dispose
 public class SyncSocketSession : IDisposable
 {
-    private readonly Stream _inputStream;
-    private readonly Stream _outputStream;
+    private readonly Socket _socket;
     private readonly SemaphoreSlim _sendSemaphore = new SemaphoreSlim(1);
     private readonly byte[] _buffer = new byte[MAXIMUM_PACKET_SIZE_ENCRYPTED];
     private readonly byte[] _bufferDecrypted = new byte[MAXIMUM_PACKET_SIZE];
@@ -63,12 +62,14 @@ public class SyncSocketSession : IDisposable
     public IAuthorizable? Authorizable { get; set; }
     public bool IsAuthorized => Authorizable?.IsAuthorized ?? false;
 
-    public SyncSocketSession(string remoteAddress, KeyPair localKeyPair, Stream inputStream, Stream outputStream,
+    public SyncSocketSession(string remoteAddress, KeyPair localKeyPair, Socket socket,
         Action<SyncSocketSession>? onClose = null, Action<SyncSocketSession>? onHandshakeComplete = null,
         Action<SyncSocketSession, Opcode, byte, ReadOnlySpan<byte>>? onData = null, Action<SyncSocketSession, ChannelRelayed>? onNewChannel = null, Func<LinkType, SyncSocketSession, string, string?, uint, bool>? isHandshakeAllowed = null, Action<SyncSocketSession, ChannelRelayed, bool>? onChannelEstablished = null)
     {
-        _inputStream = inputStream;
-        _outputStream = outputStream;
+        _socket = socket;
+        _socket.ReceiveBufferSize = MAXIMUM_PACKET_SIZE_ENCRYPTED;
+        _socket.SendBufferSize = MAXIMUM_PACKET_SIZE_ENCRYPTED;
+
         _onClose = onClose;
         _onHandshakeComplete = onHandshakeComplete;
         _onChannelEstablished = onChannelEstablished;
@@ -127,9 +128,7 @@ public class SyncSocketSession : IDisposable
         {
             try
             {
-                if (await ReadAsync(messageSizeBytes, 0, 4, cancellationToken: cancellationToken) != 4)
-                    throw new Exception("Expected exactly 4 bytes");
-
+                await ReceiveExactAsync(messageSizeBytes, 0, 4, cancellationToken);
                 int messageSize = BinaryPrimitives.ReadInt32LittleEndian(messageSizeBytes.AsSpan(0, 4));
                 if (messageSize == 0)
                     throw new Exception("Disconnected.");
@@ -140,17 +139,10 @@ public class SyncSocketSession : IDisposable
                 if (messageSize > MAXIMUM_PACKET_SIZE_ENCRYPTED)
                     throw new Exception($"Message size ({messageSize}) exceeds maximum allowed size ({MAXIMUM_PACKET_SIZE_ENCRYPTED})");
 
-                int bytesRead = 0;
-                while (bytesRead < messageSize)
-                {
-                    int read = await ReadAsync(_buffer, bytesRead, messageSize - bytesRead, cancellationToken: cancellationToken);
-                    if (read <= 0)
-                        throw new Exception("Stream closed");
-                    bytesRead += read;
-                }
+                await ReceiveExactAsync(_buffer, 0, messageSize, cancellationToken);
 
                 if (Logger.WillLog(LogLevel.Debug))
-                    Logger.Debug<SyncSocketSession>($"Read message bytes {bytesRead}");
+                    Logger.Debug<SyncSocketSession>($"Read message bytes {messageSize}");
 
                 int plen = Decrypt(_buffer.AsSpan().Slice(0, messageSize), _bufferDecrypted);
                 if (Logger.WillLog(LogLevel.Debug))
@@ -207,20 +199,10 @@ public class SyncSocketSession : IDisposable
             await SendAsync(message, 0, totalMessageSize + 4, cancellationToken: cancellationToken);
             Logger.Info<SyncSocketSession>($"HandshakeAsInitiator: Wrote message size {totalMessageSize} (pairing: {pairingMessageLength}, channel: {channelBytesWritten}, app id: {appId}");
 
-            var bytesRead = await ReadAsync(message, 0, 4);
-            if (bytesRead != 4)
-                throw new Exception($"Expected exactly 4 bytes (message size) (app id: {appId})");
-
+            await ReceiveExactAsync(message, 0, 4);
             var messageSize = BitConverter.ToInt32(message);
             Logger.Info<SyncSocketSession>($"HandshakeAsInitiator: Read message size {messageSize} (app id: {appId})");
-            bytesRead = 0;
-            while (bytesRead < messageSize)
-            {
-                var read = await ReadAsync(message, bytesRead, messageSize - bytesRead);
-                if (read == 0)
-                    throw new Exception("Stream closed.");
-                bytesRead += read;
-            }
+            await ReceiveExactAsync(message, 0, messageSize);
 
             var (_, _, transport) = handshakeState.ReadMessage(message.AsSpan().Slice(0, messageSize), plaintext);
             _transport = transport;
@@ -236,21 +218,10 @@ public class SyncSocketSession : IDisposable
         var plaintext = new byte[512];
         using (var handshakeState = Constants.Protocol.Create(false, s: _localKeyPair.PrivateKey))
         {
-            var bytesRead = await ReadAsync(message, 0, 4);
-            if (bytesRead != 4)
-                throw new Exception($"Expected exactly 4 bytes (message size), read {bytesRead}");
-
+            await ReceiveExactAsync(message, 0, 4);
             var messageSize = BinaryPrimitives.ReadInt32LittleEndian(message.AsSpan(0, 4));
             Logger.Info<SyncSocketSession>($"HandshakeAsResponder: Read message size {messageSize}");
-
-            bytesRead = 0;
-            while (bytesRead < messageSize)
-            {
-                var read = await ReadAsync(message, bytesRead, messageSize - bytesRead);
-                if (read == 0)
-                    throw new Exception("Stream closed.");
-                bytesRead += read;
-            }
+            await ReceiveExactAsync(message, 0, messageSize);
 
             int offset = 0;
             uint appId = BinaryPrimitives.ReadUInt32LittleEndian(message.AsSpan(offset, 4));
@@ -305,9 +276,7 @@ public class SyncSocketSession : IDisposable
         const int MINIMUM_VERSION = 4;
         await SendAsync(VERSION_BYTES, 0, 4, cancellationToken: cancellationToken);
         byte[] versionBytes = new byte[4];
-        int bytesRead = await ReadAsync(versionBytes, 0, 4);
-        if (bytesRead != 4)
-            throw new Exception($"Expected 4 bytes to be read, read {bytesRead}");
+        await ReceiveExactAsync(versionBytes, 0, 4);
         RemoteVersion = BinaryPrimitives.ReadInt32LittleEndian(versionBytes.AsSpan(0, 4));
         Logger.Info(nameof(SyncSocketSession), $"PerformVersionCheck {RemoteVersion}");
         if (RemoteVersion < MINIMUM_VERSION)
@@ -330,22 +299,59 @@ public class SyncSocketSession : IDisposable
         return plen;
     }
 
-    private async ValueTask<int> ReadAsync(byte[] buffer, int offset, int size, CancellationToken cancellationToken = default)
+    private async ValueTask ReceiveExactAsync(byte[] buffer, int offset, int size, CancellationToken cancellationToken = default)
     {
-        int bytesRead = await _inputStream.ReadAsync(buffer, offset, size, cancellationToken: cancellationToken);
+        Stopwatch? sw = null;
         if (Logger.WillLog(LogLevel.Debug))
-            Logger.Debug<SyncSocketSession>($"Read {bytesRead} bytes.\n{Utilities.HexDump(buffer.AsSpan().Slice(offset, bytesRead))}");
-        return bytesRead;
+            sw = new Stopwatch();
+
+        int totalBytesReceived = 0;
+        while (totalBytesReceived < size)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            sw?.Restart();
+            int bytesReceived = await _socket.ReceiveAsync(new ArraySegment<byte>(buffer, offset + totalBytesReceived, size - totalBytesReceived), cancellationToken);
+            if (bytesReceived == 0)
+                throw new Exception("Connection closed");
+            if (Logger.WillLog(LogLevel.Debug))
+                Logger.Debug<SyncSocketSession>($"Receive duration ({bytesReceived}/{size} bytes): {sw?.ElapsedMilliseconds}ms");
+            totalBytesReceived += bytesReceived;
+        }
+
+        if (Logger.WillLog(LogLevel.Debug))
+            Logger.Debug<SyncSocketSession>($"Received {totalBytesReceived} bytes.\n{Utilities.HexDump(buffer.AsSpan().Slice(0, totalBytesReceived))}");
     }
 
-    private async Task SendAsync(byte[] data, int offset = 0, int size = -1, CancellationToken cancellationToken = default)
+    private async ValueTask SendAsync(byte[] data, int offset = 0, int count = -1, CancellationToken cancellationToken = default)
     {
-        if (Logger.WillLog(LogLevel.Debug))
-            Logger.Debug<SyncSocketSession>($"Sending {data.Length} bytes.\n{Utilities.HexDump(data.AsSpan().Slice(offset, size))}");
+        if (count == -1)
+            count = data.Length;
 
-        if (size == -1)
-            size = data.Length;
-        await _outputStream.WriteAsync(data, offset, size, cancellationToken);
+        if (Logger.WillLog(LogLevel.Debug))
+            Logger.Debug<SyncSocketSession>($"Sending {count} bytes.\n{Utilities.HexDump(data.AsSpan().Slice(offset, count))}");
+
+        Stopwatch? sw = null;
+        if (Logger.WillLog(LogLevel.Debug))
+            sw = new Stopwatch();
+
+        int totalBytesSent = 0;
+        while (totalBytesSent < count)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            sw?.Restart();
+            if (Logger.WillLog(LogLevel.Debug))
+                Logger.Debug<SyncSocketSession>($"Sending {count - totalBytesSent} bytes.");
+
+            int bytesSent = await _socket.SendAsync(new ArraySegment<byte>(data, offset + totalBytesSent, count - totalBytesSent));
+            if (bytesSent == 0)
+                throw new Exception("Failed to send.");
+            if (Logger.WillLog(LogLevel.Debug))
+                Logger.Debug<SyncSocketSession>($"Send duration ({bytesSent} bytes): {sw?.ElapsedMilliseconds}ms");
+
+            totalBytesSent += bytesSent;
+        }
     }
 
     public int GenerateStreamId() => Interlocked.Increment(ref _streamIdGenerator);
@@ -356,8 +362,8 @@ public class SyncSocketSession : IDisposable
         if (size == -1)
             size = data.Length;
 
-        if (Logger.WillLog(LogLevel.Verbose))
-            Logger.Verbose<SyncSocketSession>($"SendAsync (opcode = {opcode}, subOpcode = {subOpcode}, size = {size})");
+        if (Logger.WillLog(LogLevel.Debug))
+            Logger.Debug<SyncSocketSession>($"SendAsync (opcode = {opcode}, subOpcode = {subOpcode}, size = {size})");
 
         if (size + HEADER_SIZE > MAXIMUM_PACKET_SIZE)
         {
@@ -447,8 +453,8 @@ public class SyncSocketSession : IDisposable
 
     public async Task SendAsync(Opcode opcode, byte subOpcode = 0, CancellationToken cancellationToken = default)
     {
-        if (Logger.WillLog(LogLevel.Verbose))
-            Logger.Verbose<SyncSocketSession>($"SendAsync (opcode = {opcode}, subOpcode = {subOpcode}, size = 0)");
+        if (Logger.WillLog(LogLevel.Debug))
+            Logger.Debug<SyncSocketSession>($"SendAsync (opcode = {opcode}, subOpcode = {subOpcode}, size = 0)");
 
         try
         {
@@ -1244,8 +1250,8 @@ public class SyncSocketSession : IDisposable
 
     private void HandlePacket(Opcode opcode, byte subOpcode, ReadOnlySpan<byte> data, ChannelRelayed? sourceChannel = null)
     {
-        if (Logger.WillLog(LogLevel.Verbose))
-            Logger.Verbose<SyncSocketSession>($"HandlePacket (opcode = {opcode}, subOpcode = {subOpcode}, data.length = {data.Length}, sourceChannel.ConnectionId = {sourceChannel?.ConnectionId})");
+        if (Logger.WillLog(LogLevel.Debug))
+            Logger.Debug<SyncSocketSession>($"HandlePacket (opcode = {opcode}, subOpcode = {subOpcode}, data.length = {data.Length}, sourceChannel.ConnectionId = {sourceChannel?.ConnectionId})");
 
         switch (opcode)
         {
@@ -1515,7 +1521,7 @@ public class SyncSocketSession : IDisposable
                 }
                 catch (Exception e)
                 {
-                    Logger.Info<SyncSocketSession>("Failed to send relayed transport response", e);
+                    Logger.Error<SyncSocketSession>("Failed to send relayed transport response", e);
                 }
             });
             return;
@@ -1535,7 +1541,7 @@ public class SyncSocketSession : IDisposable
             }
             catch (Exception e)
             {
-                Logger.Info<SyncSocketSession>("Failed to send relayed transport response", e);
+                Logger.Error<SyncSocketSession>("Failed to send relayed transport response", e);
             }
         });
     }
@@ -2126,8 +2132,7 @@ public class SyncSocketSession : IDisposable
 
         _started = false;
         _onClose?.Invoke(this);
-        _inputStream.Close();
-        _outputStream.Close();
+        _socket.Close();
         _transport?.Dispose();
         Logger.Info<SyncSocketSession>("Session closed");
     }
