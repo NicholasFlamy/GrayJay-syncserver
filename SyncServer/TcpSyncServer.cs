@@ -116,7 +116,6 @@ public class TcpSyncServer : IDisposable
     );
 
     private const int MAX_CONNECTIONS = 100000;
-    private const int BUFFER_SIZE = 1024;
 
     private Socket? _listenSocket;
     private readonly SemaphoreSlim _maxConnections;
@@ -280,8 +279,8 @@ public class TcpSyncServer : IDisposable
         _listenSocket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
         _listenSocket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
         _listenSocket.NoDelay = true;
-        _listenSocket.ReceiveBufferSize = BUFFER_SIZE;
-        _listenSocket.SendBufferSize = BUFFER_SIZE;
+        _listenSocket.ReceiveBufferSize = MAXIMUM_PACKET_SIZE_ENCRYPTED;
+        _listenSocket.SendBufferSize = MAXIMUM_PACKET_SIZE_ENCRYPTED;
         _listenSocket.Bind(new IPEndPoint(IPAddress.Any, _port));
         _listenSocket.Listen(1000);
 
@@ -302,8 +301,9 @@ public class TcpSyncServer : IDisposable
                         return;
                     }
 
-                    clientSocket.ReceiveBufferSize = 8 * 1024;
-                    clientSocket.SendBufferSize = 8 * 1024;
+                    clientSocket.ReceiveBufferSize = MAXIMUM_PACKET_SIZE_ENCRYPTED;
+                    clientSocket.SendBufferSize = MAXIMUM_PACKET_SIZE_ENCRYPTED;
+                    clientSocket.NoDelay = true;
 
                     var session = new SyncSession(this, (s) => _sessions[s.RemotePublicKey!] = s, OnSessionClosed, _useRateLimits)
                     {

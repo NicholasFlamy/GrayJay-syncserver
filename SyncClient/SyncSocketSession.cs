@@ -330,6 +330,8 @@ public class SyncSocketSession : IDisposable
 
         if (Logger.WillLog(LogLevel.Debug))
             Logger.Debug<SyncSocketSession>($"Sending {count} bytes.\n{Utilities.HexDump(data.AsSpan().Slice(offset, count))}");
+        else if (Logger.WillLog(LogLevel.Verbose))
+            Logger.Verbose<SyncSocketSession>($"Sending {count} bytes.");
 
         Stopwatch? sw = null;
         if (Logger.WillLog(LogLevel.Debug))
