@@ -67,11 +67,15 @@ public class TcpSyncServerMetrics
     public long TotalGetRecordTimeMs;
     public long GetRecordCount;
 
+    public long MaxConnectionsCount => _server.MaxConnections.CurrentCount;
+
     public long TotalRented => Utilities.TotalRented;
     public long TotalReturned => Utilities.TotalReturned;
 
     public long MemoryUsage => GC.GetTotalMemory(false);
     public int ActiveRelayedConnections => _server.RelayedConnections.Values.Count(conn => conn.IsActive);
+    public int ClientCount => _server.ClientCount;
+    public int SessionCount => _server.SessionCount;
 
     public int[] GCCounts
     {
@@ -118,10 +122,11 @@ public class TcpSyncServer : IDisposable
     private const int MAX_CONNECTIONS = 100000;
 
     private Socket? _listenSocket;
-    private readonly SemaphoreSlim _maxConnections;
-    private readonly int _maxConnectionCount;
+    public readonly SemaphoreSlim MaxConnections;
     private readonly ConcurrentDictionary<Socket, SyncSession> _clients = new();
+    public int ClientCount => _clients.Count;
     private readonly ConcurrentDictionary<string, SyncSession> _sessions = new();
+    public int SessionCount => _sessions.Count;
     private readonly KeyPair _keyPair;
     public KeyPair LocalKeyPair => _keyPair;
     private readonly ConcurrentDictionary<(string, string), byte[]> _connectionInfoStore = new();
@@ -149,8 +154,7 @@ public class TcpSyncServer : IDisposable
     {
         Metrics = new TcpSyncServerMetrics(this);
         _port = port;
-        _maxConnectionCount = maxConnections;
-        _maxConnections = new SemaphoreSlim(maxConnections, maxConnections);
+        MaxConnections = new SemaphoreSlim(maxConnections, maxConnections);
         _keyPair = keyPair;
         RecordRepository = recordRepository;
         _useRateLimits = useRateLimits;
@@ -180,10 +184,9 @@ public class TcpSyncServer : IDisposable
 
     public void OnSessionClosed(SyncSession session)
     {
-        bool removed = false;
         var socket = session.Socket;
         if (socket != null)
-            removed = _clients.TryRemove(session.Socket, out _);
+            _clients.TryRemove(session.Socket, out _);
 
         var remotePublicKey = session?.RemotePublicKey;
         if (remotePublicKey != null)
@@ -194,14 +197,12 @@ public class TcpSyncServer : IDisposable
                 _connectionInfoStore.TryRemove(key, out _);
         }
 
+        Interlocked.Increment(ref Metrics.TotalConnectionsClosed);
+        Interlocked.Decrement(ref Metrics.ActiveConnections);
+
         try
         {
-            if (removed)
-            {
-                Interlocked.Increment(ref Metrics.TotalConnectionsClosed);
-                Interlocked.Decrement(ref Metrics.ActiveConnections);
-                _maxConnections.Release();
-            }
+            MaxConnections.Release();
         }
         catch (Exception e)
         {
@@ -215,6 +216,9 @@ public class TcpSyncServer : IDisposable
             if (connection.Initiator == session || connection.Target == session)
             {
                 RelayedConnections.TryRemove(kvp.Key, out _);
+                RemoveRelayPairByConnectionId(kvp.Key);
+                _connectionTokenBuckets.TryRemove(kvp.Key, out _);
+
                 var otherSession = connection.Initiator == session ? connection.Target : connection.Initiator;
                 if (otherSession != null)
                 {
@@ -292,12 +296,12 @@ public class TcpSyncServer : IDisposable
             {
                 while (true)
                 {
-                    _maxConnections.Wait();
+                    MaxConnections.Wait();
                     var clientSocket = await _listenSocket.AcceptAsync();
                     if (clientSocket == null)
                     {
                         Logger.Info<TcpSyncServer>("Accepted socket is null.");
-                        _maxConnections.Release();
+                        MaxConnections.Release();
                         return;
                     }
 
@@ -322,7 +326,7 @@ public class TcpSyncServer : IDisposable
                     catch (Exception ex)
                     {
                         Logger.Error<TcpSyncServer>($"Accept processing error", ex);
-                        _maxConnections.Release();
+                        MaxConnections.Release();
                     }
                 }
             }
@@ -376,7 +380,7 @@ public class TcpSyncServer : IDisposable
             _listenSocket = null;
         }
 
-        _maxConnections.Dispose();
+        MaxConnections.Dispose();
     }
     public bool TryRegisterNewKeypair(string ipAddress)
     {

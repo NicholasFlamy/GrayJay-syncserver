@@ -52,6 +52,7 @@ public class SyncSession
     private int _streamIdGenerator = 0;
     private readonly SemaphoreSlim _sendSemaphore = new SemaphoreSlim(1);
     private readonly bool _useRateLimits;
+    private bool _disposed = false;
 
     public SyncSession(TcpSyncServer server, Action<SyncSession> onHandshakeComplete, Action<SyncSession> onClose, bool useRateLimits = true)
     {
@@ -63,6 +64,10 @@ public class SyncSession
 
     public void Dispose()
     {
+        if (_disposed)
+            return;
+
+        _disposed = true;
         _onClose?.Invoke(this);
         HandshakeState?.Dispose();
         Socket?.Close();
@@ -80,6 +85,8 @@ public class SyncSession
 
     private async ValueTask ReceiveExactAsync(byte[] buffer, int offset, int size, CancellationToken cancellationToken = default)
     {
+        ThrowIfDisposed();
+
         Stopwatch? sw = null;
         if (Logger.WillLog(LogLevel.Debug))
             sw = new Stopwatch();
@@ -104,6 +111,8 @@ public class SyncSession
 
     public void Start()
     {
+        ThrowIfDisposed();
+
         _ = Task.Run(async () =>
         {
             try
@@ -191,6 +200,8 @@ public class SyncSession
 
                 while (true)
                 {
+                    ThrowIfDisposed();
+
                     await ReceiveExactAsync(_sessionBuffer, 0, 4);
                     int messageSize = BinaryPrimitives.ReadInt32LittleEndian(_sessionBuffer.AsSpan(0, 4));
 
@@ -220,6 +231,12 @@ public class SyncSession
                 Logger.Error<SyncSession>($"Receive error", e);
             }
         });
+    }
+
+    private void ThrowIfDisposed()
+    {
+        if (_disposed)
+            throw new ObjectDisposedException("Object is disposed");
     }
 
     private async ValueTask HandlePacketAsync(ArraySegment<byte> data)
@@ -1446,6 +1463,8 @@ public class SyncSession
 
     public async ValueTask SendAsync(Opcode opcode, byte subOpcode)
     {
+        ThrowIfDisposed();
+
         var decryptedSize = HEADER_SIZE;
         var encryptedSize = decryptedSize + 4 + 16;
         byte[] decryptedPacket = Utilities.RentBytes(decryptedSize);
@@ -1495,6 +1514,8 @@ public class SyncSession
 
     public async ValueTask SendAsync(Opcode opcode, byte subOpcode, ArraySegment<byte> data, ContentEncoding contentEncoding = ContentEncoding.Raw, CancellationToken cancellationToken = default)
     {
+        ThrowIfDisposed();
+
         if (Logger.WillLog(LogLevel.Debug))
             Logger.Debug<SyncSession>($"Send (opcode = {opcode}, subOpcode = {subOpcode}, size = {data.Count})");
 
@@ -1641,6 +1662,8 @@ public class SyncSession
 
     private int Encrypt(ReadOnlySpan<byte> source, Span<byte> destination)
     {
+        ThrowIfDisposed();
+
         int encryptedLength = _transport!.WriteMessage(source, destination);
         if (Logger.WillLog(LogLevel.Debug))
             Logger.Debug<SyncSession>($"Encrypted message bytes (source size: {source.Length}, destination size: {encryptedLength})");
@@ -1649,6 +1672,8 @@ public class SyncSession
 
     private int Decrypt(ReadOnlySpan<byte> source, Span<byte> destination)
     {
+        ThrowIfDisposed();
+
         int plen = _transport!.ReadMessage(source, destination);
         if (Logger.WillLog(LogLevel.Debug))
             Logger.Debug<SyncSession>($"Decrypted message bytes (source size: {source.Length}, destination size: {plen})");
@@ -1658,6 +1683,8 @@ public class SyncSession
     //TODO: Reuse buffer initially set by InitializeBufferPool
     private async ValueTask SendAsync(byte[] data, int offset, int count, CancellationToken cancellationToken = default)
     {
+        ThrowIfDisposed();
+
         if (Logger.WillLog(LogLevel.Debug))
             Logger.Debug<SyncSession>($"Sending {count} bytes.");
 
