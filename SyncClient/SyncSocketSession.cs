@@ -488,7 +488,7 @@ public class SyncSocketSession : IDisposable
         {
             await _sendSemaphore.WaitAsync(cancellationToken);
 
-            Array.Copy(BitConverter.GetBytes(2), 0, _sendBuffer, 0, 4);
+            BinaryPrimitives.WriteInt32LittleEndian(_sendBuffer.AsSpan(0, 4), HEADER_SIZE - 4);
             _sendBuffer[4] = (byte)opcode;
             _sendBuffer[5] = (byte)subOpcode;
             _sendBuffer[6] = (byte)ContentEncoding.Raw;
@@ -496,13 +496,9 @@ public class SyncSocketSession : IDisposable
             if (Logger.WillLog(LogLevel.Debug))
                 Logger.Debug<SyncSocketSession>($"Encrypted message bytes {HEADER_SIZE}");
 
-            var len = Encrypt(_sendBuffer.AsSpan().Slice(0, HEADER_SIZE), _sendBufferEncrypted);
-            await SendAsync(BitConverter.GetBytes(len), 0, 4, cancellationToken);
-
-            if (Logger.WillLog(LogLevel.Debug))
-                Logger.Debug<SyncSocketSession>($"Wrote message size {len}");
-
-            await SendAsync(_sendBufferEncrypted, 0, len, cancellationToken);
+            var len = Encrypt(_sendBuffer.AsSpan().Slice(0, HEADER_SIZE), _sendBufferEncrypted.AsSpan(4));
+            BinaryPrimitives.WriteInt32LittleEndian(_sendBufferEncrypted.AsSpan(0, 4), len);
+            await SendAsync(_sendBufferEncrypted, 0, len + 4, cancellationToken: cancellationToken);
 
             if (Logger.WillLog(LogLevel.Debug))
                 Logger.Debug<SyncSocketSession>($"Wrote message bytes {len}");

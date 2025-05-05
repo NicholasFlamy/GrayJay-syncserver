@@ -53,6 +53,8 @@ public class SyncSession
     private readonly SemaphoreSlim _sendSemaphore = new SemaphoreSlim(1);
     private readonly bool _useRateLimits;
     private bool _disposed = false;
+    private CancellationTokenSource _disposeCancellationTokenSource = new CancellationTokenSource();
+    private DateTime _lastPongTime = DateTime.Now;
 
     public SyncSession(TcpSyncServer server, Action<SyncSession> onHandshakeComplete, Action<SyncSession> onClose, bool useRateLimits = true)
     {
@@ -68,6 +70,7 @@ public class SyncSession
             return;
 
         _disposed = true;
+        _disposeCancellationTokenSource.Cancel();
         _onClose?.Invoke(this);
         HandshakeState?.Dispose();
         Socket?.Close();
@@ -83,7 +86,7 @@ public class SyncSession
         }
     }
 
-    private async ValueTask ReceiveExactAsync(byte[] buffer, int offset, int size, CancellationToken cancellationToken = default)
+    private async ValueTask<bool> ReceiveExactAsync(byte[] buffer, int offset, int size)
     {
         ThrowIfDisposed();
 
@@ -94,12 +97,12 @@ public class SyncSession
         int totalBytesReceived = 0;
         while (totalBytesReceived < size)
         {
-            cancellationToken.ThrowIfCancellationRequested();
+            _disposeCancellationTokenSource.Token.ThrowIfCancellationRequested();
 
             sw?.Restart();
-            int bytesReceived = await Socket.ReceiveAsync(new ArraySegment<byte>(buffer, offset + totalBytesReceived, size - totalBytesReceived));
+            int bytesReceived = await Socket.ReceiveAsync(new ArraySegment<byte>(buffer, offset + totalBytesReceived, size - totalBytesReceived), cancellationToken: _disposeCancellationTokenSource.Token);
             if (bytesReceived == 0)
-                throw new Exception("Connection closed");
+                return false;
             if (Logger.WillLog(LogLevel.Debug))
                 Logger.Debug<SyncSession>($"Receive duration ({bytesReceived}/{size} bytes), requested {size - totalBytesReceived} bytes: {sw?.ElapsedMilliseconds}ms");
             totalBytesReceived += bytesReceived;
@@ -107,6 +110,8 @@ public class SyncSession
 
         if (Logger.WillLog(LogLevel.Debug))
             Logger.Debug<SyncSession>($"Received {totalBytesReceived} bytes.");
+
+        return true;
     }
 
     public void Start()
@@ -118,17 +123,29 @@ public class SyncSession
             try
             {
                 await SendVersionAsync();
-                await ReceiveExactAsync(_sessionBuffer, 0, 4);
+                if (!await ReceiveExactAsync(_sessionBuffer, 0, 4))
+                {
+                    Logger.Info<SyncSession>("Session closed while waiting for version.");
+                    return;
+                }
                 HandleVersionCheck(_sessionBuffer.AsSpan(0, 4));
 
                 Interlocked.Increment(ref _server.Metrics.TotalHandshakeAttempts);
 
-                await ReceiveExactAsync(_sessionBuffer, 0, 4);
+                if (!await ReceiveExactAsync(_sessionBuffer, 0, 4))
+                {
+                    Logger.Info<SyncSession>("Session closed while waiting for handshake size.");
+                    return;
+                }
                 int handshakeSize = BinaryPrimitives.ReadInt32LittleEndian(_sessionBuffer.AsSpan(0, 4));
                 if (handshakeSize > _sessionBuffer.Length)
                     throw new Exception($"Handshake size should be less than {_sessionBuffer.Length} bytes.");
 
-                await ReceiveExactAsync(_sessionBuffer, 0, handshakeSize);
+                if (!await ReceiveExactAsync(_sessionBuffer, 0, handshakeSize))
+                {
+                    Logger.Info<SyncSession>("Session closed while waiting for handshake data.");
+                    return;
+                }
                 Logger.Info<SyncSession>($"HandshakeAsResponder: Received handshake message ({handshakeSize} bytes)");
 
                 var handshakeData = new ArraySegment<byte>(_sessionBuffer, 0, handshakeSize);
@@ -169,7 +186,7 @@ public class SyncSession
 
                 try
                 {
-                    await _sendSemaphore.WaitAsync();
+                    await _sendSemaphore.WaitAsync(_disposeCancellationTokenSource.Token);
                     await SendAsync(_sessionBuffer, 0, bytesWritten + 4);
                 }
                 finally
@@ -198,37 +215,83 @@ public class SyncSession
                 if (receivedPairingCode != null)
                     Logger.Info<SyncSession>($"Accepted pairing code '{receivedPairingCode}' from {RemotePublicKey} (app id: {appId})");
 
-                while (true)
+                while (!_disposeCancellationTokenSource.IsCancellationRequested)
                 {
-                    ThrowIfDisposed();
-
-                    await ReceiveExactAsync(_sessionBuffer, 0, 4);
+                    if (!await ReceiveExactAsync(_sessionBuffer, 0, 4))
+                    {
+                        Logger.Info<SyncSession>("Session closed while waiting for message size.");
+                        return;
+                    }
                     int messageSize = BinaryPrimitives.ReadInt32LittleEndian(_sessionBuffer.AsSpan(0, 4));
-
                     if (messageSize <= _sessionBuffer.Length)
                     {
-                        await ReceiveExactAsync(_sessionBuffer, 0, messageSize);
+                        if (!await ReceiveExactAsync(_sessionBuffer, 0, messageSize))
+                        {
+                            Logger.Info<SyncSession>("Session closed while waiting for message.");
+                            return;
+                        }
                         await HandlePacketAsync(new ArraySegment<byte>(_sessionBuffer, 0, messageSize));
                     }
                     else
                     {
-                        var accumulatedBuffer = Utilities.RentBytes(messageSize);
+                        var buffer = Utilities.RentBytes(messageSize);
                         try
                         {
-                            await ReceiveExactAsync(accumulatedBuffer, 0, messageSize);
-                            await HandlePacketAsync(new ArraySegment<byte>(accumulatedBuffer, 0, messageSize));
+                            if (!await ReceiveExactAsync(buffer, 0, messageSize))
+                            {
+                                Logger.Info<SyncSession>("Session closed while waiting for large message.");
+                                return;
+                            }
+                            await HandlePacketAsync(new ArraySegment<byte>(buffer, 0, messageSize));
                         }
                         finally
                         {
-                            Utilities.ReturnBytes(accumulatedBuffer);
+                            Utilities.ReturnBytes(buffer);
                         }
                     }
                 }
             }
             catch (Exception e)
             {
-                Dispose();
                 Logger.Error<SyncSession>($"Receive error", e);
+            }
+            finally
+            {
+                Dispose();
+            }
+        });
+
+        _ = Task.Run(async () =>
+        {
+            _lastPongTime = DateTime.Now;
+            var pingInterval = TimeSpan.FromSeconds(5);
+            var disconnectInterval = TimeSpan.FromSeconds(30);
+
+            try
+            {
+                while (!_disposeCancellationTokenSource.IsCancellationRequested)
+                {
+                    if (DateTime.Now - _lastPongTime > disconnectInterval)
+                    {
+                        Logger.Error<SyncSession>("Session closed due to inactivity");
+                        break;
+                    }
+
+                    bool isHandshakeComplete = _transport != null;
+                    if (isHandshakeComplete)
+                    {
+                        await Task.Delay(pingInterval, _disposeCancellationTokenSource.Token);
+                        await SendAsync(Opcode.PING, 0);
+                    }
+                }
+            }
+            catch (Exception e)
+            {
+                Logger.Error<SyncSession>("Error in receive loop", e);
+            }
+            finally
+            {
+                Dispose();
             }
         });
     }
@@ -655,6 +718,9 @@ public class SyncSession
                 break;
             case Opcode.PING:
                 await SendAsync(Opcode.PONG);
+                break;
+            case Opcode.PONG:
+                _lastPongTime = DateTime.Now;
                 break;
             case Opcode.REQUEST:
                 await HandleRequest((RequestOpcode)subOpcode, data);
@@ -1452,7 +1518,7 @@ public class SyncSession
     {
         try
         {
-            await _sendSemaphore.WaitAsync();
+            await _sendSemaphore.WaitAsync(_disposeCancellationTokenSource.Token);
             await SendAsync(VersionBytes, 0, 4);
         }
         finally
@@ -1495,7 +1561,7 @@ public class SyncSession
 
             try
             {
-                await _sendSemaphore.WaitAsync();
+                await _sendSemaphore.WaitAsync(_disposeCancellationTokenSource.Token);
                 await SendAsync(encryptedPacket, 0, encryptedSize);
 
                 if (Logger.WillLog(LogLevel.Debug))
@@ -1512,7 +1578,7 @@ public class SyncSession
         }
     }
 
-    public async ValueTask SendAsync(Opcode opcode, byte subOpcode, ArraySegment<byte> data, ContentEncoding contentEncoding = ContentEncoding.Raw, CancellationToken cancellationToken = default)
+    public async ValueTask SendAsync(Opcode opcode, byte subOpcode, ArraySegment<byte> data, ContentEncoding contentEncoding = ContentEncoding.Raw)
     {
         ThrowIfDisposed();
 
@@ -1529,7 +1595,7 @@ public class SyncSession
                 {
                     using (var gzipStream = new GZipStream(compressedStream, CompressionMode.Compress))
                     {
-                        await gzipStream.WriteAsync(data.AsMemory(data.Offset, data.Count), cancellationToken);
+                        await gzipStream.WriteAsync(data.AsMemory(data.Offset, data.Count), _disposeCancellationTokenSource.Token);
                     }
                     processedData = compressedStream.ToArray();
                 }
@@ -1593,7 +1659,7 @@ public class SyncSession
                     }
 
                     sendOffset += bytesToSend;
-                    await SendAsync(Opcode.STREAM, (byte)op, segmentDataSegment.Slice(0, segmentPacketSize), ContentEncoding.Raw, cancellationToken);
+                    await SendAsync(Opcode.STREAM, (byte)op, segmentDataSegment.Slice(0, segmentPacketSize), ContentEncoding.Raw);
                 }
             }
             finally
@@ -1628,11 +1694,11 @@ public class SyncSession
 
                 try
                 {
-                    await _sendSemaphore.WaitAsync(cancellationToken);
+                    await _sendSemaphore.WaitAsync(_disposeCancellationTokenSource.Token);
 
                     var len = Encrypt(decryptedPacket.AsSpan().Slice(0, processedData.Count + HEADER_SIZE), encryptedPacket.AsSpan().Slice(4));
                     BinaryPrimitives.WriteInt32LittleEndian(encryptedPacket.AsSpan().Slice(0, 4), len);
-                    await SendAsync(encryptedPacket, 0, encryptedSize, cancellationToken);
+                    await SendAsync(encryptedPacket, 0, encryptedSize);
 
                     if (Logger.WillLog(LogLevel.Debug))
                         Logger.Debug<SyncSession>($"Wrote message bytes {len}");
@@ -1649,13 +1715,13 @@ public class SyncSession
         }
     }
 
-    public async ValueTask SendAsync(Opcode opcode, byte subOpcode = 0, byte[]? data = null, int offset = 0, int count = -1, ContentEncoding contentEncoding = ContentEncoding.Raw, CancellationToken cancellationToken = default)
+    public async ValueTask SendAsync(Opcode opcode, byte subOpcode = 0, byte[]? data = null, int offset = 0, int count = -1, ContentEncoding contentEncoding = ContentEncoding.Raw)
     {
         if (count == -1)
             count = data?.Length ?? 0;
 
         if (data != null)
-            await SendAsync(opcode, subOpcode, new ArraySegment<byte>(data, offset, count), contentEncoding, cancellationToken);
+            await SendAsync(opcode, subOpcode, new ArraySegment<byte>(data, offset, count), contentEncoding);
         else
             await SendAsync(opcode, subOpcode);
     }
@@ -1681,7 +1747,7 @@ public class SyncSession
     }
 
     //TODO: Reuse buffer initially set by InitializeBufferPool
-    private async ValueTask SendAsync(byte[] data, int offset, int count, CancellationToken cancellationToken = default)
+    private async ValueTask SendAsync(byte[] data, int offset, int count)
     {
         ThrowIfDisposed();
 
@@ -1695,13 +1761,13 @@ public class SyncSession
         int totalBytesSent = 0;
         while (totalBytesSent < count)
         {
-            cancellationToken.ThrowIfCancellationRequested();
+            _disposeCancellationTokenSource.Token.ThrowIfCancellationRequested();
 
             sw?.Restart();
             if (Logger.WillLog(LogLevel.Debug))
                 Logger.Debug<SyncSession>($"Sending {count - totalBytesSent} bytes.");
 
-            int bytesSent = await Socket.SendAsync(new ArraySegment<byte>(data, offset + totalBytesSent, count - totalBytesSent));
+            int bytesSent = await Socket.SendAsync(new ArraySegment<byte>(data, offset + totalBytesSent, count - totalBytesSent), cancellationToken: _disposeCancellationTokenSource.Token);
             if (bytesSent == 0)
                 throw new Exception("Failed to send.");
             if (Logger.WillLog(LogLevel.Debug))
