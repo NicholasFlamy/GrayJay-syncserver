@@ -11,6 +11,7 @@ using System.Diagnostics;
 using System.IO.Compression;
 using System.Drawing;
 using System.Threading;
+using System.Buffers.Text;
 
 namespace SyncClient;
 
@@ -168,14 +169,14 @@ public class SyncSocketSession : IDisposable
 
         var message = new byte[512];
         var plaintext = new byte[512];
-        using (var handshakeState = Constants.Protocol.Create(true, s: _localKeyPair.PrivateKey, rs: Convert.FromBase64String(remotePublicKey)))
+        using (var handshakeState = Constants.Protocol.Create(true, s: _localKeyPair.PrivateKey, rs: remotePublicKey.DecodeBase64()))
         {
             byte[] pairingMessage = Array.Empty<byte>();
             int pairingMessageLength = 0;
             if (pairingCode != null)
             {
                 var pairingProtocol = new Protocol(HandshakePattern.N, CipherFunction.ChaChaPoly, HashFunction.Blake2b);
-                using var pairingHandshakeState = pairingProtocol.Create(true, rs: Convert.FromBase64String(remotePublicKey));
+                using var pairingHandshakeState = pairingProtocol.Create(true, rs: remotePublicKey.DecodeBase64());
                 byte[] pairingCodeBytes = Encoding.UTF8.GetBytes(pairingCode);
                 if (pairingCodeBytes.Length > 32)
                     throw new ArgumentException("Pairing code must not exceed 32 bytes.");
@@ -542,7 +543,7 @@ public class SyncSocketSession : IDisposable
 
         try
         {
-            byte[] publicKeyBytes = Convert.FromBase64String(publicKey);
+            byte[] publicKeyBytes = publicKey.DecodeBase64();
             if (publicKeyBytes.Length != 32)
                 throw new ArgumentException("Public key must be 32 bytes.");
 
@@ -595,7 +596,7 @@ public class SyncSocketSession : IDisposable
             writer.Write((byte)numKeys); // 1 byte: Number of public keys
             foreach (var pk in publicKeyList)
             {
-                byte[] pkBytes = Convert.FromBase64String(pk);
+                byte[] pkBytes = pk.DecodeBase64();
                 if (pkBytes.Length != 32)
                     throw new ArgumentException($"Invalid public key length for {pk}; must be 32 bytes.");
                 writer.Write(pkBytes); // 32 bytes per public key
@@ -716,7 +717,7 @@ public class SyncSocketSession : IDisposable
             writer.Write((byte)authorizedKeys.Length);
             foreach (var authorizedKey in authorizedKeys)
             {
-                var publicKeyBytes = Convert.FromBase64String(authorizedKey);
+                var publicKeyBytes = authorizedKey.DecodeBase64();
                 if (publicKeyBytes.Length != 32)
                     throw new InvalidOperationException("Public key must be 32 bytes.");
                 writer.Write(publicKeyBytes);
@@ -832,7 +833,7 @@ public class SyncSocketSession : IDisposable
                     {
                         var (channel, tcs) = pending;
                         channel.Dispose();
-                        tcs.SetException(new Exception($"Relayed transport request {requestId} failed with error code {statusCode}"));
+                        tcs.SetException(new Exception($"Relayed transport request {requestId} failed with error code {(TransportResponseCode)statusCode}"));
                     }
                 }
                 return;
@@ -1732,7 +1733,7 @@ public class SyncSocketSession : IDisposable
 
             foreach (var consumerPublicKey in consumerList)
             {
-                byte[] consumerPublicKeyBytes = Convert.FromBase64String(consumerPublicKey);
+                byte[] consumerPublicKeyBytes = consumerPublicKey.DecodeBase64();
                 if (consumerPublicKeyBytes.Length != 32)
                     throw new ArgumentException($"Consumer public key must be 32 bytes: {consumerPublicKey}");
 
@@ -1802,7 +1803,7 @@ public class SyncSocketSession : IDisposable
 
         try
         {
-            byte[] consumerPublicKeyBytes = Convert.FromBase64String(consumerPublicKey);
+            byte[] consumerPublicKeyBytes = consumerPublicKey.DecodeBase64();
             if (consumerPublicKeyBytes.Length != 32)
                 throw new ArgumentException("Consumer public key must be 32 bytes.", nameof(consumerPublicKey));
 
@@ -1884,7 +1885,7 @@ public class SyncSocketSession : IDisposable
 
         try
         {
-            byte[] publisherPublicKeyBytes = Convert.FromBase64String(publisherPublicKey);
+            byte[] publisherPublicKeyBytes = publisherPublicKey.DecodeBase64();
             if (publisherPublicKeyBytes.Length != 32)
                 throw new ArgumentException("Publisher public key must be 32 bytes.", nameof(publisherPublicKey));
 
@@ -1947,7 +1948,7 @@ public class SyncSocketSession : IDisposable
             offset += 1;
             foreach (var publisher in publishers)
             {
-                byte[] publisherPublicKeyBytes = Convert.FromBase64String(publisher);
+                byte[] publisherPublicKeyBytes = publisher.DecodeBase64();
                 if (publisherPublicKeyBytes.Length != 32)
                     throw new ArgumentException($"Publisher public key must be 32 bytes: {publisher}");
                 publisherPublicKeyBytes.CopyTo(packet.AsSpan(offset, 32));
@@ -1984,11 +1985,11 @@ public class SyncSocketSession : IDisposable
 
         try
         {
-            byte[] publisherPublicKeyBytes = Convert.FromBase64String(publisherPublicKey);
+            byte[] publisherPublicKeyBytes = publisherPublicKey.DecodeBase64();
             if (publisherPublicKeyBytes.Length != 32)
                 throw new ArgumentException("Publisher public key must be 32 bytes.", nameof(publisherPublicKey));
 
-            byte[] consumerPublicKeyBytes = Convert.FromBase64String(consumerPublicKey);
+            byte[] consumerPublicKeyBytes = consumerPublicKey.DecodeBase64();
             if (consumerPublicKeyBytes.Length != 32)
                 throw new ArgumentException("Consumer public key must be 32 bytes.", nameof(consumerPublicKey));
 
@@ -2036,11 +2037,11 @@ public class SyncSocketSession : IDisposable
 
         try
         {
-            byte[] publisherPublicKeyBytes = Convert.FromBase64String(publisherPublicKey);
+            byte[] publisherPublicKeyBytes = publisherPublicKey.DecodeBase64();
             if (publisherPublicKeyBytes.Length != 32)
                 throw new ArgumentException("Publisher public key must be 32 bytes.", nameof(publisherPublicKey));
 
-            byte[] consumerPublicKeyBytes = Convert.FromBase64String(consumerPublicKey);
+            byte[] consumerPublicKeyBytes = consumerPublicKey.DecodeBase64();
             if (consumerPublicKeyBytes.Length != 32)
                 throw new ArgumentException("Consumer public key must be 32 bytes.", nameof(consumerPublicKey));
 
@@ -2097,11 +2098,11 @@ public class SyncSocketSession : IDisposable
 
         try
         {
-            byte[] publisherPublicKeyBytes = Convert.FromBase64String(publisherPublicKey);
+            byte[] publisherPublicKeyBytes = publisherPublicKey.DecodeBase64();
             if (publisherPublicKeyBytes.Length != 32)
                 throw new ArgumentException("Publisher public key must be 32 bytes.", nameof(publisherPublicKey));
 
-            byte[] consumerPublicKeyBytes = Convert.FromBase64String(consumerPublicKey);
+            byte[] consumerPublicKeyBytes = consumerPublicKey.DecodeBase64();
             if (consumerPublicKeyBytes.Length != 32)
                 throw new ArgumentException("Consumer public key must be 32 bytes.", nameof(consumerPublicKey));
 

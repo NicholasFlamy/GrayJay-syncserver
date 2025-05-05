@@ -94,9 +94,9 @@ public class ChannelRelayed : IChannel
         _session = session;
         _localKeyPair = localKeyPair;
         _handshakeState = initiator
-            ? Constants.Protocol.Create(initiator, s: _localKeyPair.PrivateKey, rs: Convert.FromBase64String(publicKey))
+            ? Constants.Protocol.Create(initiator, s: _localKeyPair.PrivateKey, rs: publicKey.DecodeBase64())
             : Constants.Protocol.Create(initiator, s: _localKeyPair.PrivateKey);
-        RemotePublicKey = publicKey;
+        RemotePublicKey = publicKey.DecodeBase64().EncodeBase64();
     }
 
     public void SetDataHandler(Action<SyncSocketSession, IChannel, Opcode, byte, ReadOnlySpan<byte>>? onData)
@@ -154,7 +154,7 @@ public class ChannelRelayed : IChannel
         ThrowIfDisposed();
 
         RemoteVersion = remoteVersion;
-        RemotePublicKey = Convert.ToBase64String(_handshakeState!.RemoteStaticPublicKey);
+        RemotePublicKey = _handshakeState!.RemoteStaticPublicKey.ToArray().EncodeBase64();
         _handshakeState!.Dispose();
         _handshakeState = null;
         _transport = transport;
@@ -317,7 +317,7 @@ public class ChannelRelayed : IChannel
             var channelMessage = new byte[1024];
             var (channelBytesWritten, _, _) = _handshakeState!.WriteMessage(null, channelMessage);
 
-            byte[] publicKeyBytes = Convert.FromBase64String(publicKey);
+            byte[] publicKeyBytes = publicKey.DecodeBase64();
             if (publicKeyBytes.Length != 32)
                 throw new ArgumentException("Public key must be 32 bytes.");
 
