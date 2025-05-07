@@ -141,6 +141,17 @@ public class TcpSyncServer : IDisposable
     public int MaxRelayedConnectionsPerKey = 10;
     public int MaxKeypairsPerHour = 50;
 
+    private readonly object _pendingLock = new object();
+    private readonly LinkedList<SyncSession> _pendingHandshakes = new LinkedList<SyncSession>();
+    private const int MAX_PENDING_HANDSHAKES = 1000;
+    private readonly TimeSpan _acceptDelay = TimeSpan.FromMilliseconds(10);
+
+    private readonly ConcurrentDictionary<string, TokenBucket> _handshakeBuckets = new();
+    private readonly ConcurrentDictionary<string, DateTime> _ipHandshakeBlacklist = new();
+    private static readonly TimeSpan HandshakeWindow = TimeSpan.FromMinutes(1);
+    private const int MaxHandshakesPerWindow = 20;
+    private static readonly TimeSpan HandshakeBlacklistDuration = TimeSpan.FromMinutes(1);
+
     private readonly int _port;
     public int Port => (_listenSocket?.LocalEndPoint as IPEndPoint)?.Port ?? _port;
     private int _nextConnectionId = 0;
@@ -296,6 +307,8 @@ public class TcpSyncServer : IDisposable
             {
                 while (true)
                 {
+                    await Task.Delay(_acceptDelay);
+
                     MaxConnections.Wait();
                     var clientSocket = await _listenSocket.AcceptAsync();
                     if (clientSocket == null)
@@ -305,13 +318,41 @@ public class TcpSyncServer : IDisposable
                         return;
                     }
 
+                    string ip = ((IPEndPoint)clientSocket.RemoteEndPoint!).Address.ToString();
+                    if (_ipHandshakeBlacklist.TryGetValue(ip, out var blockedUntil) && blockedUntil > DateTime.UtcNow)
+                    {
+                        clientSocket.Close();
+                        MaxConnections.Release();
+                        continue;
+                    }
+
+                    var bucket = _handshakeBuckets.GetOrAdd(ip, _ => new TokenBucket(MaxHandshakesPerWindow, MaxHandshakesPerWindow / HandshakeWindow.TotalSeconds));
+                    if (!bucket.TryConsume(1))
+                    {
+                        _ipHandshakeBlacklist[ip] = DateTime.UtcNow + HandshakeBlacklistDuration;
+                        clientSocket.Close();
+                        MaxConnections.Release();
+                        continue;
+                    }
+
+                    SyncSession? session = null;
                     try
                     {
-                        clientSocket.ReceiveBufferSize = MAXIMUM_PACKET_SIZE_ENCRYPTED;
-                        clientSocket.SendBufferSize = MAXIMUM_PACKET_SIZE_ENCRYPTED;
+                        //Small buffer for handshake
+                        clientSocket.ReceiveBufferSize = 1024;
+                        clientSocket.SendBufferSize = 1024;
                         clientSocket.NoDelay = true;
 
-                        var session = new SyncSession(this, (s) => _sessions[s.RemotePublicKey!] = s, OnSessionClosed, _useRateLimits)
+                        session = new SyncSession(this, (s) =>
+                        {
+                            s.Socket.ReceiveBufferSize = MAXIMUM_PACKET_SIZE_ENCRYPTED;
+                            s.Socket.SendBufferSize = MAXIMUM_PACKET_SIZE_ENCRYPTED;
+
+                            lock (_pendingLock)
+                                _pendingHandshakes.Remove(s);
+
+                            _sessions[s.RemotePublicKey!] = s;
+                        }, OnSessionClosed, _useRateLimits)
                         {
                             Socket = clientSocket,
                             HandshakeState = NoiseProtocol.Create(false, s: _keyPair.PrivateKey)
@@ -327,6 +368,22 @@ public class TcpSyncServer : IDisposable
                     {
                         Logger.Error<TcpSyncServer>($"Accept processing error", ex);
                         MaxConnections.Release();
+                    }
+
+                    if (session != null)
+                    {
+                        lock (_pendingLock)
+                        {
+                            // Evict oldest if we're at capacity
+                            if (_pendingHandshakes.Count >= MAX_PENDING_HANDSHAKES)
+                            {
+                                var oldest = _pendingHandshakes.First!;
+                                _pendingHandshakes.RemoveFirst();
+                                oldest.Value.Dispose();
+                            }
+
+                            _pendingHandshakes.AddLast(session);
+                        }
                     }
                 }
             }
