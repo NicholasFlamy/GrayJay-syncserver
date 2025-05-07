@@ -279,10 +279,9 @@ public class SyncSession
 
                     bool isHandshakeComplete = _transport != null;
                     if (isHandshakeComplete)
-                    {
-                        await Task.Delay(pingInterval, _disposeCancellationTokenSource.Token);
                         await SendAsync(Opcode.PING, 0);
-                    }
+
+                    await Task.Delay(pingInterval, _disposeCancellationTokenSource.Token);
                 }
             }
             catch (Exception e)

@@ -329,6 +329,7 @@ public class TcpSyncServer : IDisposable
                     var bucket = _handshakeBuckets.GetOrAdd(ip, _ => new TokenBucket(MaxHandshakesPerWindow, MaxHandshakesPerWindow / HandshakeWindow.TotalSeconds));
                     if (!bucket.TryConsume(1))
                     {
+                        Logger.Warning<TcpSyncServer>($"Blacklisted IP {ip} for exceeding rate limit.");
                         _ipHandshakeBlacklist[ip] = DateTime.UtcNow + HandshakeBlacklistDuration;
                         clientSocket.Close();
                         MaxConnections.Release();
@@ -380,6 +381,8 @@ public class TcpSyncServer : IDisposable
                                 var oldest = _pendingHandshakes.First!;
                                 _pendingHandshakes.RemoveFirst();
                                 oldest.Value.Dispose();
+
+                                Logger.Warning<TcpSyncServer>($"Evicted {ip} for not completing handshake in time when server is under load.");
                             }
 
                             _pendingHandshakes.AddLast(session);
