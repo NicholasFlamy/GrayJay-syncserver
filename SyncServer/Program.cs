@@ -46,7 +46,7 @@ class Program
         });
         using var app = builder.Build();
         app.MapGet("/", () => Results.Text(JsonSerializer.Serialize(server.Metrics, TcpSyncServerMetricsContext.Default.TcpSyncServerMetrics), "text/json"));
-        app.Run("http://localhost:3131");
+        app.Run("http://0.0.0.0:3131");
 
         Console.CancelKeyPress += (_, __) =>
         {
