@@ -22,6 +22,7 @@ public class TcpSyncServerMetrics
         _server = server;
     }
 
+    public long StartTime => DateTimeOffset.UtcNow.ToUnixTimeSeconds();
     public long ActiveConnections;
     public long TotalConnectionsAccepted;
     public long TotalConnectionsClosed;
