@@ -590,6 +590,7 @@ public class SyncSession
                 if (data.Count < 16)
                 {
                     Logger.Error<SyncSession>("ResponseOpcode.TRANSPORT packet too short");
+                    Interlocked.Increment(ref _server.Metrics.TotalRelayedConnectionsFailed);
                     return;
                 }
 
@@ -601,6 +602,7 @@ public class SyncSession
                 {
                     Logger.Error<SyncSession>($"No relayed connection found for connectionId {connectionId}");
                     _server.RemoveRelayPairByConnectionId(connectionId);
+                    Interlocked.Increment(ref _server.Metrics.TotalRelayedConnectionsFailed);
                     return;
                 }
 
@@ -610,12 +612,14 @@ public class SyncSession
                     {
                         Logger.Error<SyncSession>("ResponseOpcode.TRANSPORT packet too short for message length");
                         _server.RemoveRelayedConnection(connectionId);
+                        Interlocked.Increment(ref _server.Metrics.TotalRelayedConnectionsFailed);
                         return;
                     }
                     int messageLength = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(16, 4));
                     if (data.Count != 20 + messageLength)
                     {
                         Logger.Error<SyncSession>($"Invalid ResponseOpcode.TRANSPORT packet size. Expected {20 + messageLength}, got {data.Count}");
+                        Interlocked.Increment(ref _server.Metrics.TotalRelayedConnectionsFailed);
                         return;
                     }
 
@@ -1092,6 +1096,7 @@ public class SyncSession
         {
             Logger.Error<SyncSession>("REQUEST_TRANSPORT packet too short");
             await SendEmptyResponseAsync(ResponseOpcode.TRANSPORT_RELAYED, requestId, (int)TransportResponseCode.GeneralError);
+            Interlocked.Increment(ref _server.Metrics.TotalRelayedConnectionsFailed);
             return;
         }
 
@@ -1111,6 +1116,7 @@ public class SyncSession
             {
                 Logger.Error<SyncSession>($"REQUEST_TRANSPORT packet too short for pairing message (app id: {appId})");
                 await SendEmptyResponseAsync(ResponseOpcode.TRANSPORT_RELAYED, requestId, (int)TransportResponseCode.PairingCodeDataMismatch);
+                Interlocked.Increment(ref _server.Metrics.TotalRelayedConnectionsFailed);
                 return;
             }
             offset += pairingMessageLength;
@@ -1123,6 +1129,7 @@ public class SyncSession
         {
             Logger.Error<SyncSession>($"Invalid REQUEST_TRANSPORT packet size. Expected {offset + 4 + channelMessageLength}, got {data.Count} (app id: {appId})");
             await SendEmptyResponseAsync(ResponseOpcode.TRANSPORT_RELAYED, requestId, (int)TransportResponseCode.ChannelMessageDataLengthMismatch);
+            Interlocked.Increment(ref _server.Metrics.TotalRelayedConnectionsFailed);
             return;
         }
 
@@ -1130,6 +1137,7 @@ public class SyncSession
         {
             Logger.Info<SyncSession>($"Relay request from {RemotePublicKey} to {targetPublicKey} rejected due to blacklist (app id: {appId}).");
             await SendEmptyResponseAsync(ResponseOpcode.TRANSPORT_RELAYED, requestId, (int)TransportResponseCode.Blacklisted);
+            Interlocked.Increment(ref _server.Metrics.TotalRelayedConnectionsFailed);
             return;
         }
 
@@ -1149,6 +1157,7 @@ public class SyncSession
                 }
                 Logger.Error<SyncSession>($"IP {ipAddress} exceeded relay request limit: {reasonByIp} (app id: {appId})");
                 await SendEmptyResponseAsync(ResponseOpcode.TRANSPORT_RELAYED, requestId, (int)TransportResponseCode.RateLimitExceeded);
+                Interlocked.Increment(ref _server.Metrics.TotalRelayedConnectionsFailed);
                 return;
             }
 
@@ -1165,6 +1174,7 @@ public class SyncSession
                 }
                 Logger.Error<SyncSession>($"Remote public key {RemotePublicKey!} exceeded relay request limit: {reasonByKey} (app id: {appId})");
                 await SendEmptyResponseAsync(ResponseOpcode.TRANSPORT_RELAYED, requestId, (int)TransportResponseCode.RateLimitExceeded);
+                Interlocked.Increment(ref _server.Metrics.TotalRelayedConnectionsFailed);
                 return;
             }
         }
@@ -1174,6 +1184,7 @@ public class SyncSession
         {
             Logger.Info<SyncSession>($"Target {targetPublicKey} not found for relay request (app id: {appId}).");
             await SendEmptyResponseAsync(ResponseOpcode.TRANSPORT_RELAYED, requestId, (int)TransportResponseCode.GeneralError);
+            Interlocked.Increment(ref _server.Metrics.TotalRelayedConnectionsFailed);
             return;
         }
 
