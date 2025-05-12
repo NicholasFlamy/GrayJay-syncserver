@@ -677,7 +677,7 @@ public class SyncSocketSession : IDisposable
                     {
                         if (ip.AddressFamily == AddressFamily.InterNetwork)
                             ipv4Addresses.Add(ip);
-                        else if (ip.AddressFamily == AddressFamily.InterNetworkV6)
+                        else if (ip.AddressFamily == AddressFamily.InterNetworkV6 && !ip.IsIPv6LinkLocal)
                             ipv6Addresses.Add(ip);
                     }
                 }

@@ -70,6 +70,18 @@ public class TcpSyncServerMetrics
 
     public long MaxConnectionsCount => _server.MaxConnections.CurrentCount;
 
+    public int ConnectionInfoCount => _server.ConnectionInfoStore.Count;
+    public long TotalPublishConnectionInfoSuccesses;
+    public long TotalPublishConnectionInfoCount;
+    public long TotalPublishConnectionInfoFailures;
+    public long TotalPublishConnectionInfoTimeMs;
+    public long TotalRequestConnectionInfoSuccesses;
+    public long TotalRequestConnectionInfoFailures;
+    public long TotalRequestConnectionInfoTimeMs;
+    public long TotalRequestBulkConnectionInfoSuccesses;
+    public long TotalRequestBulkConnectionInfoFailures;
+    public long TotalRequestBulkConnectionInfoTimeMs;
+
     public long TotalRented => Utilities.TotalRented;
     public long TotalReturned => Utilities.TotalReturned;
 
@@ -130,9 +142,9 @@ public class TcpSyncServer : IDisposable
     public int SessionCount => _sessions.Count;
     private readonly KeyPair _keyPair;
     public KeyPair LocalKeyPair => _keyPair;
-    private readonly ConcurrentDictionary<(string, string), byte[]> _connectionInfoStore = new();
+    public readonly ConcurrentDictionary<(string, string), byte[]> ConnectionInfoStore = new();
     public readonly ConcurrentDictionary<long, RelayedConnection> RelayedConnections = new();
-    private ConcurrentDictionary<(string, string), DateTime> _relayBlacklist = new ConcurrentDictionary<(string, string), DateTime>();
+    private readonly ConcurrentDictionary<(string, string), DateTime> RelayBlacklist = new ConcurrentDictionary<(string, string), DateTime>();
 
     private readonly ConcurrentDictionary<string, TokenBucket> _ipTokenBuckets = new();
     private readonly ConcurrentDictionary<string, TokenBucket> _keyTokenBuckets = new();
@@ -204,9 +216,9 @@ public class TcpSyncServer : IDisposable
         if (remotePublicKey != null)
         {
             _sessions.TryRemove(remotePublicKey, out _);
-            var keysToRemove = _connectionInfoStore.Keys.Where(k => k.Item1 == remotePublicKey).ToList();
+            var keysToRemove = ConnectionInfoStore.Keys.Where(k => k.Item1 == remotePublicKey).ToList();
             foreach (var key in keysToRemove)
-                _connectionInfoStore.TryRemove(key, out _);
+                ConnectionInfoStore.TryRemove(key, out _);
         }
 
         Interlocked.Increment(ref Metrics.TotalConnectionsClosed);
@@ -273,12 +285,12 @@ public class TcpSyncServer : IDisposable
 
     public void StoreConnectionInfo(string publicKey, string intendedPublicKey, byte[] encryptedBlob)
     {
-        _connectionInfoStore[(publicKey, intendedPublicKey)] = encryptedBlob;
+        ConnectionInfoStore[(publicKey, intendedPublicKey)] = encryptedBlob;
     }
 
     public byte[]? RetrieveConnectionInfo(string targetPublicKey, string requestingPublicKey)
     {
-        if (_connectionInfoStore.TryGetValue((targetPublicKey, requestingPublicKey), out byte[]? block))
+        if (ConnectionInfoStore.TryGetValue((targetPublicKey, requestingPublicKey), out byte[]? block))
             return block;
         return null;
     }
@@ -401,7 +413,7 @@ public class TcpSyncServer : IDisposable
 
     public bool IsBlacklisted(string initiator, string target)
     {
-        if (_relayBlacklist.TryGetValue((initiator, target), out DateTime expiration))
+        if (RelayBlacklist.TryGetValue((initiator, target), out DateTime expiration))
         {
             if (DateTime.UtcNow < expiration)
             {
@@ -410,7 +422,7 @@ public class TcpSyncServer : IDisposable
             else
             {
                 // Expired, remove from blacklist
-                _relayBlacklist.TryRemove((initiator, target), out _);
+                RelayBlacklist.TryRemove((initiator, target), out _);
                 return false;
             }
         }
@@ -420,7 +432,7 @@ public class TcpSyncServer : IDisposable
     public void AddToBlacklist(string initiator, string target, TimeSpan duration)
     {
         DateTime expiration = DateTime.UtcNow + duration;
-        _relayBlacklist[(initiator, target)] = expiration;
+        RelayBlacklist[(initiator, target)] = expiration;
     }
 
     public void Dispose()

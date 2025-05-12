@@ -974,6 +974,7 @@ public class SyncSession
         {
             Logger.Error<SyncSession>("REQUEST_BULK_CONNECTION_INFO packet too short");
             await SendEmptyResponseAsync(ResponseOpcode.BULK_CONNECTION_INFO, requestId, (int)BulkConnectionInfoResponseCode.InvalidRequest);
+            Interlocked.Increment(ref _server.Metrics.TotalRequestBulkConnectionInfoFailures);
             return;
         }
         byte numKeys = data[0];
@@ -981,6 +982,7 @@ public class SyncSession
         {
             Logger.Error<SyncSession>("Invalid REQUEST_BULK_CONNECTION_INFO packet size");
             await SendEmptyResponseAsync(ResponseOpcode.BULK_CONNECTION_INFO, requestId, (int)BulkConnectionInfoResponseCode.InvalidRequest);
+            Interlocked.Increment(ref _server.Metrics.TotalRequestBulkConnectionInfoFailures);
             return;
         }
         var publicKeys = new List<string>(numKeys);
@@ -996,6 +998,8 @@ public class SyncSession
         writer.Write(requestId); // 4 bytes: Request ID
         writer.Write((int)BulkConnectionInfoResponseCode.Success);
         writer.Write(numKeys); // 1 byte: Number of responses
+
+        var sw = Stopwatch.StartNew();
         foreach (var pk in publicKeys)
         {
             var block = _server.RetrieveConnectionInfo(pk, requestingPublicKey);
@@ -1011,7 +1015,9 @@ public class SyncSession
                 writer.Write((byte)1); // 1 byte: Status (not found)
             }
         }
+        Interlocked.Add(ref _server.Metrics.TotalRequestBulkConnectionInfoTimeMs, sw.ElapsedMilliseconds);
         await SendAsync(Opcode.RESPONSE, (byte)ResponseOpcode.BULK_CONNECTION_INFO, responseData.ToArray());
+        Interlocked.Increment(ref _server.Metrics.TotalRequestBulkConnectionInfoSuccesses);
     }
 
     private void HandlePublishConnectionInfo(ReadOnlySpan<byte> data)
@@ -1019,12 +1025,17 @@ public class SyncSession
         if (RemotePublicKey == null)
         {
             Logger.Error<SyncSession>("Cannot publish connection info before handshake completes.");
+            Interlocked.Increment(ref _server.Metrics.TotalPublishConnectionInfoFailures);
             return;
         }
+
+        Interlocked.Increment(ref _server.Metrics.TotalPublishConnectionInfoSuccesses);
 
         int offset = 0;
         byte numEntries = data[offset];
         offset += 1;
+
+        var sw = Stopwatch.StartNew();
 
         var remoteIpBytes = ((IPEndPoint)Socket.RemoteEndPoint!).Address.GetAddressBytes();
         for (int i = 0; i < numEntries; i++)
@@ -1049,7 +1060,10 @@ public class SyncSession
             ciphertextSpan.CopyTo(block.AsSpan(1 + remoteIpBytes.Length + 48, ciphertextLength));
 
             _server.StoreConnectionInfo(RemotePublicKey, intendedPublicKey, block);
+            Interlocked.Increment(ref _server.Metrics.TotalPublishConnectionInfoCount);
         }
+
+        Interlocked.Add(ref _server.Metrics.TotalPublishConnectionInfoTimeMs, sw.ElapsedMilliseconds);
 
         Logger.Info<SyncSession>($"Published connection info for {numEntries} authorized keys by {RemotePublicKey}.");
     }
@@ -1059,17 +1073,21 @@ public class SyncSession
         if (data.Count != 32)
         {
             Logger.Error<SyncSession>("Invalid target public key length in REQUEST_CONNECTION_INFO");
-            await SendEmptyResponseAsync(ResponseOpcode.CONNECTION_INFO, requestId, (int)ConnectionInfoResponseCode.InvalidRequest); 
+            await SendEmptyResponseAsync(ResponseOpcode.CONNECTION_INFO, requestId, (int)ConnectionInfoResponseCode.InvalidRequest);
+            Interlocked.Increment(ref _server.Metrics.TotalRequestConnectionInfoFailures);
             return;
         }
 
         string targetPublicKey = Convert.ToBase64String(data.Slice(0, 32)); 
         string requestingPublicKey = RemotePublicKey!;
 
+        var sw = Stopwatch.StartNew();
         var block = _server.RetrieveConnectionInfo(targetPublicKey, requestingPublicKey);
+        Interlocked.Add(ref _server.Metrics.TotalRequestConnectionInfoTimeMs, sw.ElapsedMilliseconds);
         if (block == null)
         {
             await SendEmptyResponseAsync(ResponseOpcode.CONNECTION_INFO, requestId, (int)ConnectionInfoResponseCode.NotFound);
+            Interlocked.Increment(ref _server.Metrics.TotalRequestConnectionInfoFailures);
             return;
         }
 
@@ -1081,6 +1099,7 @@ public class SyncSession
             BinaryPrimitives.WriteInt32LittleEndian(responseData.AsSpan(4, 4), 0); //status code
             block.CopyTo(responseData.AsSpan(8));
             await SendAsync(Opcode.RESPONSE, (byte)ResponseOpcode.CONNECTION_INFO, responseData, 0, 8 + block.Length);
+            Interlocked.Increment(ref _server.Metrics.TotalRequestConnectionInfoSuccesses);
         }
         finally
         {
@@ -1457,6 +1476,7 @@ public class SyncSession
         {
             Logger.Error<SyncSession>("REQUEST_GET_RECORD packet too short");
             await SendEmptyResponseAsync(ResponseOpcode.GET_RECORD, requestId, (int)GetRecordResponseCode.InvalidRequest);
+            Interlocked.Increment(ref _server.Metrics.TotalGetRecordFailures);
             return;
         }
         byte[] publisherPublicKey = data.Slice(0, 32).ToArray();
@@ -1464,6 +1484,7 @@ public class SyncSession
         if (keyLength > 32)
         {
             await SendEmptyResponseAsync(ResponseOpcode.GET_RECORD, requestId, (int)GetRecordResponseCode.InvalidRequest);
+            Interlocked.Increment(ref _server.Metrics.TotalGetRecordFailures);
             return;
         }
         string key = Encoding.UTF8.GetString(data.Slice(33, keyLength));
