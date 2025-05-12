@@ -1,11 +1,16 @@
 ﻿using System.Buffers;
 using System.Buffers.Binary;
 using System.Diagnostics;
+using System.Drawing;
+using System.IO.Compression;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 using Noise;
 using SyncShared;
+using static System.Runtime.InteropServices.JavaScript.JSType;
 using static SyncServer.TcpSyncServer;
 using LogLevel = SyncShared.LogLevel;
 
@@ -27,231 +32,285 @@ public class SyncSession
         WaitingForData
     }
 
-    public const int HEADER_SIZE = 6;
+    public const int HEADER_SIZE = 7;
     public const int MAXIMUM_PACKET_SIZE = 65535 - 16;
     public const int MAXIMUM_PACKET_SIZE_ENCRYPTED = MAXIMUM_PACKET_SIZE + 16;
     private const long KV_STORAGE_LIMIT_PER_PUBLISHER = 10 * 1024 * 1024; // 10MB
     private const int MAX_ACTIVE_STREAMS = 10;
 
     public required Socket Socket { get; init; }
-    public required SocketAsyncEventArgs ReadArgs { get; init; }
-    public required SocketAsyncEventArgs WriteArgs { get; init; }
     public required HandshakeState HandshakeState { get; init; }
     public string? RemotePublicKey { get; private set; }
-    public SessionPrimaryState PrimaryState { get; set; } = SessionPrimaryState.VersionCheck;
-    public SessionSecondaryState SecondaryState { get; set; } = SessionSecondaryState.WaitingForSize;
     public int RemoteVersion { get; private set; } = -1;
-    private Queue<(byte[] data, int offset, int count, bool returnToPool)> _sendQueue = new Queue<(byte[], int, int, bool)>(16);
-    private long _sendQueueTotalSize = 0;
-    private const int MAX_SEND_QUEUE_ITEMS = 100;
-    private const long MAX_SEND_QUEUE_SIZE = 10 * 1024 * 1024;
-    private bool _isBusyWriting = false;
-    private int _messageSize = -1;
-    private byte[]? _accumulatedBuffer;
-    private int _accumulatedBytes = 0;
-    private byte[] _sizeBuffer = new byte[4];
-    private int _sizeAccumulatedBytes = 0;
-    private byte[] _sessionBuffer = new byte[1024];
-    private byte[] _decryptionBuffer = new byte[1024];
+    private byte[] _sessionBuffer = new byte[8 * 1024];
+    private byte[] _decryptionBuffer = new byte[8 * 1024];
     private readonly TcpSyncServer _server;
     private Transport? _transport;
     private Action<SyncSession> _onHandshakeComplete;
+    private Action<SyncSession> _onClose;
     private readonly Dictionary<int, SyncStream> _syncStreams = new();
     private int _streamIdGenerator = 0;
-    private readonly object _sendLock = new object();
+    private readonly SemaphoreSlim _sendSemaphore = new SemaphoreSlim(1);
+    private readonly bool _useRateLimits;
+    private bool _disposed = false;
+    private CancellationTokenSource _disposeCancellationTokenSource = new CancellationTokenSource();
+    private DateTime _lastPongTime = DateTime.Now;
 
-    public SyncSession(TcpSyncServer server, Action<SyncSession> onHandshakeComplete)
+    public SyncSession(TcpSyncServer server, Action<SyncSession> onHandshakeComplete, Action<SyncSession> onClose, bool useRateLimits = true)
     {
         _server = server;
         _onHandshakeComplete = onHandshakeComplete;
+        _onClose = onClose;
+        _useRateLimits = useRateLimits;
     }
 
     public void Dispose()
     {
+        if (_disposed)
+            return;
+
+        _disposed = true;
+        _disposeCancellationTokenSource.Cancel();
+        _onClose?.Invoke(this);
         HandshakeState?.Dispose();
-        _isBusyWriting = false;
         Socket?.Close();
-        PrimaryState = SessionPrimaryState.Closed;
-        if (_accumulatedBuffer != null)
-        {
-            Utilities.ReturnBytes(_accumulatedBuffer);
-            _accumulatedBuffer = null;
-        }
         lock (_syncStreams)
         {
             foreach (var pair in _syncStreams)
                 pair.Value.Dispose();
             _syncStreams.Clear();
         }
+        if (RemotePublicKey != null)
+        {
+            _server.RemoveRelayedConnectionsByPublicKey(RemotePublicKey);
+        }
     }
 
-    public void HandleData(int bytesReceived)
+    private async ValueTask<bool> ReceiveExactAsync(byte[] buffer, int offset, int size)
     {
-        var data = ReadArgs.Buffer.AsSpan(0, bytesReceived);
+        ThrowIfDisposed();
+
+        Stopwatch? sw = null;
         if (Logger.WillLog(LogLevel.Debug))
-            Logger.Debug<SyncSession>($"Received {bytesReceived} bytes.\n{Utilities.HexDump(data)}");
+            sw = new Stopwatch();
 
-        int offset = 0;
-        if (PrimaryState == SessionPrimaryState.VersionCheck)
+        int totalBytesReceived = 0;
+        while (totalBytesReceived < size)
         {
-            if (data.Length < 4)
-                throw new Exception("Expected exactly 4 bytes for version.");
+            _disposeCancellationTokenSource.Token.ThrowIfCancellationRequested();
 
-            HandleVersionCheck(data.Slice(0, 4));
-            PrimaryState = SessionPrimaryState.Handshake;
-            offset = 4;
+            sw?.Restart();
+            int bytesReceived = await Socket.ReceiveAsync(new ArraySegment<byte>(buffer, offset + totalBytesReceived, size - totalBytesReceived), cancellationToken: _disposeCancellationTokenSource.Token);
+            if (bytesReceived == 0)
+                return false;
+            if (Logger.WillLog(LogLevel.Debug))
+                Logger.Debug<SyncSession>($"Receive duration ({bytesReceived}/{size} bytes), requested {size - totalBytesReceived} bytes: {sw?.ElapsedMilliseconds}ms");
+            totalBytesReceived += bytesReceived;
         }
 
-        while (offset < bytesReceived)
-        {
-            if (SecondaryState == SessionSecondaryState.WaitingForSize)
-            {
-                int sizeBytesNeeded = 4 - _sizeAccumulatedBytes;
-                int available = bytesReceived - offset;
+        if (Logger.WillLog(LogLevel.Debug))
+            Logger.Debug<SyncSession>($"Received {totalBytesReceived} bytes.");
 
-                if (available < sizeBytesNeeded)
-                {
-                    data.Slice(offset, available).CopyTo(_sizeBuffer.AsSpan(_sizeAccumulatedBytes));
-                    _sizeAccumulatedBytes += available;
-                    offset += available;
-                    return;
-                }
-                else
-                {
-                    data.Slice(offset, sizeBytesNeeded).CopyTo(_sizeBuffer.AsSpan(_sizeAccumulatedBytes));
-                    _messageSize = BinaryPrimitives.ReadInt32LittleEndian(_sizeBuffer);
-
-                    if (_messageSize <= 0 || _messageSize > MAXIMUM_PACKET_SIZE_ENCRYPTED)
-                        throw new Exception($"Invalid message size: {_messageSize}");
-
-                    offset += sizeBytesNeeded;
-                    _sizeAccumulatedBytes = 0;
-                    SecondaryState = SessionSecondaryState.WaitingForData;
-                    _accumulatedBytes = 0;
-                }
-            }
-
-            if (SecondaryState == SessionSecondaryState.WaitingForData)
-            {
-                int available = bytesReceived - offset;
-                int needed = _messageSize - _accumulatedBytes;
-
-                if (available >= needed)
-                {
-                    if (_accumulatedBuffer != null)
-                    {
-                        if (_accumulatedBytes == 0 && available >= _messageSize)
-                        {
-                            HandlePacket(data.Slice(offset, _messageSize));
-                        }
-                        else
-                        {
-                            data.Slice(offset, needed).CopyTo(_accumulatedBuffer.AsSpan(_accumulatedBytes));
-                            HandlePacket(_accumulatedBuffer.AsSpan(0, _messageSize));
-                        }
-                    }
-                    else
-                    {
-                        HandlePacket(data.Slice(offset, _messageSize));
-                    }
-                    offset += needed;
-
-                    if (_accumulatedBuffer != null && _accumulatedBuffer != _sessionBuffer)
-                        Utilities.ReturnBytes(_accumulatedBuffer);
-
-                    _accumulatedBuffer = null;
-                    SecondaryState = SessionSecondaryState.WaitingForSize;
-                }
-                else
-                {
-                    if (_messageSize <= _sessionBuffer.Length)
-                        _accumulatedBuffer ??= _sessionBuffer;
-                    else
-                        _accumulatedBuffer ??= Utilities.RentBytes(_messageSize);
-
-                    data.Slice(offset, available).CopyTo(_accumulatedBuffer.AsSpan(_accumulatedBytes));
-                    _accumulatedBytes += available;
-                    offset += available;
-                    return;
-                }
-            }
-        }
+        return true;
     }
-    private void HandlePacket(ReadOnlySpan<byte> data)
-    {
-        int decryptedSize = data.Length - 16;
-        var shouldRent = decryptedSize > _decryptionBuffer.Length;
-        var decryptionBuffer = shouldRent ? Utilities.RentBytes(decryptedSize) : _decryptionBuffer;
 
-        try
+    public void Start()
+    {
+        ThrowIfDisposed();
+
+        _ = Task.Run(async () =>
         {
-            if (PrimaryState == SessionPrimaryState.Handshake)
+            try
             {
+                await SendVersionAsync();
+                if (!await ReceiveExactAsync(_sessionBuffer, 0, 4))
+                {
+                    Logger.Info<SyncSession>("Session closed while waiting for version.");
+                    return;
+                }
+                HandleVersionCheck(_sessionBuffer.AsSpan(0, 4));
+
                 Interlocked.Increment(ref _server.Metrics.TotalHandshakeAttempts);
 
+                if (!await ReceiveExactAsync(_sessionBuffer, 0, 4))
+                {
+                    Logger.Info<SyncSession>("Session closed while waiting for handshake size.");
+                    return;
+                }
+                int handshakeSize = BinaryPrimitives.ReadInt32LittleEndian(_sessionBuffer.AsSpan(0, 4));
+                if (handshakeSize > _sessionBuffer.Length)
+                    throw new Exception($"Handshake size should be less than {_sessionBuffer.Length} bytes.");
+
+                if (!await ReceiveExactAsync(_sessionBuffer, 0, handshakeSize))
+                {
+                    Logger.Info<SyncSession>("Session closed while waiting for handshake data.");
+                    return;
+                }
+                Logger.Info<SyncSession>($"HandshakeAsResponder: Received handshake message ({handshakeSize} bytes)");
+
+                var handshakeData = new ArraySegment<byte>(_sessionBuffer, 0, handshakeSize);
+
                 int offset = 0;
-                int pairingMessageLength = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(offset, 4));
+                uint appId = BinaryPrimitives.ReadUInt32LittleEndian(handshakeData.Slice(offset, 4));
+                offset += 4;
+                int pairingMessageLength = BinaryPrimitives.ReadInt32LittleEndian(handshakeData.Slice(offset, 4));
                 if (pairingMessageLength > 128)
-                    throw new InvalidDataException($"Received pairing message length ({pairingMessageLength}) exceeds maximum allowed size (128).");
+                    throw new InvalidDataException($"Received pairing message length ({pairingMessageLength}) exceeds maximum allowed size (128) (app id: {appId}).");
 
                 offset += 4;
 
                 string? receivedPairingCode = null;
                 if (pairingMessageLength > 0)
                 {
-                    if (data.Length < offset + pairingMessageLength)
-                        throw new InvalidDataException("Message too short for specified pairing message length.");
+                    if (handshakeData.Count < offset + pairingMessageLength)
+                        throw new InvalidDataException($"Message too short for specified pairing message length (app id: {appId}).");
                     var pairingProtocol = new Protocol(HandshakePattern.N, CipherFunction.ChaChaPoly, HashFunction.Blake2b);
                     using var pairingHandshakeState = pairingProtocol.Create(false, s: _server.LocalKeyPair.PrivateKey);
-                    var pairingMessage = data.Slice(offset, pairingMessageLength);
+                    var pairingMessage = handshakeData.Slice(offset, pairingMessageLength);
                     offset += pairingMessageLength;
                     var pairingPlaintext = new byte[512];
                     var (_, _, _) = pairingHandshakeState.ReadMessage(pairingMessage, pairingPlaintext);
                     receivedPairingCode = Encoding.UTF8.GetString(pairingPlaintext, 0, Array.IndexOf(pairingPlaintext, (byte)0, 0, Math.Min(32, pairingPlaintext.Length)));
-                    Logger.Info<SyncSession>($"HandshakeAsResponder: Received pairing code '{receivedPairingCode}' from client");
+                    Logger.Info<SyncSession>($"HandshakeAsResponder: Received pairing code '{receivedPairingCode}' from client (app id: {appId})");
                 }
 
-                if (data.Length < offset)
+                if (handshakeData.Count < offset)
                     throw new InvalidDataException("Message too short for channel handshake.");
-                var channelMessage = data.Slice(offset);
+                var channelMessage = handshakeData.Slice(offset);
                 var (_, _, _) = HandshakeState.ReadMessage(channelMessage, _decryptionBuffer);
                 var (bytesWritten, _, transport) = HandshakeState.WriteMessage(null, _decryptionBuffer);
-                Logger.Info<SyncSession>($"HandshakeAsResponder: Read channel message size {channelMessage.Length}");
+                Logger.Info<SyncSession>($"HandshakeAsResponder: Read channel message size {channelMessage.Count} (app id: {appId})");
 
                 BinaryPrimitives.WriteInt32LittleEndian(_sessionBuffer, bytesWritten);
                 _decryptionBuffer.AsSpan(0, bytesWritten).CopyTo(_sessionBuffer.AsSpan(4));
 
-                lock (_sendLock)
+                try
                 {
-                    Send(_sessionBuffer, 0, bytesWritten + 4);
+                    await _sendSemaphore.WaitAsync(_disposeCancellationTokenSource.Token);
+                    await SendAsync(_sessionBuffer, 0, bytesWritten + 4);
+                }
+                finally
+                {
+                    _sendSemaphore.Release();
                 }
 
-                Logger.Info<SyncSession>($"HandshakeAsResponder: Wrote response message size {bytesWritten}");
+                Logger.Info<SyncSession>($"HandshakeAsResponder: Wrote response message size {bytesWritten} (app id: {appId})");
 
                 _transport = transport;
                 RemotePublicKey = Convert.ToBase64String(HandshakeState.RemoteStaticPublicKey);
-                Logger.Info<SyncSession>($"HandshakeAsResponder: Remote public key {RemotePublicKey}");
+                Logger.Info<SyncSession>($"HandshakeAsResponder: Remote public key {RemotePublicKey} (app id: {appId})");
 
-                PrimaryState = SessionPrimaryState.DataTransfer;
                 _onHandshakeComplete?.Invoke(this);
                 Interlocked.Increment(ref _server.Metrics.TotalHandshakeSuccesses);
 
                 string ipAddress = GetIpAddress();
-                if (!_server.TryRegisterNewKeypair(ipAddress))
+                if (_useRateLimits && !_server.TryRegisterNewKeypair(ipAddress))
                 {
-                    Logger.Error<SyncSession>($"IP {ipAddress} exceeded keypair rate limit");
+                    Interlocked.Increment(ref _server.Metrics.TotalKeypairRegistrationRateLimitExceedances);
+                    Logger.Error<SyncSession>($"IP {ipAddress} exceeded keypair rate limit (app id: {appId})");
                     Dispose();
                     return;
                 }
 
                 if (receivedPairingCode != null)
-                    Logger.Info<SyncSession>($"Accepted pairing code '{receivedPairingCode}' from {RemotePublicKey}");
+                    Logger.Info<SyncSession>($"Accepted pairing code '{receivedPairingCode}' from {RemotePublicKey} (app id: {appId})");
+
+                while (!_disposeCancellationTokenSource.IsCancellationRequested)
+                {
+                    if (!await ReceiveExactAsync(_sessionBuffer, 0, 4))
+                    {
+                        Logger.Info<SyncSession>("Session closed while waiting for message size.");
+                        return;
+                    }
+                    int messageSize = BinaryPrimitives.ReadInt32LittleEndian(_sessionBuffer.AsSpan(0, 4));
+                    if (messageSize <= _sessionBuffer.Length)
+                    {
+                        if (!await ReceiveExactAsync(_sessionBuffer, 0, messageSize))
+                        {
+                            Logger.Info<SyncSession>("Session closed while waiting for message.");
+                            return;
+                        }
+                        await HandlePacketAsync(new ArraySegment<byte>(_sessionBuffer, 0, messageSize));
+                    }
+                    else
+                    {
+                        var buffer = Utilities.RentBytes(messageSize);
+                        try
+                        {
+                            if (!await ReceiveExactAsync(buffer, 0, messageSize))
+                            {
+                                Logger.Info<SyncSession>("Session closed while waiting for large message.");
+                                return;
+                            }
+                            await HandlePacketAsync(new ArraySegment<byte>(buffer, 0, messageSize));
+                        }
+                        finally
+                        {
+                            Utilities.ReturnBytes(buffer);
+                        }
+                    }
+                }
             }
-            else
+            catch (Exception e)
             {
-                int plen = Decrypt(data, decryptionBuffer);
-                HandleDecryptedPacket(decryptionBuffer.AsSpan().Slice(0, plen));
+                Logger.Error<SyncSession>($"Receive error", e);
             }
+            finally
+            {
+                Dispose();
+            }
+        });
+
+        _ = Task.Run(async () =>
+        {
+            _lastPongTime = DateTime.Now;
+            var pingInterval = TimeSpan.FromSeconds(5);
+            var disconnectInterval = TimeSpan.FromSeconds(30);
+
+            try
+            {
+                while (!_disposeCancellationTokenSource.IsCancellationRequested)
+                {
+                    if (DateTime.Now - _lastPongTime > disconnectInterval)
+                    {
+                        Logger.Error<SyncSession>("Session closed due to inactivity");
+                        break;
+                    }
+
+                    bool isHandshakeComplete = _transport != null;
+                    if (isHandshakeComplete)
+                        await SendAsync(Opcode.PING, 0);
+
+                    await Task.Delay(pingInterval, _disposeCancellationTokenSource.Token);
+                }
+            }
+            catch (Exception e)
+            {
+                Logger.Error<SyncSession>("Error in receive loop", e);
+            }
+            finally
+            {
+                Dispose();
+            }
+        });
+    }
+
+    private void ThrowIfDisposed()
+    {
+        if (_disposed)
+            throw new ObjectDisposedException("Object is disposed");
+    }
+
+    private async ValueTask HandlePacketAsync(ArraySegment<byte> data)
+    {
+        int decryptedSize = data.Count - 16;
+        var shouldRent = decryptedSize > _decryptionBuffer.Length;
+        var decryptionBuffer = shouldRent ? Utilities.RentBytes(decryptedSize) : _decryptionBuffer;
+
+        try
+        {
+            int plen = Decrypt(data, decryptionBuffer);
+            await HandleDecryptedPacketAsync(new ArraySegment<byte>(decryptionBuffer, 0, plen));
         }
         finally
         {
@@ -260,7 +319,7 @@ public class SyncSession
         }
     }
 
-    private void HandleStream(StreamOpcode subOpcode, Span<byte> data)
+    private async ValueTask HandleStreamAsync(StreamOpcode subOpcode, ArraySegment<byte> data)
     {
         switch (subOpcode)
         {
@@ -275,7 +334,9 @@ public class SyncSession
                     span = span.Slice(1);
                     byte subOp = span[0];
                     span = span.Slice(1);
-                    var syncStream = new SyncStream(expectedSize, (Opcode)op, subOp);
+                    ContentEncoding contentEncoding = (ContentEncoding)span[0];
+                    span = span.Slice(1);
+                    var syncStream = new SyncStream(expectedSize, (Opcode)op, subOp, contentEncoding);
                     if (span.Length > 0)
                         syncStream.Add(span);
                     lock (_syncStreams)
@@ -330,15 +391,15 @@ public class SyncSession
                         syncStream.Add(span);
                     if (!syncStream.IsComplete)
                         throw new Exception("After sync stream end, the stream must be complete");
-                    HandleDecryptedPacket(syncStream.Opcode, syncStream.SubOpcode, syncStream.GetBytes());
+                    await HandleDecryptedPacketAsync(syncStream.Opcode, syncStream.SubOpcode, syncStream.GetBytes(), syncStream.ContentEncoding);
                     break;
                 }
         }
     }
 
-    private void HandleRequest(RequestOpcode subOpcode, Span<byte> data)
+    private async ValueTask HandleRequest(RequestOpcode subOpcode, ArraySegment<byte> data)
     {
-        if (data.Length < 4)
+        if (data.Count < 4)
         {
             Logger.Error<SyncSession>("Received a request without a request id, terminating connection.");
             Dispose();
@@ -353,39 +414,39 @@ public class SyncSession
             switch (subOpcode)
             {
                 case RequestOpcode.CONNECTION_INFO:
-                    HandleRequestConnectionInfo(requestId, data);
+                    await HandleRequestConnectionInfoAsync(requestId, data);
                     break;
                 case RequestOpcode.TRANSPORT:
-                    HandleRequestTransport(requestId, data);
+                    await HandleRequestTransportAsync(requestId, data);
                     break;
                 case RequestOpcode.PUBLISH_RECORD:
-                    HandleRequestPublishRecord(requestId, data);
+                    await HandleRequestPublishRecordAsync(requestId, data);
                     break;
                 case RequestOpcode.BULK_DELETE_RECORD:
-                    HandleRequestBulkDeleteRecord(requestId, data);
+                    await HandleRequestBulkDeleteRecordAsync(requestId, data);
                     break;
                 case RequestOpcode.DELETE_RECORD:
-                    HandleRequestDeleteRecord(requestId, data);
+                    await HandleRequestDeleteRecordAsync(requestId, data);
                     break;
                 case RequestOpcode.LIST_RECORD_KEYS:
-                    HandleRequestListKeys(requestId, data);
+                    await HandleRequestListKeysAsync(requestId, data);
                     break;
                 case RequestOpcode.GET_RECORD:
-                    HandleRequestGetRecord(requestId, data);
+                    await HandleRequestGetRecordAsync(requestId, data);
                     break;
                 case RequestOpcode.BULK_PUBLISH_RECORD:
                     Interlocked.Increment(ref _server.Metrics.TotalPublishRecordRequests);
 
-                    if (data.Length < 10)
+                    if (data.Count < 10)
                     {
                         Logger.Error<SyncSession>("REQUEST_BULK_PUBLISH_RECORD packet too short");
-                        SendEmptyResponse(ResponseOpcode.BULK_PUBLISH_RECORD, requestId, (int)BulkPublishRecordResponseCode.InvalidRequest);
+                        await SendEmptyResponseAsync(ResponseOpcode.BULK_PUBLISH_RECORD, requestId, (int)BulkPublishRecordResponseCode.InvalidRequest);
                         return;
                     }
                     int keyLength = data[0];
-                    if (keyLength > 32 || data.Length < 6 + keyLength)
+                    if (keyLength > 32 || data.Count < 6 + keyLength)
                     {
-                        SendEmptyResponse(ResponseOpcode.BULK_PUBLISH_RECORD, requestId, (int)BulkPublishRecordResponseCode.InvalidRequest);
+                        await SendEmptyResponseAsync(ResponseOpcode.BULK_PUBLISH_RECORD, requestId, (int)BulkPublishRecordResponseCode.InvalidRequest);
                         return;
                     }
                     string key = Encoding.UTF8.GetString(data.Slice(1, keyLength));
@@ -396,18 +457,18 @@ public class SyncSession
                     byte[] publisherPublicKey = Convert.FromBase64String(RemotePublicKey!);
                     for (int i = 0; i < numConsumers; i++)
                     {
-                        if (offset + 36 > data.Length)
+                        if (offset + 36 > data.Count)
                         {
-                            SendEmptyResponse(ResponseOpcode.BULK_PUBLISH_RECORD, requestId, (int)BulkPublishRecordResponseCode.InvalidRequest);
+                            await SendEmptyResponseAsync(ResponseOpcode.BULK_PUBLISH_RECORD, requestId, (int)BulkPublishRecordResponseCode.InvalidRequest);
                             return;
                         }
                         byte[] consumerPublicKey = data.Slice(offset, 32).ToArray();
                         offset += 32;
                         int blobLength = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(offset, 4));
                         offset += 4;
-                        if (offset + blobLength > data.Length)
+                        if (offset + blobLength > data.Count)
                         {
-                            SendEmptyResponse(ResponseOpcode.BULK_PUBLISH_RECORD, requestId, (int)BulkPublishRecordResponseCode.InvalidRequest);
+                            await SendEmptyResponseAsync(ResponseOpcode.BULK_PUBLISH_RECORD, requestId, (int)BulkPublishRecordResponseCode.InvalidRequest);
                             return;
                         }
                         byte[] encryptedBlob = data.Slice(offset, blobLength).ToArray();
@@ -424,7 +485,7 @@ public class SyncSession
                             long totalSize = await _server.RecordRepository.GetTotalSizeAsync(publisherPublicKey);
                             if (totalSize + totalNewSize > KV_STORAGE_LIMIT_PER_PUBLISHER)
                             {
-                                SendEmptyResponse(ResponseOpcode.BULK_PUBLISH_RECORD, requestId, (int)BulkPublishRecordResponseCode.StorageLimitExceeded); // 2 = storage limit exceeded
+                                await SendEmptyResponseAsync(ResponseOpcode.BULK_PUBLISH_RECORD, requestId, (int)BulkPublishRecordResponseCode.StorageLimitExceeded); // 2 = storage limit exceeded
                                 return;
                             }
                             await _server.RecordRepository.BulkInsertOrUpdateAsync(records);
@@ -433,7 +494,7 @@ public class SyncSession
                             Interlocked.Add(ref _server.Metrics.TotalPublishRecordTimeMs, stopwatch.ElapsedMilliseconds);
                             Interlocked.Increment(ref _server.Metrics.PublishRecordCount);
                             Interlocked.Increment(ref _server.Metrics.TotalPublishRecordSuccesses);
-                            SendEmptyResponse(ResponseOpcode.BULK_PUBLISH_RECORD, requestId, (int)BulkPublishRecordResponseCode.Success); //Success
+                            await SendEmptyResponseAsync(ResponseOpcode.BULK_PUBLISH_RECORD, requestId, (int)BulkPublishRecordResponseCode.Success); //Success
                         }
                         catch (Exception ex)
                         {
@@ -442,22 +503,22 @@ public class SyncSession
                             Interlocked.Increment(ref _server.Metrics.PublishRecordCount);
                             Interlocked.Increment(ref _server.Metrics.TotalPublishRecordFailures);
                             Logger.Error<SyncSession>("Error bulk publishing records", ex);
-                            SendEmptyResponse(ResponseOpcode.BULK_PUBLISH_RECORD, requestId, (int)BulkPublishRecordResponseCode.GeneralError);
+                            await SendEmptyResponseAsync(ResponseOpcode.BULK_PUBLISH_RECORD, requestId, (int)BulkPublishRecordResponseCode.GeneralError);
                         }
                     });
                     break;
 
                 case RequestOpcode.BULK_GET_RECORD:
-                    if (data.Length < 10) // Minimum: requestId (4) + keyLength (1) + key (0) + numPublishers (1)
+                    if (data.Count < 10) // Minimum: requestId (4) + keyLength (1) + key (0) + numPublishers (1)
                     {
                         Logger.Error<SyncSession>("REQUEST_BULK_GET_RECORD packet too short");
-                        SendEmptyResponse(ResponseOpcode.BULK_GET_RECORD, requestId, (int)BulkGetRecordResponseCode.InvalidRequest);
+                        await SendEmptyResponseAsync(ResponseOpcode.BULK_GET_RECORD, requestId, (int)BulkGetRecordResponseCode.InvalidRequest);
                         return;
                     }
                     keyLength = data[0];
-                    if (keyLength > 32 || data.Length < 6 + keyLength)
+                    if (keyLength > 32 || data.Count < 6 + keyLength)
                     {
-                        SendEmptyResponse(ResponseOpcode.BULK_GET_RECORD, requestId, (int)BulkGetRecordResponseCode.InvalidRequest);
+                        await SendEmptyResponseAsync(ResponseOpcode.BULK_GET_RECORD, requestId, (int)BulkGetRecordResponseCode.InvalidRequest);
                         return;
                     }
                     key = Encoding.UTF8.GetString(data.Slice(1, keyLength));
@@ -467,9 +528,9 @@ public class SyncSession
 
                     for (int i = 0; i < numPublishers; i++)
                     {
-                        if (offset + 32 > data.Length)
+                        if (offset + 32 > data.Count)
                         {
-                            SendEmptyResponse(ResponseOpcode.BULK_GET_RECORD, requestId, (int)BulkGetRecordResponseCode.InvalidRequest);
+                            await SendEmptyResponseAsync(ResponseOpcode.BULK_GET_RECORD, requestId, (int)BulkGetRecordResponseCode.InvalidRequest);
                             return;
                         }
                         publisherPublicKeys.Add(data.Slice(offset, 32).ToArray());
@@ -494,21 +555,21 @@ public class SyncSession
                                 writer.Write(record.EncryptedBlob);
                                 writer.Write(record.Timestamp.ToBinary());
                             }
-                            Send(Opcode.RESPONSE, (byte)ResponseOpcode.BULK_GET_RECORD, ms.ToArray());
+                            await SendAsync(Opcode.RESPONSE, (byte)ResponseOpcode.BULK_GET_RECORD, ms.ToArray());
                         }
                         catch (Exception ex)
                         {
                             Logger.Error<SyncSession>("Error bulk getting records", ex);
-                            SendEmptyResponse(ResponseOpcode.BULK_GET_RECORD, requestId, (int)BulkGetRecordResponseCode.GeneralError);
+                            await SendEmptyResponseAsync(ResponseOpcode.BULK_GET_RECORD, requestId, (int)BulkGetRecordResponseCode.GeneralError);
                         }
                     });
                     break;
                 case RequestOpcode.BULK_CONNECTION_INFO:
-                    HandleRequestBulkConnectionInfo(requestId, data);
+                    await HandleRequestBulkConnectionInfoAsync(requestId, data);
                     break;
                 default:
                     Logger.Info<SyncSession>($"Invalid RequestOpcode received {subOpcode}.");
-                    SendEmptyResponse((ResponseOpcode)((byte)subOpcode), requestId, 1);
+                    await SendEmptyResponseAsync((ResponseOpcode)((byte)subOpcode), requestId, 1);
                     //TODO: Dispose?
                     break;
             }
@@ -516,17 +577,17 @@ public class SyncSession
         catch (Exception e)
         {
             Logger.Error<SyncSession>($"Generic error happened in request handler {subOpcode}.", e);
-            SendEmptyResponse((ResponseOpcode)((byte)subOpcode), requestId, 1);
+            await SendEmptyResponseAsync((ResponseOpcode)((byte)subOpcode), requestId, 1);
             //TODO: Dispose?
         }
     }
 
-    private void HandleResponse(ResponseOpcode subOpcode, Span<byte> data)
+    private async ValueTask HandleResponse(ResponseOpcode subOpcode, ArraySegment<byte> data)
     {
         switch (subOpcode)
         {
             case ResponseOpcode.TRANSPORT:
-                if (data.Length < 16)
+                if (data.Count < 16)
                 {
                     Logger.Error<SyncSession>("ResponseOpcode.TRANSPORT packet too short");
                     return;
@@ -535,80 +596,87 @@ public class SyncSession
                 int statusCode = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(0, 4));
                 long connectionId = BinaryPrimitives.ReadInt64LittleEndian(data.Slice(4, 8));
                 int requestId = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(12, 4));
+                var connection = _server.GetRelayedConnection(connectionId);
+                if (connection == null)
+                {
+                    Logger.Error<SyncSession>($"No relayed connection found for connectionId {connectionId}");
+                    _server.RemoveRelayPairByConnectionId(connectionId);
+                    return;
+                }
+
                 if (statusCode == 0)
                 {
-                    int messageLength = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(16, 4));
-                    if (data.Length != 20 + messageLength)
+                    if (data.Count < 20)
                     {
-                        Logger.Error<SyncSession>($"Invalid ResponseOpcode.TRANSPORT packet size. Expected {20 + messageLength}, got {data.Length}");
+                        Logger.Error<SyncSession>("ResponseOpcode.TRANSPORT packet too short for message length");
+                        _server.RemoveRelayedConnection(connectionId);
+                        return;
+                    }
+                    int messageLength = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(16, 4));
+                    if (data.Count != 20 + messageLength)
+                    {
+                        Logger.Error<SyncSession>($"Invalid ResponseOpcode.TRANSPORT packet size. Expected {20 + messageLength}, got {data.Count}");
                         return;
                     }
 
-                    var responseHandshakeMessage = data.Slice(20, messageLength);
-                    var connection = _server.GetRelayedConnection(connectionId);
-                    if (connection != null)
+                    connection.Target = this;
+                    connection.IsActive = true;
+                    var packetSize = 24 + messageLength;
+                    var packetToInitiator = Utilities.RentBytes(packetSize);
+                    try
                     {
-                        connection.Target = this;
-                        connection.IsActive = true;
-                        var packetSize = 24 + messageLength;
-                        var packetToInitiator = Utilities.RentBytes(packetSize);
-                        try
-                        {
-                            BinaryPrimitives.WriteInt32LittleEndian(packetToInitiator.AsSpan(0, 4), requestId);
-                            BinaryPrimitives.WriteInt32LittleEndian(packetToInitiator.AsSpan(4, 4), statusCode);
-                            BinaryPrimitives.WriteInt32LittleEndian(packetToInitiator.AsSpan(8, 4), RemoteVersion);
-                            BinaryPrimitives.WriteInt64LittleEndian(packetToInitiator.AsSpan(12, 8), connectionId);
-                            BinaryPrimitives.WriteInt32LittleEndian(packetToInitiator.AsSpan(20, 4), messageLength);
-                            responseHandshakeMessage.CopyTo(packetToInitiator.AsSpan(24));
-                            connection.Initiator.Send(Opcode.RESPONSE, (byte)ResponseOpcode.TRANSPORT_RELAYED, packetToInitiator.AsSpan(0, packetSize));
-                            Interlocked.Increment(ref _server.Metrics.TotalRelayedConnectionsEstablished);
-                        }
-                        finally
-                        {
-                            Utilities.ReturnBytes(packetToInitiator);
-                        }
+                        BinaryPrimitives.WriteInt32LittleEndian(packetToInitiator.AsSpan(0, 4), requestId);
+                        BinaryPrimitives.WriteInt32LittleEndian(packetToInitiator.AsSpan(4, 4), statusCode);
+                        BinaryPrimitives.WriteInt32LittleEndian(packetToInitiator.AsSpan(8, 4), RemoteVersion);
+                        BinaryPrimitives.WriteInt64LittleEndian(packetToInitiator.AsSpan(12, 8), connectionId);
+                        BinaryPrimitives.WriteInt32LittleEndian(packetToInitiator.AsSpan(20, 4), messageLength);
+                        data.Slice(20, messageLength).CopyTo(new ArraySegment<byte>(packetToInitiator, 24, messageLength));
+                        await connection.Initiator.SendAsync(Opcode.RESPONSE, (byte)ResponseOpcode.TRANSPORT_RELAYED, new ArraySegment<byte>(packetToInitiator, 0, packetSize));
+                        Interlocked.Increment(ref _server.Metrics.TotalRelayedConnectionsEstablished);
                     }
-                    else
+                    finally
                     {
-                        Logger.Error<SyncSession>($"No relayed connection found for connectionId {connectionId}");
-                        _server.RemoveRelayedConnection(connectionId);
-                        Interlocked.Increment(ref _server.Metrics.TotalRelayedConnectionsFailed);
+                        Utilities.ReturnBytes(packetToInitiator);
                     }
                 }
                 else
                 {
-                    var connection = _server.GetRelayedConnection(connectionId);
-                    if (connection != null)
+                    byte[] packetToInitiator = Utilities.RentBytes(8);
+                    try
                     {
-                        //TODO: Maybe make RequestId -> StatusCode a generic pattern and have a general flow for Request->Response
-                        Span<byte> packetToInitiator = stackalloc byte[8];
-                        BinaryPrimitives.WriteInt32LittleEndian(packetToInitiator.Slice(0, 4), requestId);
-                        BinaryPrimitives.WriteInt32LittleEndian(packetToInitiator.Slice(4, 4), statusCode);
-                        connection.Initiator.Send(Opcode.RESPONSE, (byte)ResponseOpcode.TRANSPORT_RELAYED, packetToInitiator);
+                        BinaryPrimitives.WriteInt32LittleEndian(packetToInitiator.AsSpan().Slice(0, 4), requestId);
+                        BinaryPrimitives.WriteInt32LittleEndian(packetToInitiator.AsSpan().Slice(4, 4), statusCode);
+                        await connection.Initiator.SendAsync(Opcode.RESPONSE, (byte)ResponseOpcode.TRANSPORT_RELAYED, new ArraySegment<byte>(packetToInitiator, 0, 8));
                         _server.RemoveRelayedConnection(connectionId);
-
-                        string initiatorPublicKey = connection.Initiator.RemotePublicKey!;
-                        string targetPublicKey = this.RemotePublicKey!;
-                        _server.AddToBlacklist(initiatorPublicKey, targetPublicKey, TimeSpan.FromMinutes(5));
-                        Logger.Info<SyncSession>($"Added relay from {initiatorPublicKey} to {targetPublicKey} to blacklist for 5 minutes due to rejection.");
+                        if (statusCode != (int)TransportResponseCode.DuplicateConnection)
+                        {
+                            string initiatorPublicKey = connection.Initiator.RemotePublicKey!;
+                            string targetPublicKey = RemotePublicKey!;
+                            _server.AddToBlacklist(initiatorPublicKey, targetPublicKey, TimeSpan.FromMinutes(5));
+                            Logger.Info<SyncSession>($"Added relay from {initiatorPublicKey} to {targetPublicKey} to blacklist for 5 minutes due to rejection.");
+                        }
+                    }
+                    finally
+                    {
+                        Utilities.ReturnBytes(packetToInitiator);
                     }
                 }
                 break;
         }
     }
 
-    private void HandleRelay(RelayOpcode opcode, Span<byte> data)
+    private async ValueTask HandleRelayAsync(RelayOpcode opcode, ArraySegment<byte> data)
     {
         switch (opcode)
         {
             case RelayOpcode.DATA:
-                ForwardRelayData(data);
+                await ForwardRelayDataAsync(data);
                 break;
             case RelayOpcode.ERROR:
-                ForwardRelayError(data);
+                await ForwardRelayErrorAsync(data);
                 break;
             case RelayOpcode.RELAY_ERROR:
-                HandleRelayError(data);
+                await HandleRelayErrorAsync(data);
                 break;
         }
     }
@@ -623,27 +691,47 @@ public class SyncSession
         }
     }
 
-    private void HandleDecryptedPacket(Opcode opcode, byte subOpcode, Span<byte> data)
+    private async ValueTask HandleDecryptedPacketAsync(Opcode opcode, byte subOpcode, ArraySegment<byte> data, ContentEncoding contentEncoding)
     {
+        if (contentEncoding == ContentEncoding.Gzip)
+        {
+            var isGzipSupported = opcode == Opcode.DATA;
+            if (!isGzipSupported)
+                throw new Exception($"Failed to handle packet, gzip is not supported for this opcode (opcode = {opcode}, subOpcode = {subOpcode}, data.length = {data.Count}).");
+
+            using (var compressedStream = new MemoryStream(data.Array!, data.Offset, data.Count))
+            using (var decompressedStream = new MemoryStream())
+            {
+                using (var gzipStream = new GZipStream(compressedStream, CompressionMode.Decompress))
+                {
+                    gzipStream.CopyTo(decompressedStream);
+                }
+                data = decompressedStream.ToArray();
+            }
+        }
+
         switch (opcode)
         {
             case Opcode.STREAM:
-                HandleStream((StreamOpcode)subOpcode, data);
+                await HandleStreamAsync((StreamOpcode)subOpcode, data);
                 break;
             case Opcode.PING:
-                Send(Opcode.PONG);
+                await SendAsync(Opcode.PONG);
+                break;
+            case Opcode.PONG:
+                _lastPongTime = DateTime.Now;
                 break;
             case Opcode.REQUEST:
-                HandleRequest((RequestOpcode)subOpcode, data);
+                await HandleRequest((RequestOpcode)subOpcode, data);
                 break;
             case Opcode.RESPONSE:
-                HandleResponse((ResponseOpcode)subOpcode, data);
+                await HandleResponse((ResponseOpcode)subOpcode, data);
                 break;
             case Opcode.NOTIFY:
                 HandleNotify((NotifyOpcode)subOpcode, data);
                 break;
             case Opcode.RELAY:
-                HandleRelay((RelayOpcode)subOpcode, data);
+                await HandleRelayAsync((RelayOpcode)subOpcode, data);
                 break;
             default:
                 Logger.Debug<SyncSession>($"Received unhandled opcode: {opcode}");
@@ -651,24 +739,25 @@ public class SyncSession
         }
     }
 
-    private void HandleDecryptedPacket(Span<byte> data)
+    private async ValueTask HandleDecryptedPacketAsync(ArraySegment<byte> data)
     {
         int size = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(0, 4));
-        if (size != data.Length - 4)
+        if (size != data.Count - 4)
             throw new Exception("Incomplete packet received");
 
         Opcode opcode = (Opcode)data[4];
         byte subOpcode = data[5];
-        var packetData = data.Slice(6);
+        ContentEncoding contentEncoding = (ContentEncoding)data[6];
+        var packetData = data.Slice(HEADER_SIZE);
 
-        if (Logger.WillLog(LogLevel.Verbose))
-            Logger.Verbose<SyncSession>($"HandleDecryptedPacket (opcode = {opcode}, subOpcode = {subOpcode}, size = {packetData.Length})");
-        HandleDecryptedPacket(opcode, subOpcode, packetData);
+        if (Logger.WillLog(LogLevel.Debug))
+            Logger.Debug<SyncSession>($"HandleDecryptedPacket (opcode = {opcode}, subOpcode = {subOpcode}, size = {packetData.Count})");
+        await HandleDecryptedPacketAsync(opcode, subOpcode, packetData, contentEncoding);
     }
 
-    private void ForwardRelayData(ReadOnlySpan<byte> data)
+    private async ValueTask ForwardRelayDataAsync(ArraySegment<byte> data)
     {
-        if (data.Length < 8)
+        if (data.Count < 8)
         {
             Logger.Error<SyncSession>("RELAY_DATA packet too short");
             return;
@@ -678,20 +767,20 @@ public class SyncSession
         var connection = _server.GetRelayedConnection(connectionId);
 
         string ipAddress = GetIpAddress();
-        if (!_server.IsRelayDataAllowedByIP(ipAddress, data.Length))
+        if (_useRateLimits && !_server.IsRelayDataAllowedByIP(ipAddress, data.Count))
         {
-            Interlocked.Increment(ref _server.Metrics.TotalRateLimitExceedances);
+            Interlocked.Increment(ref _server.Metrics.TotalRelayDataByIpRateLimitExceedances);
             Logger.Error<SyncSession>($"IP {ipAddress} exceeded relay data rate limit");
-            SendRelayError(connectionId, RelayErrorCode.RateLimitExceeded);
+            await SendRelayErrorAsync(connectionId, RelayErrorCode.RateLimitExceeded);
             _server.RemoveRelayedConnection(connectionId);
             return;
         }
 
-        if (!_server.IsRelayDataAllowedByConnectionId(connectionId, data.Length))
+        if (_useRateLimits && !_server.IsRelayDataAllowedByConnectionId(connectionId, data.Count))
         {
-            Interlocked.Increment(ref _server.Metrics.TotalRateLimitExceedances);
+            Interlocked.Increment(ref _server.Metrics.TotalRelayDataByConnectionIdRateLimitExceedances);
             Logger.Error<SyncSession>($"Received data to relay but exceeded ConnectionId rate limit for connectionId {connectionId}, connection terminated.");
-            SendRelayError(connectionId, RelayErrorCode.RateLimitExceeded);
+            await SendRelayErrorAsync(connectionId, RelayErrorCode.RateLimitExceeded);
             _server.RemoveRelayedConnection(connectionId);
             return;
         }
@@ -699,25 +788,32 @@ public class SyncSession
         if (connection == null || !connection.IsActive)
         {
             Logger.Error<SyncSession>($"Received data to relay but no relayed connection for connectionId {connectionId}");
-            SendRelayError(connectionId, RelayErrorCode.NotFound);
+            await SendRelayErrorAsync(connectionId, RelayErrorCode.NotFound);
+            _server.RemoveRelayedConnection(connectionId);
             return;
         }
         if (connection.Initiator != this && connection.Target != this)
         {
             Logger.Error<SyncSession>($"Received data to relay but unauthorized access to relayed connection {connectionId} by {this.RemotePublicKey}");
-            SendRelayError(connectionId, RelayErrorCode.Unauthorized);
+            await SendRelayErrorAsync(connectionId, RelayErrorCode.Unauthorized);
+            _server.RemoveRelayedConnection(connectionId);
             return;
         }
         SyncSession? otherClient = connection.Initiator == this ? connection.Target : connection.Initiator;
         if (otherClient != null)
         {
-            byte[] packet = Utilities.RentBytes(data.Length);
+            byte[] packet = Utilities.RentBytes(data.Count);
             try
             {
                 BinaryPrimitives.WriteInt64LittleEndian(packet.AsSpan(0, 8), connectionId);
-                data.Slice(8).CopyTo(packet.AsSpan(8));
-                otherClient.Send(Opcode.RELAY, (byte)RelayOpcode.RELAYED_DATA, packet.AsSpan(0, data.Length));
-                Interlocked.Add(ref _server.Metrics.TotalRelayedDataBytes, data.Length - 8);
+                data.Slice(8).CopyTo(packet, 8);
+                await otherClient.SendAsync(Opcode.RELAY, (byte)RelayOpcode.RELAYED_DATA, new ArraySegment<byte>(packet, 0, data.Count));
+                Interlocked.Add(ref _server.Metrics.TotalRelayedDataBytes, data.Count - 8);
+            }
+            catch (Exception e)
+            {
+                Logger.Warning<SyncSession>($"Failed to relay data from {RemotePublicKey} to {otherClient}. Closing connection.", e);
+                otherClient.Dispose();
             }
             finally
             {
@@ -728,9 +824,9 @@ public class SyncSession
             Logger.Warning<SyncSession>($"Relay data requested for null client by {this.RemotePublicKey}");
     }
 
-    private void ForwardRelayError(ReadOnlySpan<byte> data)
+    private async ValueTask ForwardRelayErrorAsync(ArraySegment<byte> data)
     {
-        if (data.Length < 8)
+        if (data.Count < 8)
         {
             Logger.Error<SyncSession>("ERROR relay packet too short");
             return;
@@ -741,25 +837,32 @@ public class SyncSession
         if (connection == null || !connection.IsActive)
         {
             Logger.Error<SyncSession>($"Received error to relay but no active relayed connection for connectionId {connectionId}");
-            SendRelayError(connectionId, RelayErrorCode.NotFound);
+            await SendRelayErrorAsync(connectionId, RelayErrorCode.NotFound);
+            _server.RemoveRelayPairByConnectionId(connectionId);
             return;
         }
         if (connection.Initiator != this && connection.Target != this)
         {
             Logger.Error<SyncSession>($"Received error to relay but unauthorized access to relayed connection {connectionId} by {this.RemotePublicKey}");
-            SendRelayError(connectionId, RelayErrorCode.Unauthorized);
+            await SendRelayErrorAsync(connectionId, RelayErrorCode.Unauthorized);
+            _server.RemoveRelayPairByConnectionId(connectionId);
             return;
         }
         SyncSession? otherClient = connection.Initiator == this ? connection.Target : connection.Initiator;
         if (otherClient != null)
         {
-            byte[] packet = Utilities.RentBytes(data.Length);
+            byte[] packet = Utilities.RentBytes(data.Count);
             try
             {
                 BinaryPrimitives.WriteInt64LittleEndian(packet.AsSpan(0, 8), connectionId);
-                data.Slice(8).CopyTo(packet.AsSpan(8));
-                otherClient.Send(Opcode.RELAY, (byte)RelayOpcode.RELAYED_ERROR, packet.AsSpan(0, data.Length));
-                Interlocked.Add(ref _server.Metrics.TotalRelayedErrorBytes, data.Length - 8);
+                data.Slice(8).CopyTo(packet, 8);
+                await otherClient.SendAsync(Opcode.RELAY, (byte)RelayOpcode.RELAYED_ERROR, new ArraySegment<byte>(packet, 0, data.Count));
+                Interlocked.Add(ref _server.Metrics.TotalRelayedErrorBytes, data.Count - 8);
+            }
+            catch (Exception e)
+            {
+                Logger.Warning<SyncSession>($"Failed to relay data from {RemotePublicKey} to {otherClient}. Closing connection.", e);
+                otherClient.Dispose();
             }
             finally
             {
@@ -770,9 +873,9 @@ public class SyncSession
             Logger.Warning<SyncSession>($"Relay error requested for null client by {this.RemotePublicKey}");
     }
 
-    private void HandleRelayError(ReadOnlySpan<byte> data)
+    private async ValueTask HandleRelayErrorAsync(ArraySegment<byte> data)
     {
-        if (data.Length < 12)
+        if (data.Count < 12)
         {
             Logger.Error<SyncSession>("RELAY_ERROR packet too short");
             return;
@@ -784,13 +887,15 @@ public class SyncSession
         if (connection == null || !connection.IsActive)
         {
             Logger.Error<SyncSession>($"Received relay error but no active relayed connection for connectionId {connectionId}");
-            SendRelayError(connectionId, RelayErrorCode.RateLimitExceeded);
+            await SendRelayErrorAsync(connectionId, RelayErrorCode.ConnectionClosed);
+            _server.RemoveRelayPairByConnectionId(connectionId);
             return;
         }
         if (connection.Initiator != this && connection.Target != this)
         {
             Logger.Error<SyncSession>($"Received relay error but it was unauthorized access to relayed connection {connectionId} by {this.RemotePublicKey}");
-            SendRelayError(connectionId, RelayErrorCode.Unauthorized);
+            await SendRelayErrorAsync(connectionId, RelayErrorCode.Unauthorized);
+            _server.RemoveRelayPairByConnectionId(connectionId);
             return;
         }
 
@@ -798,17 +903,17 @@ public class SyncSession
 
         SyncSession? otherClient = connection.Initiator == this ? connection.Target : connection.Initiator;
         if (otherClient != null)
-            otherClient.SendRelayError(connectionId, errorCode);
+            await otherClient.SendRelayErrorAsync(connectionId, errorCode);
 
         _server.RemoveRelayedConnection(connectionId);
     }
 
-    private void HandleRequestBulkDeleteRecord(int requestId, ReadOnlySpan<byte> data)
+    private async ValueTask HandleRequestBulkDeleteRecordAsync(int requestId, ArraySegment<byte> data)
     {
-        if (data.Length < 65) // Minimum: publisher (32) + consumer (32) + numKeys (1)
+        if (data.Count < 65) // Minimum: publisher (32) + consumer (32) + numKeys (1)
         {
             Logger.Error<SyncSession>("REQUEST_BULK_DELETE_RECORD packet too short");
-            SendEmptyResponse(ResponseOpcode.BULK_DELETE_RECORD, requestId, (int)BulkDeleteRecordResponseCode.InvalidRequest);
+            await SendEmptyResponseAsync(ResponseOpcode.BULK_DELETE_RECORD, requestId, (int)BulkDeleteRecordResponseCode.InvalidRequest);
             return;
         }
         byte[] publisherPublicKey = data.Slice(0, 32).ToArray();
@@ -819,16 +924,16 @@ public class SyncSession
 
         for (int i = 0; i < numKeys; i++)
         {
-            if (offset >= data.Length)
+            if (offset >= data.Count)
             {
-                SendEmptyResponse(ResponseOpcode.BULK_DELETE_RECORD, requestId, (int)BulkDeleteRecordResponseCode.InvalidRequest);
+                await SendEmptyResponseAsync(ResponseOpcode.BULK_DELETE_RECORD, requestId, (int)BulkDeleteRecordResponseCode.InvalidRequest);
                 return;
             }
             byte keyLength = data[offset];
             offset += 1;
-            if (offset + keyLength > data.Length || keyLength > 32)
+            if (offset + keyLength > data.Count || keyLength > 32)
             {
-                SendEmptyResponse(ResponseOpcode.BULK_DELETE_RECORD, requestId, (int)BulkDeleteRecordResponseCode.InvalidRequest);
+                await SendEmptyResponseAsync(ResponseOpcode.BULK_DELETE_RECORD, requestId, (int)BulkDeleteRecordResponseCode.InvalidRequest);
                 return;
             }
             string key = Encoding.UTF8.GetString(data.Slice(offset, keyLength));
@@ -840,7 +945,7 @@ public class SyncSession
         // Authorization: Sender must be publisher or consumer
         if (!senderPublicKey.SequenceEqual(publisherPublicKey) && !senderPublicKey.SequenceEqual(consumerPublicKey))
         {
-            SendEmptyResponse(ResponseOpcode.BULK_DELETE_RECORD, requestId, (int)BulkDeleteRecordResponseCode.Unauthorized); // Unauthorized
+            await SendEmptyResponseAsync(ResponseOpcode.BULK_DELETE_RECORD, requestId, (int)BulkDeleteRecordResponseCode.Unauthorized); // Unauthorized
             return;
         }
 
@@ -849,29 +954,29 @@ public class SyncSession
             try
             {
                 await _server.RecordRepository.BulkDeleteAsync(publisherPublicKey, consumerPublicKey, keys);
-                SendEmptyResponse(ResponseOpcode.BULK_DELETE_RECORD, requestId, (int)BulkDeleteRecordResponseCode.Success); // Success
+                await SendEmptyResponseAsync(ResponseOpcode.BULK_DELETE_RECORD, requestId, (int)BulkDeleteRecordResponseCode.Success); // Success
             }
             catch (Exception ex)
             {
                 Logger.Error<SyncSession>("Error bulk deleting records", ex);
-                SendEmptyResponse(ResponseOpcode.BULK_DELETE_RECORD, requestId, (int)BulkDeleteRecordResponseCode.GeneralError); // Error
+                await SendEmptyResponseAsync(ResponseOpcode.BULK_DELETE_RECORD, requestId, (int)BulkDeleteRecordResponseCode.GeneralError); // Error
             }
         });
     }
 
-    private void HandleRequestBulkConnectionInfo(int requestId, ReadOnlySpan<byte> data)
+    private async ValueTask HandleRequestBulkConnectionInfoAsync(int requestId, ArraySegment<byte> data)
     {
-        if (data.Length < 1)
+        if (data.Count < 1)
         {
             Logger.Error<SyncSession>("REQUEST_BULK_CONNECTION_INFO packet too short");
-            SendEmptyResponse(ResponseOpcode.BULK_CONNECTION_INFO, requestId, (int)BulkConnectionInfoResponseCode.InvalidRequest);
+            await SendEmptyResponseAsync(ResponseOpcode.BULK_CONNECTION_INFO, requestId, (int)BulkConnectionInfoResponseCode.InvalidRequest);
             return;
         }
         byte numKeys = data[0];
-        if (data.Length != 1 + numKeys * 32)
+        if (data.Count != 1 + numKeys * 32)
         {
             Logger.Error<SyncSession>("Invalid REQUEST_BULK_CONNECTION_INFO packet size");
-            SendEmptyResponse(ResponseOpcode.BULK_CONNECTION_INFO, requestId, (int)BulkConnectionInfoResponseCode.InvalidRequest);
+            await SendEmptyResponseAsync(ResponseOpcode.BULK_CONNECTION_INFO, requestId, (int)BulkConnectionInfoResponseCode.InvalidRequest);
             return;
         }
         var publicKeys = new List<string>(numKeys);
@@ -902,7 +1007,7 @@ public class SyncSession
                 writer.Write((byte)1); // 1 byte: Status (not found)
             }
         }
-        Send(Opcode.RESPONSE, (byte)ResponseOpcode.BULK_CONNECTION_INFO, responseData.ToArray());
+        await SendAsync(Opcode.RESPONSE, (byte)ResponseOpcode.BULK_CONNECTION_INFO, responseData.ToArray());
     }
 
     private void HandlePublishConnectionInfo(ReadOnlySpan<byte> data)
@@ -942,15 +1047,15 @@ public class SyncSession
             _server.StoreConnectionInfo(RemotePublicKey, intendedPublicKey, block);
         }
 
-        Logger.Info<SyncSession>($"Published connection info for {numEntries} authorized keys.");
+        Logger.Info<SyncSession>($"Published connection info for {numEntries} authorized keys by {RemotePublicKey}.");
     }
 
-    private void HandleRequestConnectionInfo(int requestId, ReadOnlySpan<byte> data)
+    private async ValueTask HandleRequestConnectionInfoAsync(int requestId, ArraySegment<byte> data)
     {
-        if (data.Length != 32)
+        if (data.Count != 32)
         {
             Logger.Error<SyncSession>("Invalid target public key length in REQUEST_CONNECTION_INFO");
-            SendEmptyResponse(ResponseOpcode.CONNECTION_INFO, requestId, (int)ConnectionInfoResponseCode.InvalidRequest); 
+            await SendEmptyResponseAsync(ResponseOpcode.CONNECTION_INFO, requestId, (int)ConnectionInfoResponseCode.InvalidRequest); 
             return;
         }
 
@@ -960,7 +1065,7 @@ public class SyncSession
         var block = _server.RetrieveConnectionInfo(targetPublicKey, requestingPublicKey);
         if (block == null)
         {
-            SendEmptyResponse(ResponseOpcode.CONNECTION_INFO, requestId, (int)ConnectionInfoResponseCode.NotFound);
+            await SendEmptyResponseAsync(ResponseOpcode.CONNECTION_INFO, requestId, (int)ConnectionInfoResponseCode.NotFound);
             return;
         }
 
@@ -971,7 +1076,7 @@ public class SyncSession
             BinaryPrimitives.WriteInt32LittleEndian(responseData.AsSpan(0, 4), requestId);
             BinaryPrimitives.WriteInt32LittleEndian(responseData.AsSpan(4, 4), 0); //status code
             block.CopyTo(responseData.AsSpan(8));
-            Send(Opcode.RESPONSE, (byte)ResponseOpcode.CONNECTION_INFO, responseData, 0, 8 + block.Length);
+            await SendAsync(Opcode.RESPONSE, (byte)ResponseOpcode.CONNECTION_INFO, responseData, 0, 8 + block.Length);
         }
         finally
         {
@@ -979,144 +1084,199 @@ public class SyncSession
         }
     }
 
-    private void HandleRequestTransport(int requestId, ReadOnlySpan<byte> data)
+    private async ValueTask HandleRequestTransportAsync(int requestId, ArraySegment<byte> data)
     {
         Interlocked.Increment(ref _server.Metrics.TotalRelayedConnectionsRequested);
 
-        if (data.Length < 40)
+        if (data.Count < 40)
         {
             Logger.Error<SyncSession>("REQUEST_TRANSPORT packet too short");
-            SendEmptyResponse(ResponseOpcode.TRANSPORT_RELAYED, requestId, (int)TransportResponseCode.GeneralError);
+            await SendEmptyResponseAsync(ResponseOpcode.TRANSPORT_RELAYED, requestId, (int)TransportResponseCode.GeneralError);
             return;
         }
 
-        string targetPublicKey = Convert.ToBase64String(data.Slice(0, 32));
-        int pairingMessageLength = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(32, 4));
-        int offset = 36;
+        int offset = 0;
+        uint appId = BinaryPrimitives.ReadUInt32LittleEndian(data.Slice(offset, 4));
+        offset += 4;
+
+        string targetPublicKey = Convert.ToBase64String(data.Slice(offset, 32));
+        offset += 32;
+
+        int pairingMessageLength = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(offset, 4));
+        offset += 4;
 
         if (pairingMessageLength > 0)
         {
-            if (data.Length < offset + pairingMessageLength + 4)
+            if (data.Count < offset + pairingMessageLength + 4)
             {
-                Logger.Error<SyncSession>("REQUEST_TRANSPORT packet too short for pairing message");
-                SendEmptyResponse(ResponseOpcode.TRANSPORT_RELAYED, requestId, (int)TransportResponseCode.PairingCodeDataMismatch);
+                Logger.Error<SyncSession>($"REQUEST_TRANSPORT packet too short for pairing message (app id: {appId})");
+                await SendEmptyResponseAsync(ResponseOpcode.TRANSPORT_RELAYED, requestId, (int)TransportResponseCode.PairingCodeDataMismatch);
                 return;
             }
             offset += pairingMessageLength;
         }
+
+        Logger.Verbose<SyncSession>($"Transport request received (from = {RemotePublicKey}, to = {targetPublicKey}) (app id: {appId}).");
+
         int channelMessageLength = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(offset, 4));
-        if (data.Length != offset + 4 + channelMessageLength)
+        if (data.Count != offset + 4 + channelMessageLength)
         {
-            Logger.Error<SyncSession>($"Invalid REQUEST_TRANSPORT packet size. Expected {offset + 4 + channelMessageLength}, got {data.Length}");
-            SendEmptyResponse(ResponseOpcode.TRANSPORT_RELAYED, requestId, (int)TransportResponseCode.ChannelMessageDataLengthMismatch);
+            Logger.Error<SyncSession>($"Invalid REQUEST_TRANSPORT packet size. Expected {offset + 4 + channelMessageLength}, got {data.Count} (app id: {appId})");
+            await SendEmptyResponseAsync(ResponseOpcode.TRANSPORT_RELAYED, requestId, (int)TransportResponseCode.ChannelMessageDataLengthMismatch);
             return;
         }
-
-        byte[] pairingMessage = pairingMessageLength > 0 ? data.Slice(36, pairingMessageLength).ToArray() : Array.Empty<byte>();
-        byte[] channelHandshakeMessage = data.Slice(offset + 4, channelMessageLength).ToArray();
-
-        Logger.Verbose<SyncSession>($"Transport request received (from = {RemotePublicKey}, to = {targetPublicKey}).");
 
         if (_server.IsBlacklisted(RemotePublicKey!, targetPublicKey))
         {
-            Logger.Info<SyncSession>($"Relay request from {RemotePublicKey} to {targetPublicKey} rejected due to blacklist.");
-            SendEmptyResponse(ResponseOpcode.TRANSPORT_RELAYED, requestId, (int)TransportResponseCode.Blacklisted);
+            Logger.Info<SyncSession>($"Relay request from {RemotePublicKey} to {targetPublicKey} rejected due to blacklist (app id: {appId}).");
+            await SendEmptyResponseAsync(ResponseOpcode.TRANSPORT_RELAYED, requestId, (int)TransportResponseCode.Blacklisted);
             return;
         }
 
-        string ipAddress = GetIpAddress();
-        if (!_server.IsRelayRequestAllowedByIP(ipAddress))
+        if (_useRateLimits)
         {
-            Logger.Error<SyncSession>($"IP {ipAddress} exceeded relay request limit");
-            SendEmptyResponse(ResponseOpcode.TRANSPORT_RELAYED, requestId, (int)TransportResponseCode.RateLimitExceeded);
-            return;
-        }
+            string ipAddress = GetIpAddress();
+            var (allowedByIp, reasonByIp) = _server.IsRelayRequestAllowedByIP(ipAddress);
+            if (!allowedByIp)
+            {
+                if (reasonByIp == RateLimitReason.TokenRateLimitExceeded)
+                {
+                    Interlocked.Increment(ref _server.Metrics.TotalRelayRequestByIpTokenRateLimitExceedances);
+                }
+                else if (reasonByIp == RateLimitReason.ConnectionLimitExceeded)
+                {
+                    Interlocked.Increment(ref _server.Metrics.TotalRelayRequestByIpConnectionLimitExceedances);
+                }
+                Logger.Error<SyncSession>($"IP {ipAddress} exceeded relay request limit: {reasonByIp} (app id: {appId})");
+                await SendEmptyResponseAsync(ResponseOpcode.TRANSPORT_RELAYED, requestId, (int)TransportResponseCode.RateLimitExceeded);
+                return;
+            }
 
-        if (!_server.IsRelayRequestAllowedByKey(RemotePublicKey!))
-        {
-            Logger.Error<SyncSession>($"Remote public key {RemotePublicKey!} exceeded relay request limit");
-            SendEmptyResponse(ResponseOpcode.TRANSPORT_RELAYED, requestId, (int)TransportResponseCode.RateLimitExceeded);
-            return;
+            var (allowedByKey, reasonByKey) = _server.IsRelayRequestAllowedByKey(RemotePublicKey!);
+            if (!allowedByKey)
+            {
+                if (reasonByKey == RateLimitReason.TokenRateLimitExceeded)
+                {
+                    Interlocked.Increment(ref _server.Metrics.TotalRelayRequestByKeyTokenRateLimitExceedances);
+                }
+                else if (reasonByKey == RateLimitReason.ConnectionLimitExceeded)
+                {
+                    Interlocked.Increment(ref _server.Metrics.TotalRelayRequestByKeyConnectionLimitExceedances);
+                }
+                Logger.Error<SyncSession>($"Remote public key {RemotePublicKey!} exceeded relay request limit: {reasonByKey} (app id: {appId})");
+                await SendEmptyResponseAsync(ResponseOpcode.TRANSPORT_RELAYED, requestId, (int)TransportResponseCode.RateLimitExceeded);
+                return;
+            }
         }
 
         var targetSession = _server.GetSession(targetPublicKey);
         if (targetSession == null)
         {
-            Logger.Info<SyncSession>($"Target {targetPublicKey} not found for relay request.");
-            SendEmptyResponse(ResponseOpcode.TRANSPORT_RELAYED, requestId, (int)TransportResponseCode.GeneralError);
+            Logger.Info<SyncSession>($"Target {targetPublicKey} not found for relay request (app id: {appId}).");
+            await SendEmptyResponseAsync(ResponseOpcode.TRANSPORT_RELAYED, requestId, (int)TransportResponseCode.GeneralError);
             return;
         }
 
         long connectionId = _server.GetNextConnectionId();
-        _server.SetRelayedConnection(connectionId, this);
+        /* TODO REIMPLEMENT if (!_server.TryReserveRelayPair(RemotePublicKey!, targetPublicKey, connectionId, out var pair))
+        {
+            Logger.Info<SyncSession>($"Relay request from {RemotePublicKey} to {targetPublicKey} rejected due to existing connection (app id: {appId}).");
+            await SendEmptyResponseAsync(ResponseOpcode.TRANSPORT_RELAYED, requestId, (int)TransportResponseCode.DuplicateConnection);
+            return;
+        }*/
 
-        byte[] initiatorPublicKeyBytes = Convert.FromBase64String(RemotePublicKey!);
-
-        var packetSize = 4 + 8 + 4 + 32 + 4 + pairingMessageLength + 4 + channelMessageLength;
-        var packetToTarget = Utilities.RentBytes(packetSize);
+        bool setupFailed = true;
         try
         {
-            int packetOffset = 0;
-            BinaryPrimitives.WriteInt32LittleEndian(packetToTarget.AsSpan(packetOffset, 4), RemoteVersion);
-            packetOffset += 4;
-            BinaryPrimitives.WriteInt64LittleEndian(packetToTarget.AsSpan(packetOffset, 8), connectionId);
-            packetOffset += 8;
-            BinaryPrimitives.WriteInt32LittleEndian(packetToTarget.AsSpan(packetOffset, 4), requestId);
-            packetOffset += 4;
-            initiatorPublicKeyBytes.CopyTo(packetToTarget.AsSpan(packetOffset, 32));
-            packetOffset += 32;
-            BinaryPrimitives.WriteInt32LittleEndian(packetToTarget.AsSpan(packetOffset, 4), pairingMessageLength);
-            packetOffset += 4;
-            if (pairingMessageLength > 0)
-            {
-                pairingMessage.CopyTo(packetToTarget.AsSpan(packetOffset));
-                packetOffset += pairingMessageLength;
-            }
-            BinaryPrimitives.WriteInt32LittleEndian(packetToTarget.AsSpan(packetOffset, 4), channelMessageLength);
-            packetOffset += 4;
-            channelHandshakeMessage.CopyTo(packetToTarget.AsSpan(packetOffset));
+            _server.SetRelayedConnection(connectionId, this);
 
-            targetSession.Send(Opcode.REQUEST, (byte)RequestOpcode.TRANSPORT_RELAYED, packetToTarget.AsSpan(0, packetSize));
+            byte[] initiatorPublicKeyBytes = Convert.FromBase64String(RemotePublicKey!);
+            byte[] pairingMessage = pairingMessageLength > 0 ? data.Slice(40, pairingMessageLength).ToArray() : Array.Empty<byte>();
+            byte[] channelHandshakeMessage = data.Slice(offset + 4, channelMessageLength).ToArray();
+
+            var packetSize = 4 + 8 + 4 + 4 + 32 + 4 + pairingMessageLength + 4 + channelMessageLength;
+            var packetToTarget = Utilities.RentBytes(packetSize);
+
+            try
+            {
+                int packetOffset = 0;
+                BinaryPrimitives.WriteInt32LittleEndian(packetToTarget.AsSpan(packetOffset, 4), RemoteVersion);
+                packetOffset += 4;
+                BinaryPrimitives.WriteInt64LittleEndian(packetToTarget.AsSpan(packetOffset, 8), connectionId);
+                packetOffset += 8;
+                BinaryPrimitives.WriteInt32LittleEndian(packetToTarget.AsSpan(packetOffset, 4), requestId);
+                packetOffset += 4;
+                BinaryPrimitives.WriteUInt32LittleEndian(packetToTarget.AsSpan(packetOffset, 4), appId);
+                packetOffset += 4;
+                initiatorPublicKeyBytes.CopyTo(packetToTarget.AsSpan(packetOffset, 32));
+                packetOffset += 32;
+                BinaryPrimitives.WriteInt32LittleEndian(packetToTarget.AsSpan(packetOffset, 4), pairingMessageLength);
+                packetOffset += 4;
+                if (pairingMessageLength > 0)
+                {
+                    pairingMessage.CopyTo(packetToTarget.AsSpan(packetOffset));
+                    packetOffset += pairingMessageLength;
+                }
+                BinaryPrimitives.WriteInt32LittleEndian(packetToTarget.AsSpan(packetOffset, 4), channelMessageLength);
+                packetOffset += 4;
+                channelHandshakeMessage.CopyTo(packetToTarget.AsSpan(packetOffset));
+
+                await targetSession.SendAsync(Opcode.REQUEST, (byte)RequestOpcode.TRANSPORT_RELAYED, new ArraySegment<byte>(packetToTarget, 0, packetSize));
+                setupFailed = false;
+            }
+            finally
+            {
+                Utilities.ReturnBytes(packetToTarget);
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.Error<SyncSession>($"Failed to setup relay connection {connectionId}: {ex.Message} (app id: {appId})");
+            throw;
         }
         finally
         {
-            Utilities.ReturnBytes(packetToTarget);
+            if (setupFailed)
+                _server.RemoveRelayedConnection(connectionId);
         }
     }
 
-    private void HandleRequestPublishRecord(int requestId, ReadOnlySpan<byte> data)
+    private async ValueTask HandleRequestPublishRecordAsync(int requestId, ArraySegment<byte> data)
     {
+        Logger.Verbose<SyncSession>($"Received publish request with requestId {requestId}");
+
         Interlocked.Increment(ref _server.Metrics.TotalPublishRecordRequests);
 
-        if (data.Length < 37)
+        if (data.Count < 37)
         {
             Logger.Error<SyncSession>("REQUEST_PUBLISH_RECORD packet too short");
-            SendEmptyResponse(ResponseOpcode.PUBLISH_RECORD, requestId, (int)PublishRecordResponseCode.InvalidRequest); 
+            await SendEmptyResponseAsync(ResponseOpcode.PUBLISH_RECORD, requestId, (int)PublishRecordResponseCode.InvalidRequest); 
             return;
         }
         byte[] consumerPublicKey = data.Slice(0, 32).ToArray();
         int keyLength = data[32];
         if (keyLength > 32)
         {
-            SendEmptyResponse(ResponseOpcode.PUBLISH_RECORD, requestId, (int)PublishRecordResponseCode.ConsumerPublicKeyDataLengthMismatch);
+            await SendEmptyResponseAsync(ResponseOpcode.PUBLISH_RECORD, requestId, (int)PublishRecordResponseCode.ConsumerPublicKeyDataLengthMismatch);
             return;
         }
         string key = Encoding.UTF8.GetString(data.Slice(33, keyLength));
         int blobLengthOffset = 33 + keyLength;
         int blobLength = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(blobLengthOffset, 4));
-        if (data.Length < blobLengthOffset + 4 + blobLength)
+        if (data.Count < blobLengthOffset + 4 + blobLength)
         {
-            SendEmptyResponse(ResponseOpcode.PUBLISH_RECORD, requestId, (int)PublishRecordResponseCode.BlobPublicKeyDataLengthMismatch);
+            await SendEmptyResponseAsync(ResponseOpcode.PUBLISH_RECORD, requestId, (int)PublishRecordResponseCode.BlobPublicKeyDataLengthMismatch);
             return;
         }
         byte[] encryptedBlob = data.Slice(blobLengthOffset + 4, blobLength).ToArray();
         byte[] publisherPublicKey = Convert.FromBase64String(RemotePublicKey!);
 
         string ipAddress = GetIpAddress();
-        if (!_server.IsPublishRequestAllowed(ipAddress))
+        if (_useRateLimits && !_server.IsPublishRequestAllowed(ipAddress))
         {
+            Interlocked.Increment(ref _server.Metrics.TotalPublishRequestRateLimitExceedances);
             Logger.Error<SyncSession>($"IP {ipAddress} exceeded publish request rate limit");
-            SendEmptyResponse(ResponseOpcode.PUBLISH_RECORD, requestId, (int)PublishRecordResponseCode.RateLimitExceeded); 
+            await SendEmptyResponseAsync(ResponseOpcode.PUBLISH_RECORD, requestId, (int)PublishRecordResponseCode.RateLimitExceeded); 
             return;
         }
 
@@ -1130,7 +1290,7 @@ public class SyncSession
                 {
                     Logger.Error<SyncSession>($"KV_STORAGE_LIMIT_PER_PUBLISHER exceeded for key '{publisherPublicKey}'.");
                     Interlocked.Increment(ref _server.Metrics.TotalStorageLimitExceedances);
-                    SendEmptyResponse(ResponseOpcode.PUBLISH_RECORD, requestId, (int)PublishRecordResponseCode.StorageLimitExceeded); 
+                    await SendEmptyResponseAsync(ResponseOpcode.PUBLISH_RECORD, requestId, (int)PublishRecordResponseCode.StorageLimitExceeded); 
                     return;
                 }
                 await _server.RecordRepository.InsertOrUpdateAsync(publisherPublicKey, consumerPublicKey, key, encryptedBlob);
@@ -1138,7 +1298,8 @@ public class SyncSession
                 Interlocked.Add(ref _server.Metrics.TotalPublishRecordTimeMs, stopwatch.ElapsedMilliseconds);
                 Interlocked.Increment(ref _server.Metrics.PublishRecordCount);
                 Interlocked.Increment(ref _server.Metrics.TotalPublishRecordSuccesses);
-                SendEmptyResponse(ResponseOpcode.PUBLISH_RECORD, requestId, (int)PublishRecordResponseCode.Success);
+                Logger.Verbose<SyncSession>($"Publish request succeeded with requestId {requestId}");
+                await SendEmptyResponseAsync(ResponseOpcode.PUBLISH_RECORD, requestId, (int)PublishRecordResponseCode.Success);
             }
             catch (Exception ex)
             {
@@ -1147,7 +1308,8 @@ public class SyncSession
                 Interlocked.Increment(ref _server.Metrics.PublishRecordCount);
                 Interlocked.Increment(ref _server.Metrics.TotalPublishRecordFailures);
                 Logger.Error<SyncSession>("Error publishing record", ex);
-                SendEmptyResponse(ResponseOpcode.PUBLISH_RECORD, requestId, (int)PublishRecordResponseCode.GeneralError);
+                Logger.Verbose<SyncSession>($"Publish request failed with requestId {requestId}");
+                await SendEmptyResponseAsync(ResponseOpcode.PUBLISH_RECORD, requestId, (int)PublishRecordResponseCode.GeneralError);
             }
         });
     }
@@ -1157,15 +1319,15 @@ public class SyncSession
         return ((IPEndPoint)Socket.RemoteEndPoint!).Address.ToString();
     }
 
-    private void HandleRequestDeleteRecord(int requestId, ReadOnlySpan<byte> data)
+    private async ValueTask HandleRequestDeleteRecordAsync(int requestId, ArraySegment<byte> data)
     {
         Interlocked.Increment(ref _server.Metrics.TotalDeleteRecordRequests);
 
         // Parse request: publisherPublicKey (32), consumerPublicKey (32), keyLength (1), key (variable)
-        if (data.Length < 65) // Minimum size: 32 + 32 + 1 + 0
+        if (data.Count < 65) // Minimum size: 32 + 32 + 1 + 0
         {
             Logger.Error<SyncSession>("REQUEST_DELETE_RECORD packet too short");
-            SendEmptyResponse(ResponseOpcode.DELETE_RECORD, requestId, (int)DeleteRecordResponseCode.InvalidRequest);
+            await SendEmptyResponseAsync(ResponseOpcode.DELETE_RECORD, requestId, (int)DeleteRecordResponseCode.InvalidRequest);
             return;
         }
         byte[] publisherPublicKey = data.Slice(0, 32).ToArray();
@@ -1173,7 +1335,7 @@ public class SyncSession
         int keyLength = data[64];
         if (keyLength > 32)
         {
-            SendEmptyResponse(ResponseOpcode.DELETE_RECORD, requestId, (int)DeleteRecordResponseCode.InvalidRequest);
+            await SendEmptyResponseAsync(ResponseOpcode.DELETE_RECORD, requestId, (int)DeleteRecordResponseCode.InvalidRequest);
             return;
         }
         string key = Encoding.UTF8.GetString(data.Slice(65, keyLength));
@@ -1182,7 +1344,7 @@ public class SyncSession
         // Authorization: Sender must be publisher or consumer
         if (!senderPublicKey.SequenceEqual(publisherPublicKey) && !senderPublicKey.SequenceEqual(consumerPublicKey))
         {
-            SendEmptyResponse(ResponseOpcode.DELETE_RECORD, requestId, (int)DeleteRecordResponseCode.Unauthorized);
+            await SendEmptyResponseAsync(ResponseOpcode.DELETE_RECORD, requestId, (int)DeleteRecordResponseCode.Unauthorized);
             return;
         }
 
@@ -1193,7 +1355,7 @@ public class SyncSession
             {
                 await _server.RecordRepository.DeleteAsync(publisherPublicKey, consumerPublicKey, key);
                 stopwatch.Stop();
-                SendEmptyResponse(ResponseOpcode.DELETE_RECORD, requestId, (int)DeleteRecordResponseCode.Success);
+                await SendEmptyResponseAsync(ResponseOpcode.DELETE_RECORD, requestId, (int)DeleteRecordResponseCode.Success);
 
                 Interlocked.Add(ref _server.Metrics.TotalDeleteRecordTimeMs, stopwatch.ElapsedMilliseconds);
                 Interlocked.Increment(ref _server.Metrics.DeleteRecordCount);
@@ -1203,7 +1365,7 @@ public class SyncSession
             {
                 stopwatch.Stop();
                 Logger.Error<SyncSession>("Error deleting record", ex);
-                SendEmptyResponse(ResponseOpcode.DELETE_RECORD, requestId, (int)DeleteRecordResponseCode.GeneralError);
+                await SendEmptyResponseAsync(ResponseOpcode.DELETE_RECORD, requestId, (int)DeleteRecordResponseCode.GeneralError);
 
                 Interlocked.Add(ref _server.Metrics.TotalDeleteRecordTimeMs, stopwatch.ElapsedMilliseconds);
                 Interlocked.Increment(ref _server.Metrics.DeleteRecordCount);
@@ -1212,15 +1374,15 @@ public class SyncSession
         });
     }
 
-    private void HandleRequestListKeys(int requestId, ReadOnlySpan<byte> data)
+    private async ValueTask HandleRequestListKeysAsync(int requestId, ArraySegment<byte> data)
     {
         Interlocked.Increment(ref _server.Metrics.TotalListKeysRequests);
 
         // Parse request: publisherPublicKey (32), consumerPublicKey (32)
-        if (data.Length != 64)
+        if (data.Count != 64)
         {
             Logger.Error<SyncSession>("REQUEST_LIST_KEYS packet invalid size");
-            SendEmptyResponse(ResponseOpcode.LIST_RECORD_KEYS, requestId, (int)ListRecordKeysResponseCode.InvalidRequest);
+            await SendEmptyResponseAsync(ResponseOpcode.LIST_RECORD_KEYS, requestId, (int)ListRecordKeysResponseCode.InvalidRequest);
             return;
         }
         byte[] publisherPublicKey = data.Slice(0, 32).ToArray();
@@ -1230,7 +1392,7 @@ public class SyncSession
         // Authorization: Sender must be publisher or consumer
         if (!senderPublicKey.SequenceEqual(publisherPublicKey) && !senderPublicKey.SequenceEqual(consumerPublicKey))
         {
-            SendEmptyResponse(ResponseOpcode.LIST_RECORD_KEYS, requestId, (int)ListRecordKeysResponseCode.Unauthorized);
+            await SendEmptyResponseAsync(ResponseOpcode.LIST_RECORD_KEYS, requestId, (int)ListRecordKeysResponseCode.Unauthorized);
             return;
         }
 
@@ -1255,7 +1417,7 @@ public class SyncSession
                     writer.Write(timestamp.ToBinary());
                 }
                 var responseData = ms.ToArray();
-                Send(Opcode.RESPONSE, (byte)ResponseOpcode.LIST_RECORD_KEYS, responseData); // Success
+                await SendAsync(Opcode.RESPONSE, (byte)ResponseOpcode.LIST_RECORD_KEYS, responseData); // Success
 
                 Interlocked.Add(ref _server.Metrics.TotalListKeysTimeMs, stopwatch.ElapsedMilliseconds);
                 Interlocked.Increment(ref _server.Metrics.ListKeysCount);
@@ -1266,7 +1428,7 @@ public class SyncSession
                 stopwatch.Stop();
 
                 Logger.Error<SyncSession>("Error listing keys", ex);
-                SendEmptyResponse(ResponseOpcode.LIST_RECORD_KEYS, requestId, (int)ListRecordKeysResponseCode.GeneralError);
+                await SendEmptyResponseAsync(ResponseOpcode.LIST_RECORD_KEYS, requestId, (int)ListRecordKeysResponseCode.GeneralError);
 
                 Interlocked.Add(ref _server.Metrics.TotalListKeysTimeMs, stopwatch.ElapsedMilliseconds);
                 Interlocked.Increment(ref _server.Metrics.ListKeysCount);
@@ -1275,22 +1437,22 @@ public class SyncSession
         });
     }
 
-    private void HandleRequestGetRecord(int requestId, ReadOnlySpan<byte> data)
+    private async ValueTask HandleRequestGetRecordAsync(int requestId, ArraySegment<byte> data)
     {
         Interlocked.Increment(ref _server.Metrics.TotalGetRecordRequests);
 
         // Parse request: publisherPublicKey (32), consumerPublicKey (32), keyLength (1), key (variable)
-        if (data.Length < 33) // Minimum size: 32 + 1 + 0
+        if (data.Count < 33) // Minimum size: 32 + 1 + 0
         {
             Logger.Error<SyncSession>("REQUEST_GET_RECORD packet too short");
-            SendEmptyResponse(ResponseOpcode.GET_RECORD, requestId, (int)GetRecordResponseCode.InvalidRequest);
+            await SendEmptyResponseAsync(ResponseOpcode.GET_RECORD, requestId, (int)GetRecordResponseCode.InvalidRequest);
             return;
         }
         byte[] publisherPublicKey = data.Slice(0, 32).ToArray();
         int keyLength = data[32];
         if (keyLength > 32)
         {
-            SendEmptyResponse(ResponseOpcode.GET_RECORD, requestId, (int)GetRecordResponseCode.InvalidRequest);
+            await SendEmptyResponseAsync(ResponseOpcode.GET_RECORD, requestId, (int)GetRecordResponseCode.InvalidRequest);
             return;
         }
         string key = Encoding.UTF8.GetString(data.Slice(33, keyLength));
@@ -1314,7 +1476,7 @@ public class SyncSession
                     writer.Write(record.EncryptedBlob);
                     writer.Write(record.Timestamp.ToBinary());
                     var responseData = ms.ToArray();
-                    Send(Opcode.RESPONSE, (byte)ResponseOpcode.GET_RECORD, responseData);
+                    await SendAsync(Opcode.RESPONSE, (byte)ResponseOpcode.GET_RECORD, responseData);
 
                     Interlocked.Add(ref _server.Metrics.TotalGetRecordTimeMs, stopwatch.ElapsedMilliseconds);
                     Interlocked.Increment(ref _server.Metrics.GetRecordCount);
@@ -1322,7 +1484,7 @@ public class SyncSession
                 }
                 else
                 {
-                    SendEmptyResponse(ResponseOpcode.GET_RECORD, requestId, (int)GetRecordResponseCode.NotFound);
+                    await SendEmptyResponseAsync(ResponseOpcode.GET_RECORD, requestId, (int)GetRecordResponseCode.NotFound);
 
                     Interlocked.Add(ref _server.Metrics.TotalGetRecordTimeMs, stopwatch.ElapsedMilliseconds);
                     Interlocked.Increment(ref _server.Metrics.GetRecordCount);
@@ -1332,7 +1494,7 @@ public class SyncSession
             catch (Exception ex)
             {
                 Logger.Error<SyncSession>("Error getting record", ex);
-                SendEmptyResponse(ResponseOpcode.GET_RECORD, requestId, (int)GetRecordResponseCode.GeneralError);
+                await SendEmptyResponseAsync(ResponseOpcode.GET_RECORD, requestId, (int)GetRecordResponseCode.GeneralError);
             }
         });
     }
@@ -1351,48 +1513,100 @@ public class SyncSession
 
     private const int CURRENT_VERSION = 4;
     private static readonly byte[] VersionBytes = { CURRENT_VERSION, 0, 0, 0 };
-    public void SendVersion()
+    public async ValueTask SendVersionAsync()
     {
-        lock (_sendLock)
+        try
         {
-            Send(VersionBytes, 0, 4);
+            await _sendSemaphore.WaitAsync(_disposeCancellationTokenSource.Token);
+            await SendAsync(VersionBytes, 0, 4);
+        }
+        finally
+        {
+            _sendSemaphore.Release();
         }
     }
 
-    public void Send(Opcode opcode, byte subOpcode)
+    public async ValueTask SendAsync(Opcode opcode, byte subOpcode)
     {
-        var decryptedSize = 4 + 1 + 1;
+        ThrowIfDisposed();
+
+        var decryptedSize = HEADER_SIZE;
         var encryptedSize = decryptedSize + 4 + 16;
-        Span<byte> decryptedPacket = stackalloc byte[decryptedSize]; 
+        byte[] decryptedPacket = Utilities.RentBytes(decryptedSize);
         byte[] encryptedPacket = Utilities.RentBytes(encryptedSize);
 
-        BinaryPrimitives.WriteInt32LittleEndian(decryptedPacket.Slice(0, 4), decryptedSize - 4);
-        decryptedPacket[4] = (byte)opcode;
-        decryptedPacket[5] = (byte)subOpcode;
-
-        if (Logger.WillLog(LogLevel.Verbose))
-            Logger.Verbose<SyncSession>($"Send (opcode = {opcode}, subOpcode = {subOpcode}, size = 0)");
-
-        if (Logger.WillLog(LogLevel.Debug))
-            Logger.Debug<SyncSession>($"Encrypted message bytes {HEADER_SIZE}");
-
-        lock (_sendLock)
+        try
         {
-            var len = Encrypt(decryptedPacket.Slice(0, HEADER_SIZE), encryptedPacket.AsSpan().Slice(4));
-            BinaryPrimitives.WriteInt32LittleEndian(encryptedPacket.AsSpan().Slice(0, 4), len);
-            Send(encryptedPacket, 0, encryptedSize, true);
+            try
+            {
+                BinaryPrimitives.WriteInt32LittleEndian(decryptedPacket.AsSpan(0, 4), decryptedSize - 4);
+                decryptedPacket[4] = (byte)opcode;
+                decryptedPacket[5] = (byte)subOpcode;
+                decryptedPacket[6] = (byte)ContentEncoding.Raw;
 
-            if (Logger.WillLog(LogLevel.Debug))
-                Logger.Debug<SyncSession>($"Wrote message bytes {len}");
+                if (Logger.WillLog(LogLevel.Debug))
+                    Logger.Debug<SyncSession>($"Send (opcode = {opcode}, subOpcode = {subOpcode}, size = 0)");
+
+                if (Logger.WillLog(LogLevel.Debug))
+                    Logger.Debug<SyncSession>($"Encrypted message bytes {HEADER_SIZE}");
+
+                var len = Encrypt(decryptedPacket.AsSpan(0, HEADER_SIZE), encryptedPacket.AsSpan().Slice(4));
+                BinaryPrimitives.WriteInt32LittleEndian(encryptedPacket.AsSpan().Slice(0, 4), len);
+            }
+            finally
+            {
+                Utilities.ReturnBytes(decryptedPacket);
+            }
+
+            try
+            {
+                await _sendSemaphore.WaitAsync(_disposeCancellationTokenSource.Token);
+                await SendAsync(encryptedPacket, 0, encryptedSize);
+
+                if (Logger.WillLog(LogLevel.Debug))
+                    Logger.Debug<SyncSession>($"Wrote message bytes {encryptedSize}");
+            }
+            finally
+            {
+                _sendSemaphore.Release();
+            }
+        }
+        finally
+        {
+            Utilities.ReturnBytes(encryptedPacket);
         }
     }
 
-    public void Send(Opcode opcode, byte subOpcode, ReadOnlySpan<byte> data)
+    public async ValueTask SendAsync(Opcode opcode, byte subOpcode, ArraySegment<byte> data, ContentEncoding contentEncoding = ContentEncoding.Raw)
     {
-        if (Logger.WillLog(LogLevel.Verbose))
-            Logger.Verbose<SyncSession>($"Send (opcode = {opcode}, subOpcode = {subOpcode}, size = {data.Length})");
+        ThrowIfDisposed();
 
-        if (data.Length + HEADER_SIZE > MAXIMUM_PACKET_SIZE)
+        if (Logger.WillLog(LogLevel.Debug))
+            Logger.Debug<SyncSession>($"Send (opcode = {opcode}, subOpcode = {subOpcode}, size = {data.Count})");
+
+        ArraySegment<byte> processedData = data;
+        if (contentEncoding == ContentEncoding.Gzip)
+        {
+            var isGzipSupported = opcode == Opcode.DATA;
+            if (isGzipSupported)
+            {
+                using (var compressedStream = new MemoryStream())
+                {
+                    using (var gzipStream = new GZipStream(compressedStream, CompressionMode.Compress))
+                    {
+                        await gzipStream.WriteAsync(data.AsMemory(data.Offset, data.Count), _disposeCancellationTokenSource.Token);
+                    }
+                    processedData = compressedStream.ToArray();
+                }
+            }
+            else
+            {
+                Logger.Warning<SyncSession>($"Gzip requested but not supported on this (opcode = {opcode}, subOpcode = {subOpcode}), falling back.");
+                contentEncoding = ContentEncoding.Raw;
+            }
+        }
+
+        if (processedData.Count + HEADER_SIZE > MAXIMUM_PACKET_SIZE)
         {
             var segmentSize = MAXIMUM_PACKET_SIZE - HEADER_SIZE;
             var segmentData = Utilities.RentBytes(segmentSize);
@@ -1400,9 +1614,9 @@ public class SyncSession
             {
                 var id = Interlocked.Increment(ref _streamIdGenerator);
 
-                for (var sendOffset = 0; sendOffset < data.Length;)
+                for (var sendOffset = 0; sendOffset < processedData.Count;)
                 {
-                    var bytesRemaining = data.Length - sendOffset;
+                    var bytesRemaining = processedData.Count - sendOffset;
                     int bytesToSend;
                     int segmentPacketSize;
 
@@ -1410,8 +1624,8 @@ public class SyncSession
                     if (sendOffset == 0)
                     {
                         op = StreamOpcode.START;
-                        bytesToSend = segmentSize - 4 - 4 - 1 - 1;
-                        segmentPacketSize = bytesToSend + 4 + 4 + 1 + 1;
+                        bytesToSend = segmentSize - 4 - HEADER_SIZE;
+                        segmentPacketSize = bytesToSend + 4 + HEADER_SIZE;
                     }
                     else
                     {
@@ -1424,25 +1638,27 @@ public class SyncSession
                         segmentPacketSize = bytesToSend + 4 + 4;
                     }
 
+                    var segmentDataSegment = new ArraySegment<byte>(segmentData);
                     if (op == StreamOpcode.START)
                     {
                         //TODO: replace segmentData.AsSpan() into a local variable once C# 13
                         BinaryPrimitives.WriteInt32LittleEndian(segmentData.AsSpan().Slice(0, 4), id);
-                        BinaryPrimitives.WriteInt32LittleEndian(segmentData.AsSpan().Slice(4, 4), data.Length);
+                        BinaryPrimitives.WriteInt32LittleEndian(segmentData.AsSpan().Slice(4, 4), processedData.Count);
                         segmentData[8] = (byte)opcode;
                         segmentData[9] = (byte)subOpcode;
-                        data.Slice(sendOffset, bytesToSend).CopyTo(segmentData.AsSpan().Slice(10));
+                        segmentData[10] = (byte)contentEncoding;
+                        processedData.Slice(sendOffset, bytesToSend).CopyTo(segmentDataSegment.Slice(4 + HEADER_SIZE));
                     }
                     else
                     {
                         //TODO: replace segmentData.AsSpan() into a local variable once C# 13
                         BinaryPrimitives.WriteInt32LittleEndian(segmentData.AsSpan().Slice(0, 4), id);
                         BinaryPrimitives.WriteInt32LittleEndian(segmentData.AsSpan().Slice(4, 4), sendOffset);
-                        data.Slice(sendOffset, bytesToSend).CopyTo(segmentData.AsSpan().Slice(8));
+                        processedData.Slice(sendOffset, bytesToSend).CopyTo(segmentDataSegment.Slice(8));
                     }
 
                     sendOffset += bytesToSend;
-                    Send(Opcode.STREAM, (byte)op, segmentData.AsSpan().Slice(0, segmentPacketSize));
+                    await SendAsync(Opcode.STREAM, (byte)op, segmentDataSegment.Slice(0, segmentPacketSize), ContentEncoding.Raw);
                 }
             }
             finally
@@ -1452,176 +1668,143 @@ public class SyncSession
         }
         else
         {
-            var decryptedSize = 4 + 1 + 1 + data.Length;
+            var decryptedSize = HEADER_SIZE + processedData.Count;
             var encryptedSize = decryptedSize + 4 + 16;
             byte[] decryptedPacket = Utilities.RentBytes(decryptedSize);
             byte[] encryptedPacket = Utilities.RentBytes(encryptedSize);
 
             try
             {
-                BinaryPrimitives.WriteInt32LittleEndian(decryptedPacket.AsSpan().Slice(0, 4), decryptedSize - 4);
-                decryptedPacket[4] = (byte)opcode;
-                decryptedPacket[5] = (byte)subOpcode;
-                data.CopyTo(decryptedPacket.AsSpan().Slice(HEADER_SIZE));
+                try
+                {
+                    BinaryPrimitives.WriteInt32LittleEndian(decryptedPacket.AsSpan().Slice(0, 4), decryptedSize - 4);
+                    decryptedPacket[4] = (byte)opcode;
+                    decryptedPacket[5] = (byte)subOpcode;
+                    decryptedPacket[6] = (byte)ContentEncoding.Raw;
+                    processedData.CopyTo(new ArraySegment<byte>(decryptedPacket).Slice(HEADER_SIZE));
+                }
+                finally
+                {
+                    Utilities.ReturnBytes(decryptedPacket);
+                }
+
+                if (Logger.WillLog(LogLevel.Debug))
+                    Logger.Debug<SyncSession>($"Encrypted message bytes {processedData.Count + HEADER_SIZE}");
+
+                try
+                {
+                    await _sendSemaphore.WaitAsync(_disposeCancellationTokenSource.Token);
+
+                    var len = Encrypt(decryptedPacket.AsSpan().Slice(0, processedData.Count + HEADER_SIZE), encryptedPacket.AsSpan().Slice(4));
+                    BinaryPrimitives.WriteInt32LittleEndian(encryptedPacket.AsSpan().Slice(0, 4), len);
+                    await SendAsync(encryptedPacket, 0, encryptedSize);
+
+                    if (Logger.WillLog(LogLevel.Debug))
+                        Logger.Debug<SyncSession>($"Wrote message bytes {len}");
+                }
+                finally
+                {
+                    _sendSemaphore.Release();
+                }
             }
             finally
             {
-                Utilities.ReturnBytes(decryptedPacket);
-            }
-
-            if (Logger.WillLog(LogLevel.Debug))
-                Logger.Debug<SyncSession>($"Encrypted message bytes {data.Length + HEADER_SIZE}");
-
-            lock (_sendLock)
-            {
-                var len = Encrypt(decryptedPacket.AsSpan().Slice(0, data.Length + HEADER_SIZE), encryptedPacket.AsSpan().Slice(4));
-                BinaryPrimitives.WriteInt32LittleEndian(encryptedPacket.AsSpan().Slice(0, 4), len);
-                Send(encryptedPacket, 0, encryptedSize, true);
-
-                if (Logger.WillLog(LogLevel.Debug))
-                    Logger.Debug<SyncSession>($"Wrote message bytes {len}");
+                Utilities.ReturnBytes(encryptedPacket);
             }
         }
     }
 
-    public void Send(Opcode opcode, byte subOpcode = 0, byte[]? data = null, int offset = 0, int count = -1)
+    public async ValueTask SendAsync(Opcode opcode, byte subOpcode = 0, byte[]? data = null, int offset = 0, int count = -1, ContentEncoding contentEncoding = ContentEncoding.Raw)
     {
         if (count == -1)
             count = data?.Length ?? 0;
 
         if (data != null)
-            Send(opcode, subOpcode, data.AsSpan(offset, count));
+            await SendAsync(opcode, subOpcode, new ArraySegment<byte>(data, offset, count), contentEncoding);
         else
-            Send(opcode, subOpcode);
+            await SendAsync(opcode, subOpcode);
     }
 
     private int Encrypt(ReadOnlySpan<byte> source, Span<byte> destination)
     {
+        ThrowIfDisposed();
+
         int encryptedLength = _transport!.WriteMessage(source, destination);
         if (Logger.WillLog(LogLevel.Debug))
-            Logger.Debug<SyncSession>($"Encrypted message bytes (source size: {source.Length}, destination size: {encryptedLength})\n{Utilities.HexDump(source)}");
+            Logger.Debug<SyncSession>($"Encrypted message bytes (source size: {source.Length}, destination size: {encryptedLength})");
         return encryptedLength;
     }
 
     private int Decrypt(ReadOnlySpan<byte> source, Span<byte> destination)
     {
+        ThrowIfDisposed();
+
         int plen = _transport!.ReadMessage(source, destination);
         if (Logger.WillLog(LogLevel.Debug))
-            Logger.Debug<SyncSession>($"Decrypted message bytes (source size: {source.Length}, destination size: {plen})\n{Utilities.HexDump(destination.Slice(0, plen))}");
+            Logger.Debug<SyncSession>($"Decrypted message bytes (source size: {source.Length}, destination size: {plen})");
         return plen;
     }
 
     //TODO: Reuse buffer initially set by InitializeBufferPool
-    private void Send(byte[] data, int offset, int count, bool returnToPool = false)
+    private async ValueTask SendAsync(byte[] data, int offset, int count)
     {
-        if (!_isBusyWriting)
+        ThrowIfDisposed();
+
+        if (Logger.WillLog(LogLevel.Debug))
+            Logger.Debug<SyncSession>($"Sending {count} bytes.");
+
+        Stopwatch? sw = null;
+        if (Logger.WillLog(LogLevel.Debug))
+            sw = new Stopwatch();
+
+        int totalBytesSent = 0;
+        while (totalBytesSent < count)
         {
+            _disposeCancellationTokenSource.Token.ThrowIfCancellationRequested();
+
+            sw?.Restart();
             if (Logger.WillLog(LogLevel.Debug))
-                Logger.Debug<SyncSession>($"Sending {count} bytes.\n{Utilities.HexDump(data.AsSpan().Slice(offset, count))}");
+                Logger.Debug<SyncSession>($"Sending {count - totalBytesSent} bytes.");
 
-            WriteArgs.SetBuffer(data, offset, count);
-            ((ArgsPair)WriteArgs.UserToken!).ReturnToPool = returnToPool;
-            bool pending = Socket.SendAsync(WriteArgs!);
-            if (pending)
-            {
-                Logger.Verbose<SyncSession>($"Write not synchronously completed. Set isBusyWriting to true.");
-                _isBusyWriting = true;
-            }
-            else
-            {
-                if (Logger.WillLog(LogLevel.Verbose))
-                    Logger.Verbose<SyncSession>($"Sent {count} bytes synchronously.");
+            int bytesSent = await Socket.SendAsync(new ArraySegment<byte>(data, offset + totalBytesSent, count - totalBytesSent), cancellationToken: _disposeCancellationTokenSource.Token);
+            if (bytesSent == 0)
+                throw new Exception("Failed to send.");
+            if (Logger.WillLog(LogLevel.Debug))
+                Logger.Debug<SyncSession>($"Send duration ({bytesSent} bytes): {sw?.ElapsedMilliseconds}ms");
 
-                if (returnToPool)
-                    Utilities.ReturnBytes(data);
-            }
-        }
-        else
-        {
-            if (_sendQueue.Count >= MAX_SEND_QUEUE_ITEMS || _sendQueueTotalSize + count > MAX_SEND_QUEUE_SIZE)
-            {
-                Logger.Error<SyncSession>("Send queue too large, closing connection.");
-                Dispose();
-                if (returnToPool)
-                    Utilities.ReturnBytes(data);
-                return;
-            }
-            if (Logger.WillLog(LogLevel.Verbose))
-                Logger.Verbose<SyncSession>($"Queued {count} bytes to send.");
-            _sendQueue.Enqueue((data, offset, count, returnToPool));
-            _sendQueueTotalSize += count;
+            totalBytesSent += bytesSent;
         }
     }
 
-    private void SendEmptyResponse(ResponseOpcode responseOpcode, int requestId, int statusCode)
+    private async ValueTask SendEmptyResponseAsync(ResponseOpcode responseOpcode, int requestId, int statusCode)
     {
-        Span<byte> responseData = stackalloc byte[8];
-        BinaryPrimitives.WriteInt32LittleEndian(responseData.Slice(0, 4), requestId);
-        BinaryPrimitives.WriteInt32LittleEndian(responseData.Slice(4, 4), statusCode);
-        Send(Opcode.RESPONSE, (byte)responseOpcode, responseData);
-    }
+        Logger.Verbose<SyncSession>("SendEmptyResponse with requestId = " + requestId);
 
-    private void SendRelayError(long connectionId, RelayErrorCode errorCode)
-    {
-        Span<byte> errorPacket = stackalloc byte[12];
-        BinaryPrimitives.WriteInt64LittleEndian(errorPacket.Slice(0, 8), connectionId);
-        BinaryPrimitives.WriteInt32LittleEndian(errorPacket.Slice(8, 4), (int)errorCode);
-        Send(Opcode.RELAY, (byte)RelayOpcode.RELAY_ERROR, errorPacket);
-    }
-
-    public void OnWriteCompleted()
-    {
-        if (Logger.WillLog(LogLevel.Verbose))
-            Logger.Verbose<SyncSession>($"OnWriteCompleted (_sendQueue.Count = {_sendQueue.Count}, _isBusyWriting = {_isBusyWriting}).");
-
-        byte[] sentBuffer = WriteArgs.Buffer!;
-        var argsPair = (ArgsPair)WriteArgs.UserToken!;
-        if (argsPair.ReturnToPool)
-            Utilities.ReturnBytes(sentBuffer);
-
-        lock (_sendLock)
+        byte[] responseData = Utilities.RentBytes(12);
+        try
         {
-            if (_sendQueue.Count > 0)
-            {
-                bool lastSendPending = false;
+            BinaryPrimitives.WriteInt32LittleEndian(responseData.AsSpan().Slice(0, 4), requestId);
+            BinaryPrimitives.WriteInt32LittleEndian(responseData.AsSpan().Slice(4, 4), statusCode);
+            await SendAsync(Opcode.RESPONSE, (byte)responseOpcode, responseData, 0, 12);
+        }
+        finally
+        {
+            Utilities.ReturnBytes(responseData);
+        }
+    }
 
-                do
-                {
-                    var (data, offset, count, returnToPoolNext) = _sendQueue.Dequeue();
-                    _sendQueueTotalSize -= count;
-                    if (Logger.WillLog(LogLevel.Debug))
-                        Logger.Debug<SyncSession>($"Sending {count} bytes from queue.\n{Utilities.HexDump(data.AsSpan().Slice(offset, count))}");
-
-                    WriteArgs.SetBuffer(data, offset, count);
-                    argsPair.ReturnToPool = returnToPoolNext;
-                    bool pending = Socket.SendAsync(WriteArgs!);
-                    if (!pending)
-                    {
-                        if (Logger.WillLog(LogLevel.Verbose))
-                            Logger.Verbose<SyncSession>($"Sent {count} bytes synchronously from queue (_sendQueue.Count = {_sendQueue.Count}, _isBusyWriting = {_isBusyWriting}).");
-                        if (returnToPoolNext)
-                            Utilities.ReturnBytes(data);
-                    }
-                    else
-                    {
-                        Logger.Verbose<SyncSession>($"Waiting on next send from queue to complete (_sendQueue.Count = {_sendQueue.Count}, _isBusyWriting = {_isBusyWriting}).");
-                        lastSendPending = true;
-                        break;
-                    }
-                } while (_sendQueue.Count > 0);
-
-                if (!lastSendPending)
-                {
-                    _isBusyWriting = false;
-                    Logger.Verbose<SyncSession>($"Send completed. Set isBusyWriting to false because queue is empty.");
-                }
-            }
-            else
-            {
-                _isBusyWriting = false;
-                _sendQueueTotalSize = 0;
-                Logger.Verbose<SyncSession>($"Send completed asynchronously. Set isBusyWriting to false because queue was empty.");
-            }
+    private async ValueTask SendRelayErrorAsync(long connectionId, RelayErrorCode errorCode)
+    {
+        byte[] errorPacket = Utilities.RentBytes(12);
+        try
+        {
+            BinaryPrimitives.WriteInt64LittleEndian(errorPacket.AsSpan().Slice(0, 8), connectionId);
+            BinaryPrimitives.WriteInt32LittleEndian(errorPacket.AsSpan().Slice(8, 4), (int)errorCode);
+            await SendAsync(Opcode.RELAY, (byte)RelayOpcode.RELAY_ERROR, errorPacket);
+        }
+        finally
+        {
+            Utilities.ReturnBytes(errorPacket);
         }
     }
 }

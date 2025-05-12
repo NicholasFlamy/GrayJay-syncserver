@@ -6,19 +6,21 @@ public class SyncStream : IDisposable
 
     public readonly Opcode Opcode;
     public readonly byte SubOpcode;
+    public readonly ContentEncoding ContentEncoding;
     private readonly byte[] _buffer;
     public int BytesReceived { get; private set; } = 0;
     private readonly int _expectedSize;
 
     public bool IsComplete { get; private set; } = false;
 
-    public SyncStream(int expectedSize, Opcode opcode, byte subOpcode)
+    public SyncStream(int expectedSize, Opcode opcode, byte subOpcode, ContentEncoding contentEncoding)
     {
         if (expectedSize > MAXIMUM_SIZE)
             throw new Exception($"{expectedSize} exceeded maximum size {MAXIMUM_SIZE}");
 
         Opcode = opcode;
         SubOpcode = subOpcode;
+        ContentEncoding = contentEncoding;
         _expectedSize = expectedSize;
         _buffer = Utilities.RentBytes(expectedSize);
     }
@@ -34,11 +36,11 @@ public class SyncStream : IDisposable
         IsComplete = BytesReceived == _expectedSize;
     }
 
-    public Span<byte> GetBytes()
+    public ArraySegment<byte> GetBytes()
     {
         if (!IsComplete)
             throw new Exception("Data is not complete yet");
-        return _buffer.AsSpan().Slice(0, _expectedSize);
+        return new ArraySegment<byte>(_buffer, 0, _expectedSize);
     }
 
     public void Dispose()

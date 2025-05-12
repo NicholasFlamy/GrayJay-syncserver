@@ -1,7 +1,8 @@
 ﻿using Noise;
 using SyncShared;
 using System.Buffers.Binary;
-using System.Net.Sockets;
+using System.Drawing;
+using System.IO.Compression;
 using System.Text;
 namespace SyncClient;
 
@@ -12,8 +13,9 @@ public interface IChannel : IDisposable
     public IAuthorizable? Authorizable { get; set; }
     public object? SyncSession { get; set; } //TODO: Replace with SyncSession once library is properly structured
     public void SetDataHandler(Action<SyncSocketSession, IChannel, Opcode, byte, ReadOnlySpan<byte>>? onData);
-    public Task SendAsync(Opcode opcode, byte subOpcode, byte[]? data = null, int offset = 0, int count = -1, CancellationToken cancellationToken = default);
+    public Task SendAsync(Opcode opcode, byte subOpcode, byte[]? data = null, int offset = 0, int count = -1, ContentEncoding contentEncoding = ContentEncoding.Raw, CancellationToken cancellationToken = default);
     public void SetCloseHandler(Action<IChannel>? onClose);
+    public LinkType LinkType { get; }
 }
 
 public class ChannelSocket : IChannel
@@ -23,7 +25,8 @@ public class ChannelSocket : IChannel
     private readonly SyncSocketSession _session;
     private Action<SyncSocketSession, IChannel, Opcode, byte, ReadOnlySpan<byte>>? _onData;
     private Action<IChannel>? _onClose;
-    
+    public LinkType LinkType => LinkType.Direct;
+
     public IAuthorizable? Authorizable
     {
         get => _session.Authorizable;
@@ -57,10 +60,10 @@ public class ChannelSocket : IChannel
         _onData?.Invoke(_session, this, opcode, subOpcode, data);
     }
 
-    public async Task SendAsync(Opcode opcode, byte subOpcode, byte[]? data = null, int offset = 0, int count = -1, CancellationToken cancellationToken = default)
+    public async Task SendAsync(Opcode opcode, byte subOpcode, byte[]? data = null, int offset = 0, int count = -1, ContentEncoding contentEncoding = ContentEncoding.Raw, CancellationToken cancellationToken = default)
     {
         if (data != null)
-            await _session.SendAsync(opcode, subOpcode, data, offset, count, cancellationToken: cancellationToken);
+            await _session.SendAsync(opcode, subOpcode, data, offset, count, contentEncoding: contentEncoding, cancellationToken: cancellationToken);
         else
             await _session.SendAsync(opcode, subOpcode, cancellationToken: cancellationToken);
     }
@@ -78,6 +81,7 @@ public class ChannelRelayed : IChannel
     public string? RemotePublicKey { get; private set; }
     public int? RemoteVersion { get; private set; }
     public object? SyncSession { get; set; }
+    public LinkType LinkType => LinkType.Relayed;
 
     private readonly KeyPair _localKeyPair;
     private readonly SyncSocketSession _session;
@@ -90,9 +94,9 @@ public class ChannelRelayed : IChannel
         _session = session;
         _localKeyPair = localKeyPair;
         _handshakeState = initiator
-            ? Constants.Protocol.Create(initiator, s: _localKeyPair.PrivateKey, rs: Convert.FromBase64String(publicKey))
+            ? Constants.Protocol.Create(initiator, s: _localKeyPair.PrivateKey, rs: publicKey.DecodeBase64())
             : Constants.Protocol.Create(initiator, s: _localKeyPair.PrivateKey);
-        RemotePublicKey = publicKey;
+        RemotePublicKey = publicKey.DecodeBase64().EncodeBase64();
     }
 
     public void SetDataHandler(Action<SyncSocketSession, IChannel, Opcode, byte, ReadOnlySpan<byte>>? onData)
@@ -150,7 +154,7 @@ public class ChannelRelayed : IChannel
         ThrowIfDisposed();
 
         RemoteVersion = remoteVersion;
-        RemotePublicKey = Convert.ToBase64String(_handshakeState!.RemoteStaticPublicKey);
+        RemotePublicKey = _handshakeState!.RemoteStaticPublicKey.ToArray().EncodeBase64();
         _handshakeState!.Dispose();
         _handshakeState = null;
         _transport = transport;
@@ -204,7 +208,7 @@ public class ChannelRelayed : IChannel
         }
     }
 
-    public async Task SendAsync(Opcode opcode, byte subOpcode, byte[]? data = null, int offset = 0, int count = -1, CancellationToken cancellationToken = default)
+    public async Task SendAsync(Opcode opcode, byte subOpcode, byte[]? data = null, int offset = 0, int count = -1, ContentEncoding contentEncoding = ContentEncoding.Raw, CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
 
@@ -214,12 +218,36 @@ public class ChannelRelayed : IChannel
         if (count != 0 && data == null)
             throw new Exception("Data must be set if count is not 0");
 
+        byte[]? processedData = data;
+        if (data != null && contentEncoding == ContentEncoding.Gzip)
+        {
+            var isGzipSupported = opcode == Opcode.DATA;
+            if (isGzipSupported)
+            {
+                using (var compressedStream = new MemoryStream())
+                {
+                    using (var gzipStream = new GZipStream(compressedStream, CompressionMode.Compress))
+                    {
+                        await gzipStream.WriteAsync(data.AsMemory(offset, count), cancellationToken);
+                    }
+                    processedData = compressedStream.ToArray();
+                    count = processedData.Length;
+                    offset = 0;
+                }
+            }
+            else
+            {
+                Logger.Warning<SyncSocketSession>($"Gzip requested but not supported on this (opcode = {opcode}, subOpcode = {subOpcode}), falling back.");
+                contentEncoding = ContentEncoding.Raw;
+            }
+        }
+
         const int ENCRYPTION_OVERHEAD = 16;
         const int CONNECTION_ID_SIZE = 8;
-        const int HEADER_SIZE = 6;
+        const int HEADER_SIZE = 7;
         const int MAX_DATA_PER_PACKET = SyncSocketSession.MAXIMUM_PACKET_SIZE - HEADER_SIZE - CONNECTION_ID_SIZE - ENCRYPTION_OVERHEAD - 16;
 
-        if (count > MAX_DATA_PER_PACKET && data != null)
+        if (count > MAX_DATA_PER_PACKET && processedData != null)
         {
             var streamId = _session.GenerateStreamId();
             int totalSize = count;
@@ -228,7 +256,7 @@ public class ChannelRelayed : IChannel
             while (sendOffset < totalSize)
             {
                 int bytesRemaining = totalSize - sendOffset;
-                int bytesToSend = Math.Min(MAX_DATA_PER_PACKET - 8 - 2, bytesRemaining);
+                int bytesToSend = Math.Min(MAX_DATA_PER_PACKET - 8 - HEADER_SIZE + 4, bytesRemaining);
 
                 // Prepare stream data
                 byte[] streamData;
@@ -236,27 +264,29 @@ public class ChannelRelayed : IChannel
                 if (sendOffset == 0)
                 {
                     streamOpcode = StreamOpcode.START;
-                    streamData = new byte[4 + 4 + 1 + 1 + bytesToSend];
+                    streamData = new byte[4 + HEADER_SIZE + bytesToSend];
                     BinaryPrimitives.WriteInt32LittleEndian(streamData.AsSpan(0, 4), streamId);
                     BinaryPrimitives.WriteInt32LittleEndian(streamData.AsSpan(4, 4), totalSize);
                     streamData[8] = (byte)opcode;
                     streamData[9] = subOpcode;
-                    Array.Copy(data, offset + sendOffset, streamData, 10, bytesToSend);
+                    streamData[10] = (byte)contentEncoding;
+                    Array.Copy(processedData, offset + sendOffset, streamData, 4 + HEADER_SIZE, bytesToSend);
                 }
                 else
                 {
                     streamData = new byte[4 + 4 + bytesToSend];
                     BinaryPrimitives.WriteInt32LittleEndian(streamData.AsSpan(0, 4), streamId);
                     BinaryPrimitives.WriteInt32LittleEndian(streamData.AsSpan(4, 4), sendOffset);
-                    Array.Copy(data, offset + sendOffset, streamData, 8, bytesToSend);
+                    Array.Copy(processedData, offset + sendOffset, streamData, 8, bytesToSend);
                     streamOpcode = (bytesToSend < bytesRemaining) ? StreamOpcode.DATA : StreamOpcode.END;
                 }
 
                 // Wrap with header
                 var fullPacket = new byte[HEADER_SIZE + streamData.Length];
-                BinaryPrimitives.WriteInt32LittleEndian(fullPacket.AsSpan(0, 4), streamData.Length + 2);
+                BinaryPrimitives.WriteInt32LittleEndian(fullPacket.AsSpan(0, 4), streamData.Length + 3);
                 fullPacket[4] = (byte)Opcode.STREAM;
                 fullPacket[5] = (byte)streamOpcode;
+                fullPacket[6] = (byte)ContentEncoding.Raw;
                 Array.Copy(streamData, 0, fullPacket, HEADER_SIZE, streamData.Length);
 
                 await SendPacketAsync(fullPacket, cancellationToken);
@@ -266,16 +296,18 @@ public class ChannelRelayed : IChannel
         else
         {
             var packet = new byte[HEADER_SIZE + count];
-            BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(0, 4), count + 2);
+            BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(0, 4), count + HEADER_SIZE - 4);
             packet[4] = (byte)opcode;
             packet[5] = subOpcode;
-            if (count > 0 && data != null)
-                Array.Copy(data, offset, packet, HEADER_SIZE, count);
+            packet[6] = (byte)contentEncoding;
+            if (count > 0 && processedData != null)
+                Array.Copy(processedData, offset, packet, HEADER_SIZE, count);
+
             await SendPacketAsync(packet, cancellationToken);
         }
     }
 
-    public async Task SendRequestTransportAsync(int requestId, string publicKey, string? pairingCode = null, CancellationToken cancellationToken = default)
+    public async Task SendRequestTransportAsync(int requestId, string publicKey, uint appId, string? pairingCode = null, CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
 
@@ -285,7 +317,7 @@ public class ChannelRelayed : IChannel
             var channelMessage = new byte[1024];
             var (channelBytesWritten, _, _) = _handshakeState!.WriteMessage(null, channelMessage);
 
-            byte[] publicKeyBytes = Convert.FromBase64String(publicKey);
+            byte[] publicKeyBytes = publicKey.DecodeBase64();
             if (publicKeyBytes.Length != 32)
                 throw new ArgumentException("Public key must be 32 bytes.");
 
@@ -312,11 +344,13 @@ public class ChannelRelayed : IChannel
                 pairingMessage = Array.Empty<byte>();
             }
 
-            var packetSize = 4 + 32 + 4 + pairingMessageLength + 4 + channelBytesWritten;
+            var packetSize = 4 + 32 + 4 + 4 + pairingMessageLength + 4 + channelBytesWritten;
             var packet = new byte[packetSize];
 
             int offset = 0;
             BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(offset, 4), requestId);
+            offset += 4;
+            BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(offset, 4), appId);
             offset += 4;
             publicKeyBytes.CopyTo(packet.AsSpan(offset, 32));
             offset += 32;

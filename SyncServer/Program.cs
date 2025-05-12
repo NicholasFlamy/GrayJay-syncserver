@@ -120,6 +120,12 @@ class Program
 
             return Results.Text(sb.ToString(), "text/plain; version=0.0.4");
         });
-        app.Run("http://localhost:3131");
+        app.Run("http://0.0.0.0:3131");
+
+        Console.CancelKeyPress += (_, __) =>
+        {
+            _ = app.DisposeAsync();
+            server.Dispose();
+        };
     }
 }

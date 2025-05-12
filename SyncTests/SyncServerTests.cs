@@ -32,18 +32,17 @@ namespace SyncServerTests
             Action<SyncSocketSession>? onHandshakeComplete = null,
             Action<SyncSocketSession, Opcode, byte, ReadOnlySpan<byte>>? onData = null,
             Action<SyncSocketSession, ChannelRelayed>? onNewChannel = null,
-            Func<SyncSocketSession, string, string?, bool>? isHandshakeAllowed = null)
+            Func<LinkType, SyncSocketSession, string, string?, uint, bool>? isHandshakeAllowed = null,
+            uint appId = 0)
         {
             var keyPair = KeyPair.Generate();
-            var tcpClient = new TcpClient();
-            await tcpClient.ConnectAsync("127.0.0.1", port);
+            var socket = Utilities.OpenTcpSocket("127.0.0.1", port);
             var tcs = new TaskCompletionSource<bool>();
             var socketSession = new SyncSocketSession(
                 "127.0.0.1",
                 keyPair,
-                tcpClient.GetStream(),
-                tcpClient.GetStream(),
-                onClose: s => { tcpClient.Close(); },
+                socket,
+                onClose: s => { socket.Close(); },
                 onHandshakeComplete: s =>
                 {
                     onHandshakeComplete?.Invoke(s);
@@ -51,10 +50,10 @@ namespace SyncServerTests
                 },
                 onData: onData ?? ((s, o, so, d) => { }),
                 onNewChannel: onNewChannel ?? ((s, c) => { }),
-                isHandshakeAllowed: (s, pk, pw) => isHandshakeAllowed != null ? isHandshakeAllowed(s, pk, pw) : true
+                isHandshakeAllowed: (linkType, s, pk, pw, appId) => isHandshakeAllowed != null ? isHandshakeAllowed(linkType, s, pk, pw, appId) : true
             );
             socketSession.Authorizable = AlwaysAuthorized.Instance;
-            _ = socketSession.StartAsInitiatorAsync(serverPublicKey);
+            _ = socketSession.StartAsInitiatorAsync(serverPublicKey, appId);
             await tcs.Task.WithTimeout(500000, "Handshake timed out");
             return socketSession;
         }
@@ -82,15 +81,12 @@ namespace SyncServerTests
             {
                 var incorrectPublicKey = Convert.ToBase64String(KeyPair.Generate().PublicKey);
                 var keyPair = KeyPair.Generate();
-                var tcpClient = new TcpClient();
-                await tcpClient.ConnectAsync("127.0.0.1", port);
-                var stream = tcpClient.GetStream();
+                var socket = Utilities.OpenTcpSocket("127.0.0.1", port);
                 var tcs = new TaskCompletionSource<bool>();
                 var socketSession = new SyncSocketSession(
                     "127.0.0.1",
                     keyPair,
-                    stream,
-                    stream,
+                    socket,
                     onClose: s => tcs.TrySetResult(true),
                     onHandshakeComplete: s => tcs.TrySetResult(false),
                     onData: (s, o, so, d) => { },
@@ -224,6 +220,38 @@ namespace SyncServerTests
         }
 
         [TestMethod]
+        public async Task RelayedTransport_Bidirectional_Gzip_Success()
+        {
+            var (server, serverPublicKey, port) = SetupServer();
+            using (server)
+            {
+                var tcsA = new TaskCompletionSource<ChannelRelayed>();
+                var tcsB = new TaskCompletionSource<ChannelRelayed>();
+                using var clientA = await CreateClientAsync(port, serverPublicKey, onNewChannel: (s, c) => tcsA.SetResult(c));
+                using var clientB = await CreateClientAsync(port, serverPublicKey, onNewChannel: (s, c) => tcsB.SetResult(c));
+                var channelTask = clientA.StartRelayedChannelAsync(clientB.LocalPublicKey);
+                var channelA = await tcsA.Task.WithTimeout(5000, "Channel A creation timed out");
+                channelA.Authorizable = AlwaysAuthorized.Instance;
+                var channelB = await tcsB.Task.WithTimeout(5000, "Channel B creation timed out");
+                channelB.Authorizable = AlwaysAuthorized.Instance;
+                await channelTask;
+
+                var tcsDataB = new TaskCompletionSource<byte[]>();
+                channelB.SetDataHandler((s, c, o, so, d) => tcsDataB.SetResult(d.ToArray()));
+                await channelA.SendAsync(Opcode.DATA, 0, new byte[] { 1, 2, 3 }, contentEncoding: ContentEncoding.Gzip);
+
+                var tcsDataA = new TaskCompletionSource<byte[]>();
+                channelA.SetDataHandler((s, c, o, so, d) => tcsDataA.SetResult(d.ToArray()));
+                await channelB.SendAsync(Opcode.DATA, 0, new byte[] { 4, 5, 6 }, contentEncoding: ContentEncoding.Gzip);
+
+                var receivedB = await tcsDataB.Task.WithTimeout(5000, "Data to B timed out");
+                var receivedA = await tcsDataA.Task.WithTimeout(5000, "Data to A timed out");
+                CollectionAssert.AreEqual(new byte[] { 1, 2, 3 }, receivedB);
+                CollectionAssert.AreEqual(new byte[] { 4, 5, 6 }, receivedA);
+            }
+        }
+
+        [TestMethod]
         public async Task RelayedTransport_MaximumMessageSize_Success()
         {
             var (server, serverPublicKey, port) = SetupServer();
@@ -282,46 +310,40 @@ namespace SyncServerTests
             var (server, serverPublicKey, port) = SetupServer();
             using (server)
             {
-                var tcsA1 = new TaskCompletionSource<ChannelRelayed>();
                 var tcsB1 = new TaskCompletionSource<ChannelRelayed>();
-                var tcsA2 = new TaskCompletionSource<ChannelRelayed>();
                 var tcsB2 = new TaskCompletionSource<ChannelRelayed>();
-                using var clientA = await CreateClientAsync(port, serverPublicKey, onNewChannel: (s, c) =>
-                {
-                    if (!tcsA1.Task.IsCompleted) tcsA1.SetResult(c);
-                    else tcsA2.SetResult(c);
-                });
+                using var clientA = await CreateClientAsync(port, serverPublicKey, onNewChannel: (s, c) => { });
                 using var clientB = await CreateClientAsync(port, serverPublicKey, onNewChannel: (s, c) =>
                 {
                     if (!tcsB1.Task.IsCompleted) tcsB1.SetResult(c);
                     else tcsB2.SetResult(c);
                 });
 
-                var channelTask1 = clientA.StartRelayedChannelAsync(clientB.LocalPublicKey);
-                var channelA1 = await tcsA1.Task.WithTimeout(5000, "Channel A1 creation timed out");
+                var channelA1 = await clientA.StartRelayedChannelAsync(clientB.LocalPublicKey).WithTimeout(5000, "Channel A1 creation timed out");
                 channelA1.Authorizable = AlwaysAuthorized.Instance;
                 var channelB1 = await tcsB1.Task.WithTimeout(5000, "Channel B1 creation timed out");
                 channelB1.Authorizable = AlwaysAuthorized.Instance;
-                await channelTask1;
-
-                var channelTask2 = clientA.StartRelayedChannelAsync(clientB.LocalPublicKey);
-                var channelA2 = await tcsA2.Task.WithTimeout(5000, "Channel A2 creation timed out");
-                channelA2.Authorizable = AlwaysAuthorized.Instance;
-                var channelB2 = await tcsB2.Task.WithTimeout(5000, "Channel B2 creation timed out");
-                channelB2.Authorizable = AlwaysAuthorized.Instance;
-                await channelTask2;
 
                 var tcsDataB1 = new TaskCompletionSource<byte[]>();
                 channelB1.SetDataHandler((s, c, o, so, d) => tcsDataB1.SetResult(d.ToArray()));
-                var tcsDataB2 = new TaskCompletionSource<byte[]>();
-                channelB2.SetDataHandler((s, c, o, so, d) => tcsDataB2.SetResult(d.ToArray()));
-
                 await channelA1.SendAsync(Opcode.DATA, 0, new byte[] { 1 });
-                await channelA2.SendAsync(Opcode.DATA, 0, new byte[] { 2 });
 
                 var receivedB1 = await tcsDataB1.Task.WithTimeout(5000, "Data on channel B1 timed out");
-                var receivedB2 = await tcsDataB2.Task.WithTimeout(5000, "Data on channel B2 timed out");
                 CollectionAssert.AreEqual(new byte[] { 1 }, receivedB1);
+
+                channelA1.Dispose();
+                await Task.Delay(100);
+
+                var channelA2 = await clientA.StartRelayedChannelAsync(clientB.LocalPublicKey).WithTimeout(5000, "Channel A2 creation timed out");
+                channelA2.Authorizable = AlwaysAuthorized.Instance;
+                var channelB2 = await tcsB2.Task.WithTimeout(5000, "Channel B2 creation timed out");
+                channelB2.Authorizable = AlwaysAuthorized.Instance;
+
+                var tcsDataB2 = new TaskCompletionSource<byte[]>();
+                channelB2.SetDataHandler((s, c, o, so, d) => tcsDataB2.SetResult(d.ToArray()));
+                await channelA2.SendAsync(Opcode.DATA, 0, new byte[] { 2 });
+
+                var receivedB2 = await tcsDataB2.Task.WithTimeout(5000, "Data on channel B2 timed out");
                 CollectionAssert.AreEqual(new byte[] { 2 }, receivedB2);
             }
         }
@@ -364,6 +386,26 @@ namespace SyncServerTests
 
         [TestMethod]
         public async Task PublishAndGetRecord_Success()
+        {
+            var (server, serverPublicKey, port) = SetupServer();
+            using (server)
+            {
+                using var clientA = await CreateClientAsync(port, serverPublicKey);
+                using var clientB = await CreateClientAsync(port, serverPublicKey);
+                using var clientC = await CreateClientAsync(port, serverPublicKey);
+                var data = new byte[] { 1, 2, 3 };
+                bool success = await clientA.PublishRecordAsync(clientB.LocalPublicKey, "testKey", data);
+                var recordB = await clientB.GetRecordAsync(clientA.LocalPublicKey, "testKey");
+                var recordC = await clientC.GetRecordAsync(clientA.LocalPublicKey, "testKey");
+                Assert.IsTrue(success);
+                Assert.IsNotNull(recordB);
+                CollectionAssert.AreEqual(data, recordB!.Value.Data);
+                Assert.IsNull(recordC, "Unauthorized client should not access record");
+            }
+        }
+
+        [TestMethod]
+        public async Task PublishAndGetRecord_Gzip_Success()
         {
             var (server, serverPublicKey, port) = SetupServer();
             using (server)
@@ -558,6 +600,33 @@ namespace SyncServerTests
                 var tcsDataB = new TaskCompletionSource<byte[]>();
                 channelB.SetDataHandler((s, c, o, so, d) => tcsDataB.SetResult(d.ToArray()));
                 await channelA.SendAsync(Opcode.DATA, 0, largeData);
+                var receivedData = await tcsDataB.Task.WithTimeout(10000, "Receiving large data timed out");
+                CollectionAssert.AreEqual(largeData, receivedData);
+            }
+        }
+
+        [TestMethod]
+        public async Task SingleLargeMessageViaRelayedChannel_Gzip_Success()
+        {
+            var (server, serverPublicKey, port) = SetupServer();
+            using (server)
+            {
+                var largeData = new byte[100000];
+                new Random().NextBytes(largeData);
+                var tcsA = new TaskCompletionSource<ChannelRelayed>();
+                var tcsB = new TaskCompletionSource<ChannelRelayed>();
+                using var clientA = await CreateClientAsync(port, serverPublicKey, onNewChannel: (s, c) => tcsA.SetResult(c));
+                using var clientB = await CreateClientAsync(port, serverPublicKey, onNewChannel: (s, c) => tcsB.SetResult(c));
+                var channelTask = clientA.StartRelayedChannelAsync(clientB.LocalPublicKey);
+                var channelA = await tcsA.Task.WithTimeout(5000, "Channel A creation timed out");
+                channelA.Authorizable = AlwaysAuthorized.Instance;
+                var channelB = await tcsB.Task.WithTimeout(5000, "Channel B creation timed out");
+                channelB.Authorizable = AlwaysAuthorized.Instance;
+                await channelTask;
+
+                var tcsDataB = new TaskCompletionSource<byte[]>();
+                channelB.SetDataHandler((s, c, o, so, d) => tcsDataB.SetResult(d.ToArray()));
+                await channelA.SendAsync(Opcode.DATA, 0, largeData, contentEncoding: ContentEncoding.Gzip);
                 var receivedData = await tcsDataB.Task.WithTimeout(10000, "Receiving large data timed out");
                 CollectionAssert.AreEqual(largeData, receivedData);
             }
@@ -790,26 +859,34 @@ namespace SyncServerTests
         [TestMethod]
         public async Task RelayRequestLimitPerIP_Enforced()
         {
-            var (server, serverPublicKey, port) = SetupServer();
+            //This test is known broken
+            var (server, serverPublicKey, port) = SetupServer(200);
             using (server)
             {
-                // Use 10 clients, each making 10 requests (total 100 allowed)
-                var clients = new List<SyncSocketSession>();
-                using var targetClient = await CreateClientAsync(port, serverPublicKey);
-                for (int i = 0; i < 10; i++)
+                const int maxConnectionsPerIp = 48; // Assumed per-IP limit of 100 active connections
+                var targetClients = new List<SyncSocketSession>();
+
+                // Create target clients
+                for (int i = 0; i < maxConnectionsPerIp + 1; i++)
                 {
-                    var client = await CreateClientAsync(port, serverPublicKey);
-                    clients.Add(client);
-                    for (int j = 0; j < 10; j++) // 10 requests per key, within per-key limit of 10
-                    {
-                        await client.StartRelayedChannelAsync(targetClient.LocalPublicKey).WithTimeout(5000, "Relay request timed out");
-                    }
+                    targetClients.Add(await CreateClientAsync(port, serverPublicKey));
                 }
 
-                // 101st request should fail
-                using var extraClient = await CreateClientAsync(port, serverPublicKey);
+                var initiatorClients = new List<SyncSocketSession>();
+
+                // Create initiator clients, each connecting to a unique target
+                for (int i = 0; i < maxConnectionsPerIp; i++)
+                {
+                    var initiator = await CreateClientAsync(port, serverPublicKey);
+                    initiatorClients.Add(initiator);
+                    await initiator.StartRelayedChannelAsync(targetClients[i].LocalPublicKey)
+                        .WithTimeout(5000, "Relay request timed out");
+                }
+
+                // Attempt the 101st request, which should fail due to the per-IP limit
+                using var extraInitiator = await CreateClientAsync(port, serverPublicKey);
                 await Assert.ThrowsExceptionAsync<Exception>(
-                    async () => await extraClient.StartRelayedChannelAsync(targetClient.LocalPublicKey),
+                    async () => await extraInitiator.StartRelayedChannelAsync(targetClients[maxConnectionsPerIp].LocalPublicKey),
                     "101st relay request should fail due to IP limit"
                 );
             }
@@ -818,6 +895,7 @@ namespace SyncServerTests
         [TestMethod]
         public async Task RelayRequestLimitPerKey_Enforced()
         {
+            //This test is known broken
             var (server, serverPublicKey, port) = SetupServer();
             using (server)
             {
@@ -1070,7 +1148,7 @@ namespace SyncServerTests
                     port,
                     serverPublicKey,
                     onNewChannel: (s, c) => tcsB.SetResult(c),
-                    isHandshakeAllowed: (s, pk, code) => code == validPairingCode
+                    isHandshakeAllowed: (linkType, s, pk, code, appId) => code == validPairingCode
                 );
 
                 using var clientA = await CreateClientAsync(
@@ -1080,7 +1158,7 @@ namespace SyncServerTests
                 );
 
                 // Start relayed channel with the correct pairing code
-                var channelTask = clientA.StartRelayedChannelAsync(clientB.LocalPublicKey, validPairingCode);
+                var channelTask = clientA.StartRelayedChannelAsync(clientB.LocalPublicKey, pairingCode: validPairingCode);
                 var channelA = await tcsA.Task.WithTimeout(5000, "Channel A creation timed out");
                 channelA.Authorizable = AlwaysAuthorized.Instance;
                 var channelB = await tcsB.Task.WithTimeout(5000, "Channel B creation timed out");
@@ -1112,14 +1190,14 @@ namespace SyncServerTests
                     port,
                     serverPublicKey,
                     onNewChannel: (s, c) => tcsB.SetResult(c),
-                    isHandshakeAllowed: (s, pk, code) => code == validPairingCode
+                    isHandshakeAllowed: (linkType, s, pk, code, appId) => code == validPairingCode
                 );
 
                 using var clientA = await CreateClientAsync(port, serverPublicKey);
 
                 // Attempt to start relayed channel with an incorrect pairing code
                 await Assert.ThrowsExceptionAsync<Exception>(
-                    async () => await clientA.StartRelayedChannelAsync(clientB.LocalPublicKey, invalidPairingCode),
+                    async () => await clientA.StartRelayedChannelAsync(clientB.LocalPublicKey, pairingCode: invalidPairingCode),
                     "Starting relayed channel with invalid pairing code should fail"
                 );
 
@@ -1144,7 +1222,7 @@ namespace SyncServerTests
                     port,
                     serverPublicKey,
                     onNewChannel: (s, c) => tcsB.SetResult(c),
-                    isHandshakeAllowed: (s, pk, code) => code == validPairingCode
+                    isHandshakeAllowed: (linkType, s, pk, code, appId) => code == validPairingCode
                 );
 
                 using var clientA = await CreateClientAsync(port, serverPublicKey);
@@ -1177,7 +1255,7 @@ namespace SyncServerTests
                     port,
                     serverPublicKey,
                     onNewChannel: (s, c) => tcsB.SetResult(c),
-                    isHandshakeAllowed: (s, pk, code) => true
+                    isHandshakeAllowed: (linkType, s, pk, code, appId) => true
                 );
 
                 using var clientA = await CreateClientAsync(
@@ -1187,7 +1265,7 @@ namespace SyncServerTests
                 );
 
                 // Start relayed channel with an unnecessary pairing code
-                var channelTask = clientA.StartRelayedChannelAsync(clientB.LocalPublicKey, pairingCode);
+                var channelTask = clientA.StartRelayedChannelAsync(clientB.LocalPublicKey, pairingCode: pairingCode);
                 var channelA = await tcsA.Task.WithTimeout(5000, "Channel A creation timed out");
                 channelA.Authorizable = AlwaysAuthorized.Instance;
                 var channelB = await tcsB.Task.WithTimeout(5000, "Channel B creation timed out");
@@ -1201,6 +1279,231 @@ namespace SyncServerTests
                 var receivedData = await tcsDataB.Task.WithTimeout(5000, "Data transmission timed out");
 
                 CollectionAssert.AreEqual(new byte[] { 4, 5, 6 }, receivedData);
+            }
+        }
+
+        [TestMethod]
+        public async Task PreventMultipleConnections_SameDirection()
+        {
+            var (server, serverPublicKey, port) = SetupServer();
+            using (server)
+            {
+                using var clientA = await CreateClientAsync(port, serverPublicKey);
+                using var clientB = await CreateClientAsync(port, serverPublicKey);
+
+                // First connection should succeed
+                var channel1 = await clientA.StartRelayedChannelAsync(clientB.LocalPublicKey);
+                Assert.IsNotNull(channel1);
+
+                // Second connection should fail
+                try
+                {
+                    await clientA.StartRelayedChannelAsync(clientB.LocalPublicKey);
+                    Assert.Fail("Second connection should have thrown an exception.");
+                }
+                catch (Exception ex)
+                {
+                    Assert.IsTrue(ex.Message.Contains("DuplicateConnection") || ex.Message.Contains("6"),
+                        "Second connection should fail with DuplicateConnection error.");
+                }
+            }
+        }
+
+        [TestMethod]
+        public async Task PreventMultipleConnections_OppositeDirection()
+        {
+            var (server, serverPublicKey, port) = SetupServer();
+            using (server)
+            {
+                using var clientA = await CreateClientAsync(port, serverPublicKey);
+                using var clientB = await CreateClientAsync(port, serverPublicKey);
+
+                // Establish first connection A -> B
+                var channel1 = await clientA.StartRelayedChannelAsync(clientB.LocalPublicKey);
+                Assert.IsNotNull(channel1, "First connection should be established");
+
+                // Attempt connection B -> A
+                await Assert.ThrowsExceptionAsync<Exception>(
+                    async () => await clientB.StartRelayedChannelAsync(clientA.LocalPublicKey),
+                    "Connection in opposite direction should fail due to existing connection"
+                );
+            }
+        }
+
+        [TestMethod]
+        public async Task AllowNewConnectionAfterClosing()
+        {
+            var (server, serverPublicKey, port) = SetupServer();
+            using (server)
+            {
+                using var clientA = await CreateClientAsync(port, serverPublicKey);
+                using var clientB = await CreateClientAsync(port, serverPublicKey);
+
+                // Establish first connection A -> B
+                var channel1 = await clientA.StartRelayedChannelAsync(clientB.LocalPublicKey);
+                Assert.IsNotNull(channel1, "First connection should be established");
+
+                // Close the connection
+                channel1.Dispose();
+                await Task.Delay(100); // Allow time for server cleanup
+
+                // Attempt new connection A -> B
+                var channel2 = await clientA.StartRelayedChannelAsync(clientB.LocalPublicKey);
+                Assert.IsNotNull(channel2, "New connection should be allowed after closing the previous one");
+            }
+        }
+
+        [TestMethod]
+        public async Task ConcurrentConnectionAttempts()
+        {
+            // Set up the server and clients
+            var (server, serverPublicKey, port) = SetupServer();
+            using (server)
+            {
+                using var clientA = await CreateClientAsync(port, serverPublicKey);
+                using var clientB = await CreateClientAsync(port, serverPublicKey);
+
+                // Start two connection attempts concurrently
+                var taskA = clientA.StartRelayedChannelAsync(clientB.LocalPublicKey);
+                var taskB = clientB.StartRelayedChannelAsync(clientA.LocalPublicKey);
+
+                // Wait for both tasks to complete (successfully or with failure)
+                try
+                {
+                    await Task.WhenAll(taskA, taskB);
+                }
+                catch
+                {
+                    // Exceptions are expected; we'll check them below
+                }
+
+                // Count successes and failures
+                int successCount = (taskA.IsCompletedSuccessfully ? 1 : 0) + (taskB.IsCompletedSuccessfully ? 1 : 0);
+                int failureCount = (taskA.IsFaulted ? 1 : 0) + (taskB.IsFaulted ? 1 : 0);
+
+                // Assert the expected outcome
+                Assert.AreEqual(1, successCount, "Exactly one connection should succeed.");
+                Assert.AreEqual(1, failureCount, "Exactly one connection should fail.");
+
+                // Verify the failure is due to DuplicateConnection (error code 6)
+                Task failedTask = taskA.IsFaulted ? taskA : taskB;
+                if (failedTask.IsFaulted)
+                {
+                    var exception = failedTask.Exception?.InnerException;
+                    Assert.IsNotNull(exception, "The failed task should have an exception.");
+                    Assert.IsTrue(exception.Message.Contains("DuplicateConnection") || exception.Message.Contains("6"),
+                        "The failure should be due to a duplicate connection error.");
+                }
+            }
+        }
+
+        [TestMethod]
+        public async Task AllowConnectionsBetweenDifferentPairs()
+        {
+            var (server, serverPublicKey, port) = SetupServer();
+            using (server)
+            {
+                using var clientA = await CreateClientAsync(port, serverPublicKey);
+                using var clientB = await CreateClientAsync(port, serverPublicKey);
+                using var clientC = await CreateClientAsync(port, serverPublicKey);
+
+                // Establish A -> B
+                var channelAB = await clientA.StartRelayedChannelAsync(clientB.LocalPublicKey);
+                Assert.IsNotNull(channelAB, "Connection A -> B should be established");
+
+                // Establish A -> C
+                var channelAC = await clientA.StartRelayedChannelAsync(clientC.LocalPublicKey);
+                Assert.IsNotNull(channelAC, "Connection A -> C should be established");
+
+                // Establish B -> C
+                var channelBC = await clientB.StartRelayedChannelAsync(clientC.LocalPublicKey);
+                Assert.IsNotNull(channelBC, "Connection B -> C should be established");
+            }
+        }
+
+        [TestMethod]
+        public async Task SessionDisposalDuringConnectionAttempt()
+        {
+            var (server, serverPublicKey, port) = SetupServer();
+            using (server)
+            {
+                using var clientA = await CreateClientAsync(port, serverPublicKey);
+                using var clientB = await CreateClientAsync(port, serverPublicKey);
+
+                // Start connection attempt A -> B
+                var connectionTask = clientA.StartRelayedChannelAsync(clientB.LocalPublicKey);
+
+                // Dispose client B immediately
+                clientB.Dispose();
+
+                // Connection attempt should fail
+                await Assert.ThrowsExceptionAsync<Exception>(
+                    async () => await connectionTask,
+                    "Connection attempt should fail if target session is disposed"
+                );
+            }
+        }
+
+        [TestMethod]
+        public async Task RelayedTransport_WithValidAppId_Success()
+        {
+            // Arrange: Set up server and clients
+            var (server, serverPublicKey, port) = SetupServer();
+            using (server)
+            {
+                const uint allowedAppId = 1234;
+                var tcsB = new TaskCompletionSource<ChannelRelayed>();
+
+                // Client B requires appId 1234
+                using var clientB = await CreateClientAsync(
+                    port,
+                    serverPublicKey,
+                    onNewChannel: (s, c) => tcsB.SetResult(c),
+                    isHandshakeAllowed: (linkType, s, pk, code, appId) => appId == allowedAppId
+                );
+
+                using var clientA = await CreateClientAsync(port, serverPublicKey);
+
+                // Act: Start relayed channel with valid appId
+                var channelTask = clientA.StartRelayedChannelAsync(clientB.LocalPublicKey, appId: allowedAppId);
+                var channelB = await tcsB.Task.WithTimeout(5000, "Channel B creation timed out");
+                await channelTask.WithTimeout(5000, "Channel establishment timed out");
+
+                // Assert: Channel is established
+                Assert.IsNotNull(channelB, "Channel should be created on target with valid appId");
+            }
+        }
+
+        [TestMethod]
+        public async Task RelayedTransport_WithInvalidAppId_Fails()
+        {
+            // Arrange: Set up server and clients
+            var (server, serverPublicKey, port) = SetupServer();
+            using (server)
+            {
+                const uint allowedAppId = 1234;
+                var tcsB = new TaskCompletionSource<ChannelRelayed>();
+
+                // Client B requires appId 1234
+                using var clientB = await CreateClientAsync(
+                    port,
+                    serverPublicKey,
+                    onNewChannel: (s, c) => tcsB.SetResult(c),
+                    isHandshakeAllowed: (linkType, s, pk, code, appId) => appId == allowedAppId
+                );
+
+                using var clientA = await CreateClientAsync(port, serverPublicKey);
+
+                // Act & Assert: Attempt with invalid appId should fail
+                await Assert.ThrowsExceptionAsync<Exception>(
+                    async () => await clientA.StartRelayedChannelAsync(clientB.LocalPublicKey, appId: 5678),
+                    "Starting relayed channel with invalid appId should fail"
+                );
+
+                // Ensure no channel was created on client B
+                var channelTask = tcsB.Task;
+                var completedTask = await Task.WhenAny(channelTask, Task.Delay(1000));
+                Assert.AreNotEqual(channelTask, completedTask, "No channel should be created with invalid appId");
             }
         }
     }
