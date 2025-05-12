@@ -114,6 +114,37 @@ class Program
                 sb.AppendLine($"tcpsyncserver_gc_counts{{generation=\"{i}\"}} {gcCounts[i]}");
             }
 
+            // Server start time
+            AppendMetric("tcpsyncserver_start_time_seconds", "Start time of the server in seconds since epoch", "gauge", metrics.StartTime);
+
+            // Rate limit exceedances
+            AppendMetric("tcpsyncserver_total_keypair_registration_rate_limit_exceedances", "Total number of keypair registration rate limit exceedances", "counter", metrics.TotalKeypairRegistrationRateLimitExceedances);
+            AppendMetric("tcpsyncserver_total_relay_request_by_ip_token_rate_limit_exceedances", "Total number of relay request by IP token rate limit exceedances", "counter", metrics.TotalRelayRequestByIpTokenRateLimitExceedances);
+            AppendMetric("tcpsyncserver_total_relay_request_by_ip_connection_limit_exceedances", "Total number of relay request by IP connection limit exceedances", "counter", metrics.TotalRelayRequestByIpConnectionLimitExceedances);
+            AppendMetric("tcpsyncserver_total_relay_request_by_key_token_rate_limit_exceedances", "Total number of relay request by key token rate limit exceedances", "counter", metrics.TotalRelayRequestByKeyTokenRateLimitExceedances);
+            AppendMetric("tcpsyncserver_total_relay_request_by_key_connection_limit_exceedances", "Total number of relay request by key connection limit exceedances", "counter", metrics.TotalRelayRequestByKeyConnectionLimitExceedances);
+            AppendMetric("tcpsyncserver_total_relay_data_by_ip_rate_limit_exceedances", "Total number of relay data by IP rate limit exceedances", "counter", metrics.TotalRelayDataByIpRateLimitExceedances);
+            AppendMetric("tcpsyncserver_total_relay_data_by_connection_id_rate_limit_exceedances", "Total number of relay data by connection ID rate limit exceedances", "counter", metrics.TotalRelayDataByConnectionIdRateLimitExceedances);
+            AppendMetric("tcpsyncserver_total_publish_request_rate_limit_exceedances", "Total number of publish request rate limit exceedances", "counter", metrics.TotalPublishRequestRateLimitExceedances);
+
+            // Connection info metrics
+            AppendMetric("tcpsyncserver_total_publish_connection_info_successes", "Total number of successful publish connection info operations", "counter", metrics.TotalPublishConnectionInfoSuccesses);
+            AppendMetric("tcpsyncserver_total_publish_connection_info_count", "Total number of publish connection info operations", "counter", metrics.TotalPublishConnectionInfoCount);
+            AppendMetric("tcpsyncserver_total_publish_connection_info_failures", "Total number of failed publish connection info operations", "counter", metrics.TotalPublishConnectionInfoFailures);
+            AppendMetric("tcpsyncserver_total_publish_connection_info_time_ms", "Total time spent on publish connection info operations in milliseconds", "counter", metrics.TotalPublishConnectionInfoTimeMs);
+            AppendMetric("tcpsyncserver_total_request_connection_info_successes", "Total number of successful request connection info operations", "counter", metrics.TotalRequestConnectionInfoSuccesses);
+            AppendMetric("tcpsyncserver_total_request_connection_info_failures", "Total number of failed request connection info operations", "counter", metrics.TotalRequestConnectionInfoFailures);
+            AppendMetric("tcpsyncserver_total_request_connection_info_time_ms", "Total time spent on request connection info operations in milliseconds", "counter", metrics.TotalRequestConnectionInfoTimeMs);
+            AppendMetric("tcpsyncserver_total_request_bulk_connection_info_successes", "Total number of successful bulk request connection info operations", "counter", metrics.TotalRequestBulkConnectionInfoSuccesses);
+            AppendMetric("tcpsyncserver_total_request_bulk_connection_info_failures", "Total number of failed bulk request connection info operations", "counter", metrics.TotalRequestBulkConnectionInfoFailures);
+            AppendMetric("tcpsyncserver_total_request_bulk_connection_info_time_ms", "Total time spent on bulk request connection info operations in milliseconds", "counter", metrics.TotalRequestBulkConnectionInfoTimeMs);
+
+            // Current state metrics
+            AppendMetric("tcpsyncserver_available_connection_slots", "Available connection slots", "gauge", metrics.MaxConnectionsCount);
+            AppendMetric("tcpsyncserver_connection_info_count", "Number of connection info entries", "gauge", metrics.ConnectionInfoCount);
+            AppendMetric("tcpsyncserver_client_count", "Number of clients", "gauge", metrics.ClientCount);
+            AppendMetric("tcpsyncserver_session_count", "Number of sessions", "gauge", metrics.SessionCount);
+
             return Results.Text(sb.ToString(), "text/plain; version=0.0.4");
         });
         app.Run("http://0.0.0.0:3131");
