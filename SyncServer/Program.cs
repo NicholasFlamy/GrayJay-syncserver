@@ -72,9 +72,6 @@ class Program
             AppendMetric("tcpsyncserver_total_relayed_data_bytes", "Total number of relayed data bytes", "counter", metrics.TotalRelayedDataBytes);
             AppendMetric("tcpsyncserver_total_relayed_error_bytes", "Total number of relayed error bytes", "counter", metrics.TotalRelayedErrorBytes);
 
-            // Rate limit metrics
-            AppendMetric("tcpsyncserver_total_rate_limit_exceedances", "Total number of rate limit exceedances", "counter", metrics.TotalRateLimitExceedances);
-
             // Record operation metrics
             AppendMetric("tcpsyncserver_total_publish_record_requests", "Total number of publish record requests", "counter", metrics.TotalPublishRecordRequests);
             AppendMetric("tcpsyncserver_total_delete_record_requests", "Total number of delete record requests", "counter", metrics.TotalDeleteRecordRequests);
@@ -105,7 +102,6 @@ class Program
             // Memory and buffer metrics
             AppendMetric("tcpsyncserver_total_rented", "Total number of rented resources", "counter", metrics.TotalRented);
             AppendMetric("tcpsyncserver_total_returned", "Total number of returned resources", "counter", metrics.TotalReturned);
-            AppendMetric("tcpsyncserver_buffer_pool_available", "Number of available buffers in the read/write pool", "gauge", metrics.BufferPoolAvailable);
             AppendMetric("tcpsyncserver_memory_usage_bytes", "Current memory usage in bytes", "gauge", metrics.MemoryUsage);
             AppendMetric("tcpsyncserver_active_relayed_connections", "Number of currently active relayed connections", "gauge", metrics.ActiveRelayedConnections);
 
