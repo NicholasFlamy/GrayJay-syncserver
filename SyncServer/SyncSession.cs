@@ -656,8 +656,8 @@ public class SyncSession
                         {
                             string initiatorPublicKey = connection.Initiator.RemotePublicKey!;
                             string targetPublicKey = RemotePublicKey!;
-                            _server.AddToBlacklist(initiatorPublicKey, targetPublicKey, TimeSpan.FromMinutes(5));
-                            Logger.Info<SyncSession>($"Added relay from {initiatorPublicKey} to {targetPublicKey} to blacklist for 5 minutes due to rejection.");
+                            _server.AddToBlacklist(initiatorPublicKey, targetPublicKey, TimeSpan.FromSeconds(30));
+                            Logger.Info<SyncSession>($"Added relay from {initiatorPublicKey} to {targetPublicKey} to blacklist for 30 seconds due to rejection.");
                         }
                     }
                     finally
