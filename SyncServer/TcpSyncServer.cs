@@ -174,7 +174,7 @@ public class TcpSyncServer : IDisposable
 
     public bool _useRateLimits;
 
-    public TcpSyncServer(int port, KeyPair keyPair, IRecordRepository recordRepository, int maxConnections = MAX_CONNECTIONS, bool useRateLimits = true)
+    public TcpSyncServer(int port, KeyPair keyPair, IRecordRepository recordRepository, int maxConnections = MAX_CONNECTIONS, bool useRateLimits = false)
     {
         Metrics = new TcpSyncServerMetrics(this);
         _port = port;

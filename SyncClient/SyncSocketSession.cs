@@ -42,6 +42,9 @@ public class SyncSocketSession : IDisposable
     private readonly Action<SyncSocketSession, ChannelRelayed>? _onNewChannel;
     private readonly Action<SyncSocketSession, ChannelRelayed, bool>? _onChannelEstablished;
     private readonly Func<LinkType, SyncSocketSession, string, string?, uint, bool>? _isHandshakeAllowed;
+    private DateTime _lastPongTime;
+    private readonly TimeSpan _pingInterval = TimeSpan.FromSeconds(5);
+    private readonly TimeSpan _disconnectTimeout = TimeSpan.FromSeconds(30);
 
     private int _streamIdGenerator = 0;
     private Transport? _transport = null;
@@ -85,6 +88,38 @@ public class SyncSocketSession : IDisposable
         RemoteAddress = remoteAddress;
     }
 
+    private void StartPingLoop()
+    {
+        if (RemoteVersion < 5)
+            return;
+
+        _lastPongTime = DateTime.Now;
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                while (_started)
+                {
+                    await Task.Delay(_pingInterval);
+
+                    if (DateTime.Now - _lastPongTime > _disconnectTimeout)
+                    {
+                        Logger.Error<SyncSocketSession>("Session timed out waiting for PONG; closing.");
+                        Dispose();
+                        break;
+                    }
+                    await SendAsync(Opcode.PING);
+                }
+            }
+            catch (Exception e)
+            {
+                Logger.Error<SyncSocketSession>("Ping loop failed.", e);
+                Dispose();
+            }
+        });
+    }
+
     public async Task StartAsInitiatorAsync(string remotePublicKey, uint appId = 0, string? pairingCode = null, CancellationToken cancellationToken = default)
     {
         _started = true;
@@ -92,6 +127,7 @@ public class SyncSocketSession : IDisposable
         {
             await HandshakeAsInitiatorAsync(remotePublicKey, appId, pairingCode, cancellationToken);
             _onHandshakeComplete?.Invoke(this);
+            StartPingLoop();
             await ReceiveLoopAsync(cancellationToken);
         }
         catch (Exception e)
@@ -112,6 +148,7 @@ public class SyncSocketSession : IDisposable
             if (await HandshakeAsResponderAsync(cancellationToken))
             {
                 _onHandshakeComplete?.Invoke(this);
+                StartPingLoop();
                 await ReceiveLoopAsync(cancellationToken);
             }
         }
@@ -273,7 +310,7 @@ public class SyncSocketSession : IDisposable
         }
     }
 
-    private const int CURRENT_VERSION = 4;
+    private const int CURRENT_VERSION = 5;
     private static readonly byte[] VERSION_BYTES = BitConverter.GetBytes(CURRENT_VERSION);
     private async ValueTask PerformVersionCheckAsync(CancellationToken cancellationToken = default)
     {
@@ -1310,13 +1347,9 @@ public class SyncSocketSession : IDisposable
                     try
                     {
                         if (sourceChannel != null)
-                        {
                             await sourceChannel.SendAsync(Opcode.PONG, 0);
-                        }
                         else
-                        {
                             await SendAsync(Opcode.PONG);
-                        }
                     }
                     catch (Exception e)
                     {
@@ -1326,6 +1359,10 @@ public class SyncSocketSession : IDisposable
                 Logger.Debug<SyncSocketSession>("Received PONG");
                 return;
             case Opcode.PONG:
+                if (sourceChannel != null)
+                    sourceChannel.InvokeDataHandler(opcode, subOpcode, data);
+                else
+                    _lastPongTime = DateTime.Now;
                 Logger.Debug<SyncSocketSession>("Received PONG");
                 return;
             case Opcode.RESPONSE:

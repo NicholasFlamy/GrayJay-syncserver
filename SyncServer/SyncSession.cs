@@ -1543,7 +1543,7 @@ public class SyncSession
             throw new Exception($"Version must be at least {MINIMUM_VERSION}");
     }
 
-    private const int CURRENT_VERSION = 4;
+    private const int CURRENT_VERSION = 5;
     private static readonly byte[] VersionBytes = { CURRENT_VERSION, 0, 0, 0 };
     public async ValueTask SendVersionAsync()
     {

@@ -88,6 +88,9 @@ public class ChannelRelayed : IChannel
     private Action<SyncSocketSession, IChannel, Opcode, byte, ReadOnlySpan<byte>>? _onData;
     private Action<IChannel>? _onClose;
     private bool _disposed = false;
+    private DateTime _lastPongTime;
+    private readonly TimeSpan _pingInterval = TimeSpan.FromSeconds(5);
+    private readonly TimeSpan _disconnectTimeout = TimeSpan.FromSeconds(30);
 
     public ChannelRelayed(SyncSocketSession session, KeyPair localKeyPair, string publicKey, bool initiator)
     {
@@ -138,6 +141,38 @@ public class ChannelRelayed : IChannel
         _onClose?.Invoke(this);
     }
 
+    private void StartPingLoop()
+    {
+        if (RemoteVersion < 5)
+            return;
+
+        _lastPongTime = DateTime.Now;
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                while (!_disposed)
+                {
+                    await Task.Delay(_pingInterval);
+
+                    if (DateTime.Now - _lastPongTime > _disconnectTimeout)
+                    {
+                        Logger.Error<SyncSocketSession>("Session timed out waiting for PONG; closing.");
+                        Dispose();
+                        break;
+                    }
+                    await SendAsync(Opcode.PING, 0);
+                }
+            }
+            catch (Exception e)
+            {
+                Logger.Error<SyncSocketSession>("Ping loop failed.", e);
+                Dispose();
+            }
+        });
+    }
+
     private void ThrowIfDisposed()
     {
         if (_disposed) 
@@ -146,6 +181,12 @@ public class ChannelRelayed : IChannel
 
     public void InvokeDataHandler(Opcode opcode, byte subOpcode, ReadOnlySpan<byte> data)
     {
+        if (opcode == Opcode.PONG)
+        {
+            _lastPongTime = DateTime.Now;
+            return;
+        }
+
         _onData?.Invoke(_session, this, opcode, subOpcode, data);
     }
 
@@ -159,6 +200,8 @@ public class ChannelRelayed : IChannel
         _handshakeState = null;
         _transport = transport;
         Logger.Info<SyncSocketSession>($"Completed handshake for connectionId {ConnectionId}");
+
+        StartPingLoop();
     }
 
     private async Task SendPacketAsync(byte[] packet, CancellationToken cancellationToken = default)
