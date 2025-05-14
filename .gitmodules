@@ -1,0 +1,3 @@
+[submodule "FUTO.MDNS"]
+	path = FUTO.MDNS
+	url = ../FUTO.MDNS.git

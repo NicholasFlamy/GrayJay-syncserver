@@ -14,6 +14,8 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "SyncTests", "..\SyncTests\S
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "SyncTestClient", "..\SyncTestClient\SyncTestClient.csproj", "{29A98AC4-4CF2-4FD8-A959-8EEC98F07C91}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "FUTO.MDNS", "..\..\Grayjay.Desktop\FUTO.MDNS\FUTO.MDNS\FUTO.MDNS.csproj", "{3F986FE0-7D20-EFB1-68D6-CBDB529EBDAC}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -70,6 +72,14 @@ Global
 		{29A98AC4-4CF2-4FD8-A959-8EEC98F07C91}.Release|Any CPU.Build.0 = Release|Any CPU
 		{29A98AC4-4CF2-4FD8-A959-8EEC98F07C91}.Release|x64.ActiveCfg = Release|Any CPU
 		{29A98AC4-4CF2-4FD8-A959-8EEC98F07C91}.Release|x64.Build.0 = Release|Any CPU
+		{3F986FE0-7D20-EFB1-68D6-CBDB529EBDAC}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{3F986FE0-7D20-EFB1-68D6-CBDB529EBDAC}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{3F986FE0-7D20-EFB1-68D6-CBDB529EBDAC}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{3F986FE0-7D20-EFB1-68D6-CBDB529EBDAC}.Debug|x64.Build.0 = Debug|Any CPU
+		{3F986FE0-7D20-EFB1-68D6-CBDB529EBDAC}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{3F986FE0-7D20-EFB1-68D6-CBDB529EBDAC}.Release|Any CPU.Build.0 = Release|Any CPU
+		{3F986FE0-7D20-EFB1-68D6-CBDB529EBDAC}.Release|x64.ActiveCfg = Release|Any CPU
+		{3F986FE0-7D20-EFB1-68D6-CBDB529EBDAC}.Release|x64.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
