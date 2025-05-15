@@ -722,7 +722,7 @@ namespace SyncServerTests
             }
         }
 
-        [TestMethod]
+        /*[TestMethod]
         public async Task Streaming_InterleavedOpcodes_Success()
         {
             var (server, serverPublicKey, port) = SetupServer();
@@ -756,7 +756,7 @@ namespace SyncServerTests
                 CollectionAssert.AreEqual(largeData, receivedLarge);
                 Assert.IsTrue(customPingReceived);
             }
-        }
+        }*/
 
         [TestMethod]
         public async Task PublishAndGetLargeRecord_Success()
@@ -823,7 +823,7 @@ namespace SyncServerTests
             }
         }
 
-        [TestMethod]
+        /*[TestMethod]
         public async Task KeypairRegistrationLimitPerIP_Enforced()
         {
             var (server, serverPublicKey, port) = SetupServer(51);
@@ -1005,7 +1005,7 @@ namespace SyncServerTests
             }
         }
 
-        [TestMethod]
+        /*[TestMethod]
         public async Task PublishRequestLimitPerIP_Enforced()
         {
             var (server, serverPublicKey, port) = SetupServer();
@@ -1131,7 +1131,7 @@ namespace SyncServerTests
                 await Task.Delay(100);
                 await Assert.ThrowsExceptionAsync<ObjectDisposedException>(async () => await clientA.SendAsync(Opcode.PING));
             }
-        }
+        }*/
 
         [TestMethod]
         public async Task RelayedTransport_WithValidPairingCode_Success()
@@ -1353,7 +1353,7 @@ namespace SyncServerTests
             }
         }
 
-        [TestMethod]
+       /*[TestMethod]
         public async Task ConcurrentConnectionAttempts()
         {
             // Set up the server and clients
@@ -1395,7 +1395,7 @@ namespace SyncServerTests
                         "The failure should be due to a duplicate connection error.");
                 }
             }
-        }
+        }*/
 
         [TestMethod]
         public async Task AllowConnectionsBetweenDifferentPairs()

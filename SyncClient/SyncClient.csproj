@@ -12,6 +12,7 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <ProjectReference Include="..\FUTO.MDNS\FUTO.MDNS\FUTO.MDNS.csproj" />
     <ProjectReference Include="..\SyncShared\SyncShared.csproj" />
   </ItemGroup>
 

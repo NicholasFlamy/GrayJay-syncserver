@@ -237,7 +237,7 @@ public class SyncSocketSession : IDisposable
             int totalMessageSize = 4 + 4 + pairingMessageLength + channelBytesWritten;
             BinaryPrimitives.WriteInt32LittleEndian(message.AsSpan(0, 4), totalMessageSize);
 
-            await SendAsync(message, 0, totalMessageSize + 4, cancellationToken: cancellationToken);
+            await SendRawAsync(message, 0, totalMessageSize + 4, cancellationToken: cancellationToken);
             Logger.Info<SyncSocketSession>($"HandshakeAsInitiator: Wrote message size {totalMessageSize} (pairing: {pairingMessageLength}, channel: {channelBytesWritten}, app id: {appId}");
 
             await ReceiveExactAsync(message, 0, 4);
@@ -300,7 +300,7 @@ public class SyncSocketSession : IDisposable
 
             var (bytesWritten, _, transport) = handshakeState.WriteMessage(null, message.AsSpan(4));
             BinaryPrimitives.WriteInt32LittleEndian(message.AsSpan(0, 4), bytesWritten);
-            await SendAsync(message, 0, bytesWritten + 4, cancellationToken: cancellationToken);
+            await SendRawAsync(message, 0, bytesWritten + 4, cancellationToken: cancellationToken);
             Logger.Info<SyncSocketSession>($"HandshakeAsResponder: Wrote message size {bytesWritten} (app id: {appId})");
 
             _transport = transport;
@@ -315,7 +315,7 @@ public class SyncSocketSession : IDisposable
     private async ValueTask PerformVersionCheckAsync(CancellationToken cancellationToken = default)
     {
         const int MINIMUM_VERSION = 4;
-        await SendAsync(VERSION_BYTES, 0, 4, cancellationToken: cancellationToken);
+        await SendRawAsync(VERSION_BYTES, 0, 4, cancellationToken: cancellationToken);
         byte[] versionBytes = new byte[4];
         await ReceiveExactAsync(versionBytes, 0, 4);
         RemoteVersion = BinaryPrimitives.ReadInt32LittleEndian(versionBytes.AsSpan(0, 4));
@@ -364,7 +364,7 @@ public class SyncSocketSession : IDisposable
             Logger.Debug<SyncSocketSession>($"Received {totalBytesReceived} bytes.");
     }
 
-    private async ValueTask SendAsync(byte[] data, int offset = 0, int count = -1, CancellationToken cancellationToken = default)
+    private async ValueTask SendRawAsync(byte[] data, int offset = 0, int count = -1, CancellationToken cancellationToken = default)
     {
         if (count == -1)
             count = data.Length;
@@ -506,7 +506,7 @@ public class SyncSocketSession : IDisposable
                 var len = Encrypt(_sendBuffer.AsSpan().Slice(0, processedSize + HEADER_SIZE), _sendBufferEncrypted.AsSpan(4));
 
                 BinaryPrimitives.WriteInt32LittleEndian(_sendBufferEncrypted.AsSpan(0, 4), len);
-                await SendAsync(_sendBufferEncrypted, 0, len + 4, cancellationToken: cancellationToken);
+                await SendRawAsync(_sendBufferEncrypted, 0, len + 4, cancellationToken: cancellationToken);
                 if (Logger.WillLog(LogLevel.Debug))
                     Logger.Debug<SyncSocketSession>($"Wrote message bytes {len}");
             }
@@ -536,7 +536,7 @@ public class SyncSocketSession : IDisposable
 
             var len = Encrypt(_sendBuffer.AsSpan().Slice(0, HEADER_SIZE), _sendBufferEncrypted.AsSpan(4));
             BinaryPrimitives.WriteInt32LittleEndian(_sendBufferEncrypted.AsSpan(0, 4), len);
-            await SendAsync(_sendBufferEncrypted, 0, len + 4, cancellationToken: cancellationToken);
+            await SendRawAsync(_sendBufferEncrypted, 0, len + 4, cancellationToken: cancellationToken);
 
             if (Logger.WillLog(LogLevel.Debug))
                 Logger.Debug<SyncSocketSession>($"Wrote message bytes {len}");
@@ -1892,7 +1892,8 @@ public class SyncSocketSession : IDisposable
             }
 
             ArrayPool<byte>.Shared.Return(encryptedChunkBuffer);
-            Logger.Verbose<SyncSocketSession>($"Sent publish request with requestId {requestId}");
+            if (Logger.WillLog(LogLevel.Verbose))
+                Logger.Verbose<SyncSocketSession>($"Sent publish request with requestId {requestId}");
             await SendAsync(Opcode.REQUEST, (byte)RequestOpcode.PUBLISH_RECORD, packet, contentEncoding: contentEncoding, cancellationToken: cancellationToken);
         }
         catch (Exception ex)

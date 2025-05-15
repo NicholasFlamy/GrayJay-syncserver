@@ -187,7 +187,7 @@ public class SyncSession
                 try
                 {
                     await _sendSemaphore.WaitAsync(_disposeCancellationTokenSource.Token);
-                    await SendAsync(_sessionBuffer, 0, bytesWritten + 4);
+                    await SendRawAsync(_sessionBuffer, 0, bytesWritten + 4);
                 }
                 finally
                 {
@@ -1141,7 +1141,8 @@ public class SyncSession
             offset += pairingMessageLength;
         }
 
-        Logger.Verbose<SyncSession>($"Transport request received (from = {RemotePublicKey}, to = {targetPublicKey}) (app id: {appId}).");
+        if (Logger.WillLog(LogLevel.Verbose))
+            Logger.Verbose<SyncSession>($"Transport request received (from = {RemotePublicKey}, to = {targetPublicKey}) (app id: {appId}).");
 
         int channelMessageLength = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(offset, 4));
         if (data.Count != offset + 4 + channelMessageLength)
@@ -1273,7 +1274,8 @@ public class SyncSession
 
     private async ValueTask HandleRequestPublishRecordAsync(int requestId, ArraySegment<byte> data)
     {
-        Logger.Verbose<SyncSession>($"Received publish request with requestId {requestId}");
+        if (Logger.WillLog(LogLevel.Verbose))
+            Logger.Verbose<SyncSession>($"Received publish request with requestId {requestId}");
 
         Interlocked.Increment(ref _server.Metrics.TotalPublishRecordRequests);
 
@@ -1328,7 +1330,8 @@ public class SyncSession
                 Interlocked.Add(ref _server.Metrics.TotalPublishRecordTimeMs, stopwatch.ElapsedMilliseconds);
                 Interlocked.Increment(ref _server.Metrics.PublishRecordCount);
                 Interlocked.Increment(ref _server.Metrics.TotalPublishRecordSuccesses);
-                Logger.Verbose<SyncSession>($"Publish request succeeded with requestId {requestId}");
+                if (Logger.WillLog(LogLevel.Verbose))
+                    Logger.Verbose<SyncSession>($"Publish request succeeded with requestId {requestId}");
                 await SendEmptyResponseAsync(ResponseOpcode.PUBLISH_RECORD, requestId, (int)PublishRecordResponseCode.Success);
             }
             catch (Exception ex)
@@ -1338,7 +1341,8 @@ public class SyncSession
                 Interlocked.Increment(ref _server.Metrics.PublishRecordCount);
                 Interlocked.Increment(ref _server.Metrics.TotalPublishRecordFailures);
                 Logger.Error<SyncSession>("Error publishing record", ex);
-                Logger.Verbose<SyncSession>($"Publish request failed with requestId {requestId}");
+                if (Logger.WillLog(LogLevel.Verbose))
+                    Logger.Verbose<SyncSession>($"Publish request failed with requestId {requestId}");
                 await SendEmptyResponseAsync(ResponseOpcode.PUBLISH_RECORD, requestId, (int)PublishRecordResponseCode.GeneralError);
             }
         });
@@ -1550,7 +1554,7 @@ public class SyncSession
         try
         {
             await _sendSemaphore.WaitAsync(_disposeCancellationTokenSource.Token);
-            await SendAsync(VersionBytes, 0, 4);
+            await SendRawAsync(VersionBytes, 0, 4);
         }
         finally
         {
@@ -1569,6 +1573,8 @@ public class SyncSession
 
         try
         {
+            await _sendSemaphore.WaitAsync(_disposeCancellationTokenSource.Token);
+
             try
             {
                 BinaryPrimitives.WriteInt32LittleEndian(decryptedPacket.AsSpan(0, 4), decryptedSize - 4);
@@ -1590,21 +1596,14 @@ public class SyncSession
                 Utilities.ReturnBytes(decryptedPacket);
             }
 
-            try
-            {
-                await _sendSemaphore.WaitAsync(_disposeCancellationTokenSource.Token);
-                await SendAsync(encryptedPacket, 0, encryptedSize);
+            await SendRawAsync(encryptedPacket, 0, encryptedSize);
 
-                if (Logger.WillLog(LogLevel.Debug))
-                    Logger.Debug<SyncSession>($"Wrote message bytes {encryptedSize}");
-            }
-            finally
-            {
-                _sendSemaphore.Release();
-            }
+            if (Logger.WillLog(LogLevel.Debug))
+                Logger.Debug<SyncSession>($"Wrote message bytes {encryptedSize}");
         }
         finally
         {
+            _sendSemaphore.Release();
             Utilities.ReturnBytes(encryptedPacket);
         }
     }
@@ -1707,6 +1706,8 @@ public class SyncSession
 
             try
             {
+                await _sendSemaphore.WaitAsync(_disposeCancellationTokenSource.Token);
+
                 try
                 {
                     BinaryPrimitives.WriteInt32LittleEndian(decryptedPacket.AsSpan().Slice(0, 4), decryptedSize - 4);
@@ -1714,6 +1715,12 @@ public class SyncSession
                     decryptedPacket[5] = (byte)subOpcode;
                     decryptedPacket[6] = (byte)ContentEncoding.Raw;
                     processedData.CopyTo(new ArraySegment<byte>(decryptedPacket).Slice(HEADER_SIZE));
+
+                    var len = Encrypt(decryptedPacket.AsSpan().Slice(0, processedData.Count + HEADER_SIZE), encryptedPacket.AsSpan().Slice(4));
+                    if (len + 4 != encryptedSize)
+                        throw new Exception("Encrypted size does not match expected value.");
+
+                    BinaryPrimitives.WriteInt32LittleEndian(encryptedPacket.AsSpan().Slice(0, 4), len);
                 }
                 finally
                 {
@@ -1723,24 +1730,14 @@ public class SyncSession
                 if (Logger.WillLog(LogLevel.Debug))
                     Logger.Debug<SyncSession>($"Encrypted message bytes {processedData.Count + HEADER_SIZE}");
 
-                try
-                {
-                    await _sendSemaphore.WaitAsync(_disposeCancellationTokenSource.Token);
+                await SendRawAsync(encryptedPacket, 0, encryptedSize);
 
-                    var len = Encrypt(decryptedPacket.AsSpan().Slice(0, processedData.Count + HEADER_SIZE), encryptedPacket.AsSpan().Slice(4));
-                    BinaryPrimitives.WriteInt32LittleEndian(encryptedPacket.AsSpan().Slice(0, 4), len);
-                    await SendAsync(encryptedPacket, 0, encryptedSize);
-
-                    if (Logger.WillLog(LogLevel.Debug))
-                        Logger.Debug<SyncSession>($"Wrote message bytes {len}");
-                }
-                finally
-                {
-                    _sendSemaphore.Release();
-                }
+                if (Logger.WillLog(LogLevel.Debug))
+                    Logger.Debug<SyncSession>($"Wrote message bytes {encryptedSize}");
             }
             finally
             {
+                _sendSemaphore.Release();
                 Utilities.ReturnBytes(encryptedPacket);
             }
         }
@@ -1778,7 +1775,7 @@ public class SyncSession
     }
 
     //TODO: Reuse buffer initially set by InitializeBufferPool
-    private async ValueTask SendAsync(byte[] data, int offset, int count)
+    private async ValueTask SendRawAsync(byte[] data, int offset, int count)
     {
         ThrowIfDisposed();
 
@@ -1810,7 +1807,8 @@ public class SyncSession
 
     private async ValueTask SendEmptyResponseAsync(ResponseOpcode responseOpcode, int requestId, int statusCode)
     {
-        Logger.Verbose<SyncSession>("SendEmptyResponse with requestId = " + requestId);
+        if (Logger.WillLog(LogLevel.Verbose))
+            Logger.Verbose<SyncSession>("SendEmptyResponse with requestId = " + requestId);
 
         byte[] responseData = Utilities.RentBytes(12);
         try

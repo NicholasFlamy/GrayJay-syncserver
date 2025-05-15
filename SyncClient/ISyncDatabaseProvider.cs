@@ -1,22 +1,25 @@
-﻿namespace SyncClient;
+﻿using SyncShared;
+
+namespace SyncClient;
 
 public interface ISyncDatabaseProvider
 {
     // Authorized devices
-    Task<bool> IsAuthorizedAsync(string publicKey);
-    Task AddAuthorizedDeviceAsync(string publicKey);
-    Task RemoveAuthorizedDeviceAsync(string publicKey);
-    Task<string[]> GetAllAuthorizedDevicesAsync();
+    bool IsAuthorized(string publicKey);
+    void AddAuthorizedDevice(string publicKey);
+    void RemoveAuthorizedDevice(string publicKey);
+    string[]? GetAllAuthorizedDevices();
+    int GetAuthorizedDeviceCount();
 
     // Sync key pair
-    Task<string> GetSyncKeyPairAsync();
-    Task SetSyncKeyPairAsync(string value);
+    SyncKeyPair? GetSyncKeyPair();
+    void SetSyncKeyPair(SyncKeyPair value);
 
     // Last address storage
-    Task<string> GetLastAddressAsync(string publicKey);
-    Task SetLastAddressAsync(string publicKey, string address);
+    string? GetLastAddress(string publicKey);
+    void SetLastAddress(string publicKey, string address);
 
     // Name storage
-    Task<string> GetDeviceNameAsync(string publicKey);
-    Task SetDeviceNameAsync(string publicKey, string name);
+    string? GetDeviceName(string publicKey);
+    void SetDeviceName(string publicKey, string name);
 }
