@@ -6,6 +6,7 @@ using System.Net;
 using Logger = SyncShared.Logger;
 using System.Security.Cryptography;
 using System.Collections.Concurrent;
+using System.Runtime.CompilerServices;
 
 namespace SyncClient;
 
@@ -47,11 +48,13 @@ public class SyncService : IDisposable
     private SyncSocketSession? _relaySession;
     private readonly string _relayServer;
     private readonly string _serviceName;
+    private readonly string _relayPublicKey;
 
-    public SyncService(string serviceName, string relayServer, uint appId, ISyncDatabaseProvider database, SyncServiceSettings? settings = null)
+    public SyncService(string serviceName, string relayServer, string relayPublicKey, uint appId, ISyncDatabaseProvider database, SyncServiceSettings? settings = null)
     {
         _serviceName = serviceName;
         _relayServer = relayServer;
+        _relayPublicKey = relayPublicKey;
         AppId = appId;
         _database = database;
         _settings = settings ?? new SyncServiceSettings();
@@ -197,8 +200,6 @@ public class SyncService : IDisposable
 
             while (!_cancellationTokenSource!.IsCancellationRequested)
             {
-                const string RelayPublicKey = "xGbHRzDOvE6plRbQaFgSen82eijF+gxS0yeUaeEErkw=";
-
                 try
                 {
                     Logger.Info<SyncService>("Starting relay session...");
@@ -315,7 +316,7 @@ public class SyncService : IDisposable
                         });
 
                     _relaySession.Authorizable = AlwaysAuthorized.Instance;
-                    await _relaySession.StartAsInitiatorAsync(RelayPublicKey, AppId, null, _cancellationTokenSource.Token);
+                    await _relaySession.StartAsInitiatorAsync(_relayPublicKey, AppId, null, _cancellationTokenSource.Token);
 
                     Logger.Info<SyncService>("Relay session finished.");
                 }
