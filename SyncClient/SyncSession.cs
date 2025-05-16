@@ -6,6 +6,7 @@ namespace SyncClient;
 public class SyncSession : IDisposable, IAuthorizable
 {
     private readonly List<IChannel> _channels = new List<IChannel>();
+    private volatile IChannel[] _snapshot = Array.Empty<IChannel>();
     private bool _authorized;
     private bool _remoteAuthorized;
     private readonly Action<SyncSession, bool, bool> _onAuthorized;
@@ -79,6 +80,8 @@ public class SyncSession : IDisposable, IAuthorizable
         lock (_channels)
         {
             _channels.Add(channel);
+            _channels.Sort((a, b) => ((int)a.LinkType).CompareTo((int)b.LinkType));
+            _snapshot = _channels.ToArray();
             Connected = _channels.Any();
         }
     }
@@ -128,6 +131,7 @@ public class SyncSession : IDisposable, IAuthorizable
         lock (_channels)
         {
             _channels.Remove(channel);
+            _snapshot = _channels.ToArray();
             Connected = _channels.Any();
         }
     }
@@ -140,6 +144,7 @@ public class SyncSession : IDisposable, IAuthorizable
             foreach (var channel in channelsToClose)
                 channel.Dispose();
             _channels.Clear();
+            _snapshot = Array.Empty<IChannel>();
         }
 
         _onClose(this);
@@ -217,14 +222,8 @@ public class SyncSession : IDisposable, IAuthorizable
         if (c == -1)
             c = data?.Length ?? 0;
 
-        //TODO: Make this more efficient, compute ahead of time when channels are added?
-        List<IChannel> channels;
-        lock (_channels)
-        {
-            channels = _channels.OrderBy(c => (int)c.LinkType).ToList();
-        }
-
-        if (channels.Count == 0)
+        var channels = _snapshot;
+        if (channels.Length == 0)
         {
             Logger.Verbose<SyncSession>($"Packet was not sent (opcode = {opcode}, subOpcode = {subOpcode}) due to no connected sockets");
             return;
