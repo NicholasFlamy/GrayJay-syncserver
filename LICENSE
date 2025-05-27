@@ -15,7 +15,7 @@ furnished to do so, subject to the following conditions:
 2. Branding Requirement  
    Any distribution of the Software, or any derivative work that includes a
    user interface implementing or exposing the Sync protocol (“sync flow”),
-   must prominently display the official Sync logo (available in this repository, synclogo.png) within that sync flow. The logo should be
+   must prominently display the official Sync logo (available in this repository, synclogo.png, https://gitlab.futo.org/videostreaming/syncserver/-/raw/master/synclogo.png) within that sync flow. The logo should be
    visible and recognizable to end users (no distortion or hiding).
 
 THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
