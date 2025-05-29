@@ -416,9 +416,6 @@ public class SyncSession
                 case RequestOpcode.CONNECTION_INFO:
                     await HandleRequestConnectionInfoAsync(requestId, data);
                     break;
-                case RequestOpcode.HOLE_PUNCH_REQUEST:
-                    await HandleHolePunchRequestAsync(requestId, data);
-                    break;
                 case RequestOpcode.TRANSPORT:
                     await HandleRequestTransportAsync(requestId, data);
                     break;
