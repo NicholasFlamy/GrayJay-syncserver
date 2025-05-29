@@ -138,7 +138,7 @@ public class SyncService : IDisposable
                 ServerSocketStarted = true;
                 Logger.Info<SyncService>($"Running on port {_settings.ListenerPort} (TCP)");
 
-                while (!_cancellationTokenSource!.IsCancellationRequested)
+                while (_cancellationTokenSource != null && !_cancellationTokenSource.IsCancellationRequested)
                 {
                     var clientSocket = await _serverSocket.AcceptSocketAsync();
                     var session = CreateSocketSession(clientSocket, true);
@@ -164,7 +164,7 @@ public class SyncService : IDisposable
             {
                 Logger.Info<SyncService>("Running auto reconnector");
 
-                while (!_cancellationTokenSource!.IsCancellationRequested)
+                while (_cancellationTokenSource != null && !_cancellationTokenSource.IsCancellationRequested)
                 {
                     var authorizedDevices = _database.GetAllAuthorizedDevices() ?? Array.Empty<string>();
                     var pairs = authorizedDevices
@@ -206,146 +206,153 @@ public class SyncService : IDisposable
 
         _ = Task.Run(async () =>
         {
-            int[] backoffs = [1000, 5000, 10000, 20000];
-            int backoffIndex = 0;
-
-            while (!_cancellationTokenSource!.IsCancellationRequested)
+            try
             {
-                try
+                int[] backoffs = [1000, 5000, 10000, 20000];
+                int backoffIndex = 0;
+
+                while (_cancellationTokenSource != null && !_cancellationTokenSource.IsCancellationRequested)
                 {
-                    Logger.Info<SyncService>("Starting relay session...");
-                    RelayConnected = false;
+                    try
+                    {
+                        Logger.Info<SyncService>("Starting relay session...");
+                        RelayConnected = false;
 
-                    var socket = OpenTcpSocket(_relayServer, 9000);
-                    _relaySession = new SyncSocketSession((socket.RemoteEndPoint as IPEndPoint)!.Address.ToString(), _keyPair!,
-                        socket,
-                        isHandshakeAllowed: IsHandshakeAllowed,
-                        onNewChannel: (s, c) =>
-                        {
-                            var remotePublicKey = c.RemotePublicKey;
-                            if (remotePublicKey == null)
+                        var socket = OpenTcpSocket(_relayServer, 9000);
+                        _relaySession = new SyncSocketSession((socket.RemoteEndPoint as IPEndPoint)!.Address.ToString(), _keyPair!,
+                            socket,
+                            isHandshakeAllowed: IsHandshakeAllowed,
+                            onNewChannel: (s, c) =>
                             {
-                                Logger.Error<SyncService>("Remote public key should never be null in onNewChannel.");
-                                return;
-                            }
-
-                            Logger.Info<SyncService>($"New channel established from relay (pk: '{c.RemotePublicKey}').");
-
-                            SyncSession? session;
-                            lock (_sessions)
-                            {
-                                if (!_sessions.TryGetValue(remotePublicKey, out session) || session == null)
+                                var remotePublicKey = c.RemotePublicKey;
+                                if (remotePublicKey == null)
                                 {
-                                    var remoteDeviceName = _database.GetDeviceName(remotePublicKey);
-                                    session = CreateNewSyncSession(remotePublicKey, remoteDeviceName);
-                                    _sessions[remotePublicKey] = session;
+                                    Logger.Error<SyncService>("Remote public key should never be null in onNewChannel.");
+                                    return;
                                 }
 
-                                session.AddChannel(c);
-                            }
+                                Logger.Info<SyncService>($"New channel established from relay (pk: '{c.RemotePublicKey}').");
 
-                            c.SetDataHandler((_, channel, opcode, subOpcode, data) => session.HandlePacket(opcode, subOpcode, data));
-                            c.SetCloseHandler((channel) =>
-                            {
-                                session.RemoveChannel(channel);
-                                var remotePublicKey = channel.RemotePublicKey;
-                                if (remotePublicKey != null && _remotePendingStatusUpdate.TryRemove(remotePublicKey, out var c))
-                                    c?.Invoke(false, "Channel closed");
-                            });
-                        },
-                        onChannelEstablished: async (_, channel, isResponder) =>
-                        {
-                            await HandleAuthorizationAsync(channel, isResponder, _cancellationTokenSource.Token);
-                        },
-                        onHandshakeComplete: async (relaySession) =>
-                        {
-                            backoffIndex = 0;
-
-                            try
-                            {
-                                while (!_cancellationTokenSource.IsCancellationRequested)
+                                SyncSession? session;
+                                lock (_sessions)
                                 {
-                                    string[]? unconnectedAuthorizedDevices = _database.GetAllAuthorizedDevices()?.Where(pk => !IsConnected(pk))?.ToArray();
-                                    if (unconnectedAuthorizedDevices != null)
+                                    if (!_sessions.TryGetValue(remotePublicKey, out session) || session == null)
                                     {
-                                        await relaySession.PublishConnectionInformationAsync(unconnectedAuthorizedDevices, _settings.ListenerPort, _settings.RelayConnectDirect, false, false, _settings.RelayConnectRelayed, _cancellationTokenSource.Token);
-                                        var connectionInfos = await relaySession.RequestBulkConnectionInfoAsync(unconnectedAuthorizedDevices, _cancellationTokenSource.Token);
-                                        foreach (var connectionInfoPair in connectionInfos)
+                                        var remoteDeviceName = _database.GetDeviceName(remotePublicKey);
+                                        session = CreateNewSyncSession(remotePublicKey, remoteDeviceName);
+                                        _sessions[remotePublicKey] = session;
+                                    }
+
+                                    session.AddChannel(c);
+                                }
+
+                                c.SetDataHandler((_, channel, opcode, subOpcode, data) => session.HandlePacket(opcode, subOpcode, data));
+                                c.SetCloseHandler((channel) =>
+                                {
+                                    session.RemoveChannel(channel);
+                                    var remotePublicKey = channel.RemotePublicKey;
+                                    if (remotePublicKey != null && _remotePendingStatusUpdate.TryRemove(remotePublicKey, out var c))
+                                        c?.Invoke(false, "Channel closed");
+                                });
+                            },
+                            onChannelEstablished: async (_, channel, isResponder) =>
+                            {
+                                await HandleAuthorizationAsync(channel, isResponder, _cancellationTokenSource.Token);
+                            },
+                            onHandshakeComplete: async (relaySession) =>
+                            {
+                                backoffIndex = 0;
+
+                                try
+                                {
+                                    while (!_cancellationTokenSource.IsCancellationRequested)
+                                    {
+                                        string[]? unconnectedAuthorizedDevices = _database.GetAllAuthorizedDevices()?.Where(pk => !IsConnected(pk))?.ToArray();
+                                        if (unconnectedAuthorizedDevices != null)
                                         {
-                                            var targetKey = connectionInfoPair.Key;
-                                            var connectionInfo = connectionInfoPair.Value;
-                                            var potentialLocalAddresses = connectionInfo.Ipv4Addresses.Concat(connectionInfo.Ipv6Addresses).Where(l => l != connectionInfo.RemoteIp).ToList();
-                                            if (connectionInfo.AllowLocalDirect && _settings.RelayConnectDirect)
+                                            await relaySession.PublishConnectionInformationAsync(unconnectedAuthorizedDevices, _settings.ListenerPort, _settings.RelayConnectDirect, false, false, _settings.RelayConnectRelayed, _cancellationTokenSource.Token);
+                                            var connectionInfos = await relaySession.RequestBulkConnectionInfoAsync(unconnectedAuthorizedDevices, _cancellationTokenSource.Token);
+                                            foreach (var connectionInfoPair in connectionInfos)
                                             {
-                                                _ = Task.Run(async () =>
+                                                var targetKey = connectionInfoPair.Key;
+                                                var connectionInfo = connectionInfoPair.Value;
+                                                var potentialLocalAddresses = connectionInfo.Ipv4Addresses.Concat(connectionInfo.Ipv6Addresses).Where(l => l != connectionInfo.RemoteIp).ToList();
+                                                if (connectionInfo.AllowLocalDirect && _settings.RelayConnectDirect)
+                                                {
+                                                    _ = Task.Run(async () =>
+                                                    {
+                                                        try
+                                                        {
+                                                            Logger.Verbose<SyncService>($"Attempting to connect directly, locally to '{targetKey}'.");
+                                                            await ConnectAsync(potentialLocalAddresses.Select(l => l.ToString()).ToArray(), _settings.ListenerPort, targetKey, cancellationToken: _cancellationTokenSource.Token);
+                                                        }
+                                                        catch (Exception e)
+                                                        {
+                                                            Logger.Error<SyncService>($"Failed to start direct connection using connection info with {targetKey}.", e);
+                                                        }
+                                                    });
+                                                }
+
+                                                var remoteAddress = connectionInfo.RemoteIp;
+                                                if (connectionInfo.AllowRemoteDirect)
+                                                {
+                                                    //TODO: Try connecting directly, remotely, set allow to true when implemented, only useful for port forwarded scenarios?
+                                                }
+
+                                                if (connectionInfo.AllowRemoteHolePunched)
+                                                {
+                                                    //TODO: Implement hole punching, set allow to true when implemented
+                                                }
+
+                                                if (connectionInfo.AllowRemoteRelayed && _settings.RelayConnectRelayed)
                                                 {
                                                     try
                                                     {
-                                                        Logger.Verbose<SyncService>($"Attempting to connect directly, locally to '{targetKey}'.");
-                                                        await ConnectAsync(potentialLocalAddresses.Select(l => l.ToString()).ToArray(), _settings.ListenerPort, targetKey, cancellationToken: _cancellationTokenSource.Token);
+                                                        Logger.Verbose<SyncService>($"Attempting relayed connection with '{targetKey}'.");
+                                                        await relaySession.StartRelayedChannelAsync(targetKey, AppId, null, _cancellationTokenSource.Token);
                                                     }
                                                     catch (Exception e)
                                                     {
-                                                        Logger.Error<SyncService>($"Failed to start direct connection using connection info with {targetKey}.", e);
+                                                        Logger.Error<SyncService>($"Failed to start relayed channel with {targetKey}.", e);
                                                     }
-                                                });
-                                            }
-
-                                            var remoteAddress = connectionInfo.RemoteIp;
-                                            if (connectionInfo.AllowRemoteDirect)
-                                            {
-                                                //TODO: Try connecting directly, remotely, set allow to true when implemented, only useful for port forwarded scenarios?
-                                            }
-
-                                            if (connectionInfo.AllowRemoteHolePunched)
-                                            {
-                                                //TODO: Implement hole punching, set allow to true when implemented
-                                            }
-
-                                            if (connectionInfo.AllowRemoteRelayed && _settings.RelayConnectRelayed)
-                                            {
-                                                try
-                                                {
-                                                    Logger.Verbose<SyncService>($"Attempting relayed connection with '{targetKey}'.");
-                                                    await relaySession.StartRelayedChannelAsync(targetKey, AppId, null, _cancellationTokenSource.Token);
-                                                }
-                                                catch (Exception e)
-                                                {
-                                                    Logger.Error<SyncService>($"Failed to start relayed channel with {targetKey}.", e);
                                                 }
                                             }
                                         }
+
+                                        await Task.Delay(TimeSpan.FromSeconds(15), _cancellationTokenSource.Token);
                                     }
-
-                                    await Task.Delay(TimeSpan.FromSeconds(15), _cancellationTokenSource.Token);
                                 }
-                            }
-                            catch (Exception e)
-                            {
-                                Logger.Error<SyncService>("Unhandled exception in relay session.", e);
-                                relaySession.Dispose();
-                            }
-                        });
+                                catch (Exception e)
+                                {
+                                    Logger.Error<SyncService>("Unhandled exception in relay session.", e);
+                                    relaySession.Dispose();
+                                }
+                            });
 
-                    _relaySession.Authorizable = AlwaysAuthorized.Instance;
-                    RelayConnected = true;
-                    await _relaySession.StartAsInitiatorAsync(_relayPublicKey, AppId, null, _cancellationTokenSource.Token);
+                        _relaySession.Authorizable = AlwaysAuthorized.Instance;
+                        RelayConnected = true;
+                        await _relaySession.StartAsInitiatorAsync(_relayPublicKey, AppId, null, _cancellationTokenSource.Token);
 
-                    Logger.Info<SyncService>("Relay session finished.");
+                        Logger.Info<SyncService>("Relay session finished.");
+                    }
+                    catch (Exception e)
+                    {
+                        Logger.Error<SyncService>("Relay session failed.", e);
+                    }
+                    finally
+                    {
+                        RelayConnected = false;
+                        _relaySession?.Dispose();
+                        _relaySession = null;
+                        var cancellationTokenSource = _cancellationTokenSource;
+                        if (cancellationTokenSource != null)
+                            await Task.Delay(backoffs[Math.Min(backoffs.Length - 1, backoffIndex++)], cancellationTokenSource.Token);
+                    }
                 }
-                catch (Exception e)
-                {
-                    Logger.Error<SyncService>("Relay session failed.", e);
-                }
-                finally
-                {
-                    RelayConnected = false;
-                    _relaySession?.Dispose();
-                    _relaySession = null;
-                    var cancellationTokenSource = _cancellationTokenSource;
-                    if (cancellationTokenSource != null)
-                        await Task.Delay(backoffs[Math.Min(backoffs.Length - 1, backoffIndex++)], cancellationTokenSource.Token);
-                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Error<SyncService>("Unhandled exception in StartRelayLoop.", ex);
             }
         });
     }
