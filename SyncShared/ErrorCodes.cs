@@ -28,7 +28,8 @@ public enum TransportResponseCode
     ChannelMessageDataLengthMismatch = 4,
     Blacklisted = 5,
     DuplicateConnection = 6,
-    Rejected = 7
+    Rejected = 7,
+    TargetNotFound = 8
 }
 
 public enum PublishRecordResponseCode

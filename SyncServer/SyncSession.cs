@@ -1206,7 +1206,7 @@ public class SyncSession
         if (targetSession == null)
         {
             Logger.Info<SyncSession>($"Target {targetPublicKey} not found for relay request (app id: {appId}).");
-            await SendEmptyResponseAsync(ResponseOpcode.TRANSPORT_RELAYED, requestId, (int)TransportResponseCode.GeneralError);
+            await SendEmptyResponseAsync(ResponseOpcode.TRANSPORT_RELAYED, requestId, (int)TransportResponseCode.TargetNotFound);
             Interlocked.Increment(ref _server.Metrics.TotalRelayedConnectionsFailed);
             return;
         }
