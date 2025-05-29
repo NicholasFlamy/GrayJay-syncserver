@@ -1596,7 +1596,7 @@ public class SyncSocketSession : IDisposable
         if (!isAllowedToConnect)
         {
             var rp = new byte[16];
-            BinaryPrimitives.WriteInt32LittleEndian(rp.AsSpan(0, 4), (int)2);
+            BinaryPrimitives.WriteInt32LittleEndian(rp.AsSpan(0, 4), (int)TransportResponseCode.Rejected);
             BinaryPrimitives.WriteInt64LittleEndian(rp.AsSpan(4, 8), connectionId);
             BinaryPrimitives.WriteInt32LittleEndian(rp.AsSpan(12, 4), requestId);
             _ = Task.Run(async () =>

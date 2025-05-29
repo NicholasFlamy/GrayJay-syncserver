@@ -37,6 +37,8 @@ public class SyncService : IDisposable
     private readonly Dictionary<string, SyncSession> _sessions = new Dictionary<string, SyncSession>();
     private readonly ConcurrentDictionary<string, Action<bool?, string>> _remotePendingStatusUpdate = new();
     public bool ServerSocketFailedToStart { get; private set; } = false;
+    public bool ServerSocketStarted { get; private set; } = false;
+    public bool RelayConnected { get; private set; } = false;
     public string PairingCode { get; } = GenerateReadablePassword(8);
     public readonly uint AppId;
     public Action<SyncSession, bool, bool>? OnAuthorized;
@@ -111,9 +113,11 @@ public class SyncService : IDisposable
 
         Logger.Info<SyncService>($"Sync key pair initialized (public key = {PublicKey})");
 
+        ServerSocketStarted = false;
         if (_settings.BindListener)
             StartListener();
 
+        RelayConnected = false;
         if (_settings.RelayEnabled)
             StartRelayLoop();
 
@@ -124,12 +128,14 @@ public class SyncService : IDisposable
     private void StartListener()
     {
         ServerSocketFailedToStart = false;
+        ServerSocketStarted = false;
         _ = Task.Run(async () =>
         {
             try
             {
                 _serverSocket = new TcpListener(IPAddress.Any, _settings.ListenerPort);
                 _serverSocket.Start();
+                ServerSocketStarted = true;
                 Logger.Info<SyncService>($"Running on port {_settings.ListenerPort} (TCP)");
 
                 while (!_cancellationTokenSource!.IsCancellationRequested)
@@ -138,11 +144,14 @@ public class SyncService : IDisposable
                     var session = CreateSocketSession(clientSocket, true);
                     await session.StartAsResponderAsync();
                 }
+
+                ServerSocketStarted = false;
             }
             catch (Exception e)
             {
                 Logger.Error<SyncService>("Server socket had an unexpected error.", e);
                 ServerSocketFailedToStart = true;
+                ServerSocketStarted = false;
             }
         });
     }
@@ -193,6 +202,8 @@ public class SyncService : IDisposable
 
     private void StartRelayLoop()
     {
+        RelayConnected = false;
+
         _ = Task.Run(async () =>
         {
             int[] backoffs = [1000, 5000, 10000, 20000];
@@ -203,6 +214,7 @@ public class SyncService : IDisposable
                 try
                 {
                     Logger.Info<SyncService>("Starting relay session...");
+                    RelayConnected = false;
 
                     var socket = OpenTcpSocket(_relayServer, 9000);
                     _relaySession = new SyncSocketSession((socket.RemoteEndPoint as IPEndPoint)!.Address.ToString(), _keyPair!,
@@ -316,6 +328,7 @@ public class SyncService : IDisposable
                         });
 
                     _relaySession.Authorizable = AlwaysAuthorized.Instance;
+                    RelayConnected = true;
                     await _relaySession.StartAsInitiatorAsync(_relayPublicKey, AppId, null, _cancellationTokenSource.Token);
 
                     Logger.Info<SyncService>("Relay session finished.");
@@ -326,6 +339,7 @@ public class SyncService : IDisposable
                 }
                 finally
                 {
+                    RelayConnected = false;
                     _relaySession?.Dispose();
                     _relaySession = null;
                     var cancellationTokenSource = _cancellationTokenSource;
