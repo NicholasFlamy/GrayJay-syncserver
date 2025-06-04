@@ -103,29 +103,57 @@ public static class Utilities
 
     public static Socket OpenTcpSocket(string host, int port)
     {
-        IPHostEntry hostEntry = Dns.GetHostEntry(host);
-        var addresses = hostEntry.AddressList.OrderBy(a => a.AddressFamily == AddressFamily.InterNetwork ? 0 : 1).ToArray();
+        if (string.IsNullOrWhiteSpace(host))
+            throw new ArgumentException("Host cannot be null, empty, or whitespace.", nameof(host));
 
+        if (port < IPEndPoint.MinPort || port > IPEndPoint.MaxPort)
+            throw new ArgumentOutOfRangeException(nameof(port), $"Port must be between {IPEndPoint.MinPort} and {IPEndPoint.MaxPort}.");
+
+        IPAddress[] addresses;
+        try
+        {
+            if (IPAddress.TryParse(host, out IPAddress? ipLiteral) && ipLiteral != null)
+                addresses = new[] { ipLiteral };
+            else
+            {
+                addresses = Dns.GetHostAddresses(host);
+                if (addresses == null || addresses.Length == 0)
+                    throw new SocketException((int)SocketError.HostNotFound);
+            }
+        }
+        catch (Exception ex)
+        {
+            throw new Exception($"Could not resolve host '{host}'.", ex);
+        }
+
+        addresses = addresses
+            .OrderBy(a => a.AddressFamily == AddressFamily.InterNetwork ? 0 : 1)
+            .ToArray();
+
+        var connectionExceptions = new List<Exception>();
         foreach (IPAddress address in addresses)
         {
+            string endpoint = $"{address}:{port}";
             try
             {
-                Socket socket = new Socket(
-                    address.AddressFamily,
-                    SocketType.Stream,
-                    ProtocolType.Tcp
-                );
+                var socket = new Socket(address.AddressFamily, SocketType.Stream, ProtocolType.Tcp)
+                {
+                    SendTimeout = 5000,
+                    ReceiveTimeout = 5000
+                };
 
                 socket.Connect(new IPEndPoint(address, port));
-                Console.WriteLine($"Connected to {host}:{port} using {address.AddressFamily}");
-                return socket;
+                if (socket.Connected)
+                    return socket;
             }
-            catch
+            catch (Exception connectEx)
             {
-                //Ignored
+                connectionExceptions.Add(connectEx);
             }
         }
 
-        throw new Exception($"Could not connect to {host}:{port}");
+        string triedList = string.Join(", ", addresses.Select(a => $"{a}:{port}"));
+        var finalEx = new Exception($"Could not connect to any resolved address for '{host}' on port {port}. Tried: {triedList}");
+        throw new AggregateException(connectionExceptions);
     }
 }

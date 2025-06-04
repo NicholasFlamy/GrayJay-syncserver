@@ -218,7 +218,7 @@ public class SyncService : IDisposable
                         Logger.Info<SyncService>("Starting relay session...");
                         RelayConnected = false;
 
-                        var socket = OpenTcpSocket(_relayServer, 9000);
+                        var socket = SyncShared.Utilities.OpenTcpSocket(_relayServer, 9000);
                         _relaySession = new SyncSocketSession((socket.RemoteEndPoint as IPEndPoint)!.Address.ToString(), _keyPair!,
                             socket,
                             isHandshakeAllowed: IsHandshakeAllowed,
@@ -623,7 +623,7 @@ public class SyncService : IDisposable
     {
         onStatusUpdate?.Invoke(null, "Connecting directly...");
 
-        var socket = OpenTcpSocket(addresses[0], port);
+        var socket = SyncShared.Utilities.OpenTcpSocket(addresses[0], port);
         var session = CreateSocketSession(socket, false, (s) =>
         {
             onStatusUpdate?.Invoke(false, "Disconnected.");
@@ -697,34 +697,6 @@ public class SyncService : IDisposable
         {
             OnData?.Invoke(sess, opcode, subOpcode, data);
         }, remoteDeviceName);
-    }
-
-    private Socket OpenTcpSocket(string host, int port)
-    {
-        IPHostEntry hostEntry = Dns.GetHostEntry(host);
-        var addresses = hostEntry.AddressList.OrderBy(a => a.AddressFamily == AddressFamily.InterNetwork ? 0 : 1).ToArray();
-
-        foreach (IPAddress address in addresses)
-        {
-            try
-            {
-                Socket socket = new Socket(
-                    address.AddressFamily,
-                    SocketType.Stream,
-                    ProtocolType.Tcp
-                );
-
-                socket.Connect(new IPEndPoint(address, port));
-                Console.WriteLine($"Connected to {host}:{port} using {address.AddressFamily}");
-                return socket;
-            }
-            catch
-            {
-                //Ignored
-            }
-        }
-
-        throw new Exception($"Could not connect to {host}:{port}");
     }
 
     public void Dispose()
