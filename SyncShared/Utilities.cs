@@ -3,6 +3,7 @@ using System.Collections.Concurrent;
 using System.Net.Sockets;
 using System.Net;
 using System.Text;
+using System.Net.NetworkInformation;
 
 namespace SyncShared;
 
@@ -101,10 +102,10 @@ public static class Utilities
         }
     }
 
-    public static Socket OpenTcpSocket(string host, int port)
+    public static async Task<Socket> OpenTcpSocketAsync(string host, int port, CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrWhiteSpace(host))
-            throw new ArgumentException("Host cannot be null, empty, or whitespace.", nameof(host));
+            throw new ArgumentException("Host cannot be null or whitespace.", nameof(host));
 
         if (port < IPEndPoint.MinPort || port > IPEndPoint.MaxPort)
             throw new ArgumentOutOfRangeException(nameof(port), $"Port must be between {IPEndPoint.MinPort} and {IPEndPoint.MaxPort}.");
@@ -112,48 +113,177 @@ public static class Utilities
         IPAddress[] addresses;
         try
         {
-            if (IPAddress.TryParse(host, out IPAddress? ipLiteral) && ipLiteral != null)
-                addresses = new[] { ipLiteral };
-            else
-            {
-                addresses = Dns.GetHostAddresses(host);
-                if (addresses == null || addresses.Length == 0)
-                    throw new SocketException((int)SocketError.HostNotFound);
-            }
+            addresses = IPAddress.TryParse(host, out var ip)
+                ? new[] { ip }
+                : await Dns.GetHostAddressesAsync(host, cancellationToken);
+
+            if (addresses.Length == 0)
+                throw new SocketException((int)SocketError.HostNotFound);
         }
         catch (Exception ex)
         {
             throw new Exception($"Could not resolve host '{host}'.", ex);
         }
 
-        addresses = addresses
-            .OrderBy(a => a.AddressFamily == AddressFamily.InterNetwork ? 0 : 1)
-            .ToArray();
+        addresses = addresses.OrderBy(ip => ip.AddressFamily == AddressFamily.InterNetwork ? 0 : 1).ToArray();
 
-        var connectionExceptions = new List<Exception>();
-        foreach (IPAddress address in addresses)
+        var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var connectTasks = addresses.Select(addr => ConnectToAddressAsync(addr, port, cts.Token)).ToList();
+        var exceptions = new List<Exception>();
+
+        while (connectTasks.Count > 0)
         {
-            string endpoint = $"{address}:{port}";
-            try
-            {
-                var socket = new Socket(address.AddressFamily, SocketType.Stream, ProtocolType.Tcp)
-                {
-                    SendTimeout = 5000,
-                    ReceiveTimeout = 5000
-                };
+            var completed = await Task.WhenAny(connectTasks);
+            connectTasks.Remove(completed);
 
-                socket.Connect(new IPEndPoint(address, port));
-                if (socket.Connected)
-                    return socket;
-            }
-            catch (Exception connectEx)
+            if (completed.Status == TaskStatus.RanToCompletion)
             {
-                connectionExceptions.Add(connectEx);
+                var socket = completed.Result;
+                cts.Cancel();
+                await Task.WhenAll(connectTasks); // Let others finish before accessing their results
+
+                foreach (var t in connectTasks)
+                {
+                    if (t.Status == TaskStatus.RanToCompletion)
+                        t.Result.Dispose();
+                }
+
+                return socket;
             }
+
+            if (completed.Exception != null)
+                exceptions.AddRange(completed.Exception.InnerExceptions);
         }
 
-        string triedList = string.Join(", ", addresses.Select(a => $"{a}:{port}"));
-        var finalEx = new Exception($"Could not connect to any resolved address for '{host}' on port {port}. Tried: {triedList}");
-        throw new AggregateException(connectionExceptions);
+        string tried = string.Join(", ", addresses.Select(a => $"{a}:{port}"));
+        throw new AggregateException(
+            $"Could not connect to any resolved address for '{host}' on port {port}. Tried: {tried}",
+            exceptions
+        );
+    }
+
+    private static async Task<Socket> ConnectToAddressAsync(IPAddress address, int port, CancellationToken token)
+    {
+        var socket = new Socket(address.AddressFamily, SocketType.Stream, ProtocolType.Tcp)
+        {
+            SendTimeout = 10000,
+            ReceiveTimeout = 10000
+        };
+
+        using var reg = token.Register(() => { try { socket.Dispose(); } catch { } });
+
+        try
+        {
+            await socket.ConnectAsync(new IPEndPoint(address, port), token);
+            return socket;
+        }
+        catch
+        {
+            socket.Dispose();
+            throw;
+        }
+    }
+
+    public static List<IPAddress> FindCandidateAddresses()
+    {
+        var candidates = NetworkInterface.GetAllNetworkInterfaces()
+            .Where(IsUsableInterface)
+            .SelectMany(nic =>
+                nic.GetIPProperties().UnicastAddresses
+                    .Where(ua => IsUsableAddress(ua.Address))
+                    .Select(ua => (nic, ua)))
+            .ToList();
+
+        return candidates
+            .OrderBy(t => AddressScore(t.ua.Address))
+            .ThenBy(t => InterfaceScore(t.nic))
+            .ThenByDescending(t => t.ua.PrefixLength)
+            .ThenByDescending(t => GetInterfaceMtuSafe(t.nic))
+            .Select(t => t.ua.Address)
+            .ToList();
+    }
+
+    private static bool IsUsableInterface(NetworkInterface nic)
+    {
+        var name = nic.Name.ToLowerInvariant();
+
+        if (nic.OperationalStatus != OperationalStatus.Up)
+            return false;
+
+        if (nic.NetworkInterfaceType == NetworkInterfaceType.Loopback ||
+            nic.NetworkInterfaceType == NetworkInterfaceType.Tunnel)
+            return false;
+
+        if (string.IsNullOrWhiteSpace(nic.GetPhysicalAddress()?.ToString()))
+            return false;
+
+        return !(
+            name.StartsWith("docker") ||
+            name.StartsWith("veth") ||
+            name.StartsWith("br-") ||
+            name.StartsWith("virbr") ||
+            name.StartsWith("vmnet") ||
+            name.StartsWith("tun") ||
+            name.StartsWith("tap"));
+    }
+
+    private static bool IsUsableAddress(IPAddress addr)
+    {
+        return !(IPAddress.IsLoopback(addr)
+            || addr.IsIPv6LinkLocal
+            || addr.IsIPv6Multicast
+            || addr.Equals(IPAddress.Any)
+            || addr.Equals(IPAddress.IPv6Any));
+    }
+
+    private static int InterfaceScore(NetworkInterface nic)
+    {
+        var name = nic.Name.ToLowerInvariant();
+
+        if (System.Text.RegularExpressions.Regex.IsMatch(name, "^(eth|enp|eno|ens|em)\\d+") ||
+            name.StartsWith("eth") ||
+            name.Contains("ethernet"))
+            return 0;
+
+        if (System.Text.RegularExpressions.Regex.IsMatch(name, "^(wlan|wlp)\\d+") ||
+            name.Contains("wi-fi") || name.Contains("wifi"))
+            return 1;
+
+        return 2;
+    }
+
+    private static int AddressScore(IPAddress addr)
+    {
+        if (addr.AddressFamily == AddressFamily.InterNetwork)
+        {
+            var bytes = addr.GetAddressBytes();
+            if (bytes[0] == 10 ||
+                (bytes[0] == 192 && bytes[1] == 168) ||
+                (bytes[0] == 172 && bytes[1] >= 16 && bytes[1] <= 31))
+                return 0; // Private IPv4
+            return 1; // Public IPv4
+        }
+
+        if (addr.AddressFamily == AddressFamily.InterNetworkV6)
+        {
+            byte b0 = addr.GetAddressBytes()[0];
+            if ((b0 & 0xFE) == 0xFC) return 2; // ULA (fc00::/7)
+            if ((b0 & 0xE0) == 0x20) return 3; // Global
+            return 4;
+        }
+
+        return int.MaxValue;
+    }
+
+    private static int GetInterfaceMtuSafe(NetworkInterface nic)
+    {
+        try
+        {
+            return nic.GetIPProperties()?.GetIPv4Properties()?.Mtu ?? 0;
+        }
+        catch
+        {
+            return 0;
+        }
     }
 }

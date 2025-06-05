@@ -169,7 +169,7 @@ public class SyncService : IDisposable
                     var authorizedDevices = _database.GetAllAuthorizedDevices() ?? Array.Empty<string>();
                     var pairs = authorizedDevices
                         .Select(pk => (PublicKey: pk, Address: _database.GetLastAddress(pk)))
-                        .Where(t => !IsConnected(t.PublicKey) && t.Address != null)
+                        .Where(t => GetLinkType(t.PublicKey) != LinkType.Direct && t.Address != null)
                         .Select(t => new { t.PublicKey, LastAddress = t.Address! })
                         .ToList();
 
@@ -218,7 +218,7 @@ public class SyncService : IDisposable
                         Logger.Info<SyncService>("Starting relay session...");
                         RelayConnected = false;
 
-                        var socket = SyncShared.Utilities.OpenTcpSocket(_relayServer, 9000);
+                        var socket = await SyncShared.Utilities.OpenTcpSocketAsync(_relayServer, 9000);
                         _relaySession = new SyncSocketSession((socket.RemoteEndPoint as IPEndPoint)!.Address.ToString(), _keyPair!,
                             socket,
                             isHandshakeAllowed: IsHandshakeAllowed,
@@ -267,7 +267,13 @@ public class SyncService : IDisposable
                                 {
                                     while (!_cancellationTokenSource.IsCancellationRequested)
                                     {
-                                        string[]? unconnectedAuthorizedDevices = _database.GetAllAuthorizedDevices()?.Where(pk => !IsConnected(pk))?.ToArray();
+                                        string[]? unconnectedAuthorizedDevices = _database.GetAllAuthorizedDevices()?.Where(pk =>
+                                        {
+                                            if (_settings.RelayConnectDirect)
+                                                return GetLinkType(pk) != LinkType.Direct;
+                                            else
+                                                return !IsConnected(pk);
+                                        })?.ToArray();
                                         if (unconnectedAuthorizedDevices != null)
                                         {
                                             await relaySession.PublishConnectionInformationAsync(unconnectedAuthorizedDevices, _settings.ListenerPort, _settings.RelayConnectDirect, false, false, _settings.RelayConnectRelayed, _cancellationTokenSource.Token);
@@ -277,7 +283,7 @@ public class SyncService : IDisposable
                                                 var targetKey = connectionInfoPair.Key;
                                                 var connectionInfo = connectionInfoPair.Value;
                                                 var potentialLocalAddresses = connectionInfo.Ipv4Addresses.Concat(connectionInfo.Ipv6Addresses).Where(l => l != connectionInfo.RemoteIp).ToList();
-                                                if (connectionInfo.AllowLocalDirect && _settings.RelayConnectDirect)
+                                                if (GetLinkType(targetKey) != LinkType.Direct && connectionInfo.AllowLocalDirect && _settings.RelayConnectDirect)
                                                 {
                                                     _ = Task.Run(async () =>
                                                     {
@@ -304,7 +310,7 @@ public class SyncService : IDisposable
                                                     //TODO: Implement hole punching, set allow to true when implemented
                                                 }
 
-                                                if (connectionInfo.AllowRemoteRelayed && _settings.RelayConnectRelayed)
+                                                if (!IsConnected(targetKey) && connectionInfo.AllowRemoteRelayed && _settings.RelayConnectRelayed)
                                                 {
                                                     try
                                                     {
@@ -474,6 +480,15 @@ public class SyncService : IDisposable
         }
     }
 
+    public LinkType GetLinkType(string publicKey)
+    {
+        lock (_sessions)
+        {
+            if (_sessions.TryGetValue(publicKey, out var v) && v != null)
+                return v.LinkType;
+            return LinkType.None;
+        }
+    }
 
     public bool IsConnected(string publicKey)
     {
@@ -532,32 +547,31 @@ public class SyncService : IDisposable
 
                 var pkey = urlSafePkey.DecodeBase64Url().EncodeBase64();
                 var authorized = IsAuthorized(pkey);
-                if (authorized && !IsConnected(pkey))
+                if (!authorized || GetLinkType(pkey) == LinkType.Direct)
+                    continue;
+
+                var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                lock (_lastMdnsConnectTimes)
                 {
-                    var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                    if (_lastMdnsConnectTimes.TryGetValue(pkey, out var lastConnectTime) && now - lastConnectTime < 30000)
+                        continue;
 
-                    lock (_lastMdnsConnectTimes)
-                    {
-                        if (_lastMdnsConnectTimes.TryGetValue(pkey, out var lastConnectTime) && now - lastConnectTime < 30000)
-                            continue;
-
-                        _lastMdnsConnectTimes[pkey] = now;
-                    }
-                    Logger.Info<SyncService>($"Found authorized device '{name}' with pkey={pkey}, attempting to connect");
-
-                    _ = Task.Run(async () =>
-                    {
-                        try
-                        {
-                            await ConnectAsync(addresses, port, pkey);
-                            Logger.Info<SyncService>($"Connected to found authorized device '{name}' with pkey={pkey}.");
-                        }
-                        catch (Exception ex)
-                        {
-                            Logger.Info<SyncService>($"Failed to connect to {pkey}", ex);
-                        }
-                    });
+                    _lastMdnsConnectTimes[pkey] = now;
                 }
+                Logger.Info<SyncService>($"Found authorized device '{name}' with pkey={pkey}, attempting to connect");
+
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        await ConnectAsync(addresses, port, pkey);
+                        Logger.Info<SyncService>($"Connected to found authorized device '{name}' with pkey={pkey}.");
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.Info<SyncService>($"Failed to connect to {pkey}", ex);
+                    }
+                });
             }
         }
     }
@@ -623,7 +637,7 @@ public class SyncService : IDisposable
     {
         onStatusUpdate?.Invoke(null, "Connecting directly...");
 
-        var socket = SyncShared.Utilities.OpenTcpSocket(addresses[0], port);
+        var socket = await SyncShared.Utilities.OpenTcpSocketAsync(addresses[0], port);
         var session = CreateSocketSession(socket, false, (s) =>
         {
             onStatusUpdate?.Invoke(false, "Disconnected.");

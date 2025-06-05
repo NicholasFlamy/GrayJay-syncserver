@@ -701,25 +701,9 @@ public class SyncSocketSession : IDisposable
             throw new ArgumentException($"Number of authorized keys exceeds the maximum limit of {MAX_AUTHORIZED_KEYS}.");
 
         // Collect network information
-        var ipv4Addresses = new List<IPAddress>(capacity: 4);
-        var ipv6Addresses = new List<IPAddress>(capacity: 4);
-        foreach (var nic in NetworkInterface.GetAllNetworkInterfaces())
-        {
-            if (nic.OperationalStatus == OperationalStatus.Up)
-            {
-                foreach (var unicast in nic.GetIPProperties().UnicastAddresses)
-                {
-                    var ip = unicast.Address;
-                    if (!IPAddress.IsLoopback(ip))
-                    {
-                        if (ip.AddressFamily == AddressFamily.InterNetwork)
-                            ipv4Addresses.Add(ip);
-                        else if (ip.AddressFamily == AddressFamily.InterNetworkV6 && !ip.IsIPv6LinkLocal)
-                            ipv6Addresses.Add(ip);
-                    }
-                }
-            }
-        }
+        var candidateAddresses = Utilities.FindCandidateAddresses();
+        var ipv4Addresses = candidateAddresses.Where(v => v.AddressFamily == AddressFamily.InterNetwork).ToList();
+        var ipv6Addresses = candidateAddresses.Where(v => v.AddressFamily == AddressFamily.InterNetworkV6).ToList();
 
         // Serialize connection information
         var nameBytes = Utilities.GetLimitedUtf8Bytes(OSHelper.GetComputerName(), 255);
