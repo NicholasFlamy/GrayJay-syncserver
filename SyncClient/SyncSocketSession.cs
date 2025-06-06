@@ -128,6 +128,26 @@ public class SyncSocketSession : IDisposable
             await HandshakeAsInitiatorAsync(remotePublicKey, appId, pairingCode, cancellationToken);
             _onHandshakeComplete?.Invoke(this);
             StartPingLoop();
+            _ = ReceiveLoopAsync(cancellationToken);
+        }
+        catch (Exception e)
+        {
+            Logger.Error<SyncSocketSession>($"Failed to run as initiator: {e}");
+        }
+        finally
+        {
+            Dispose();
+        }
+    }
+
+    public async Task RunAsInitiatorAsync(string remotePublicKey, uint appId = 0, string? pairingCode = null, CancellationToken cancellationToken = default)
+    {
+        _started = true;
+        try
+        {
+            await HandshakeAsInitiatorAsync(remotePublicKey, appId, pairingCode, cancellationToken);
+            _onHandshakeComplete?.Invoke(this);
+            StartPingLoop();
             await ReceiveLoopAsync(cancellationToken);
         }
         catch (Exception e)
@@ -149,7 +169,7 @@ public class SyncSocketSession : IDisposable
             {
                 _onHandshakeComplete?.Invoke(this);
                 StartPingLoop();
-                await ReceiveLoopAsync(cancellationToken);
+                _ = ReceiveLoopAsync(cancellationToken);
             }
         }
         catch (Exception e)

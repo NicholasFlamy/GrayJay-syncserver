@@ -337,7 +337,7 @@ public class SyncService : IDisposable
 
                         _relaySession.Authorizable = AlwaysAuthorized.Instance;
                         RelayConnected = true;
-                        await _relaySession.StartAsInitiatorAsync(_relayPublicKey, AppId, null, _cancellationTokenSource.Token);
+                        await _relaySession.RunAsInitiatorAsync(_relayPublicKey, AppId, null, _cancellationTokenSource.Token);
 
                         Logger.Info<SyncService>("Relay session finished.");
                     }
