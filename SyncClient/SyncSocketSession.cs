@@ -120,24 +120,27 @@ public class SyncSocketSession : IDisposable
         });
     }
 
-    public async Task StartAsInitiatorAsync(string remotePublicKey, uint appId = 0, string? pairingCode = null, CancellationToken cancellationToken = default)
+    public void StartAsInitiator(string remotePublicKey, uint appId = 0, string? pairingCode = null, CancellationToken cancellationToken = default)
     {
         _started = true;
-        try
+        _ = Task.Run(async () =>
         {
-            await HandshakeAsInitiatorAsync(remotePublicKey, appId, pairingCode, cancellationToken);
-            _onHandshakeComplete?.Invoke(this);
-            StartPingLoop();
-            _ = ReceiveLoopAsync(cancellationToken);
-        }
-        catch (Exception e)
-        {
-            Logger.Error<SyncSocketSession>($"Failed to run as initiator: {e}");
-        }
-        finally
-        {
-            Dispose();
-        }
+            try
+            {
+                await HandshakeAsInitiatorAsync(remotePublicKey, appId, pairingCode, cancellationToken);
+                _onHandshakeComplete?.Invoke(this);
+                StartPingLoop();
+                await ReceiveLoopAsync(cancellationToken);
+            }
+            catch (Exception e)
+            {
+                Logger.Error<SyncSocketSession>($"Failed to run as initiator: {e}");
+            }
+            finally
+            {
+                Dispose();
+            }
+        });
     }
 
     public async Task RunAsInitiatorAsync(string remotePublicKey, uint appId = 0, string? pairingCode = null, CancellationToken cancellationToken = default)
@@ -160,26 +163,29 @@ public class SyncSocketSession : IDisposable
         }
     }
 
-    public async Task StartAsResponderAsync(CancellationToken cancellationToken = default)
+    public void StartAsResponder(CancellationToken cancellationToken = default)
     {
         _started = true;
-        try
+        _ = Task.Run(async () =>
         {
-            if (await HandshakeAsResponderAsync(cancellationToken))
+            try
             {
-                _onHandshakeComplete?.Invoke(this);
-                StartPingLoop();
-                _ = ReceiveLoopAsync(cancellationToken);
+                if (await HandshakeAsResponderAsync(cancellationToken))
+                {
+                    _onHandshakeComplete?.Invoke(this);
+                    StartPingLoop();
+                    await ReceiveLoopAsync(cancellationToken);
+                }
             }
-        }
-        catch (Exception e)
-        {
-            Logger.Error<SyncSocketSession>($"Failed to run as responder: {e}");
-        }
-        finally
-        {
-            Dispose();
-        }
+            catch (Exception e)
+            {
+                Logger.Error<SyncSocketSession>($"Failed to run as responder: {e}");
+            }
+            finally
+            {
+                Dispose();
+            }
+        });
     }
 
     private async Task ReceiveLoopAsync(CancellationToken cancellationToken = default)

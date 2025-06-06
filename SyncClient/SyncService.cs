@@ -142,7 +142,7 @@ public class SyncService : IDisposable
                 {
                     var clientSocket = await _serverSocket.AcceptSocketAsync();
                     var session = CreateSocketSession(clientSocket, true);
-                    await session.StartAsResponderAsync();
+                    session.StartAsResponder();
                 }
 
                 ServerSocketStarted = false;
@@ -646,7 +646,7 @@ public class SyncService : IDisposable
         if (onStatusUpdate != null)
             _remotePendingStatusUpdate[remotePublicKey.DecodeBase64().EncodeBase64()] = onStatusUpdate;
         onStatusUpdate?.Invoke(null, "Handshaking...");
-        await session.StartAsInitiatorAsync(remotePublicKey, AppId, pairingCode, cancellationToken);
+        session.StartAsInitiator(remotePublicKey, AppId, pairingCode, cancellationToken);
         return session;
     }
 
