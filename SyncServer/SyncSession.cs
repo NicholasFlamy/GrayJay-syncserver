@@ -935,7 +935,7 @@ public class SyncSession
             }
             byte keyLength = data[offset];
             offset += 1;
-            if (offset + keyLength > data.Count || keyLength > 32)
+            if (offset + keyLength > data.Count || keyLength > 64)
             {
                 await SendEmptyResponseAsync(ResponseOpcode.BULK_DELETE_RECORD, requestId, (int)BulkDeleteRecordResponseCode.InvalidRequest);
                 return;
@@ -1287,7 +1287,7 @@ public class SyncSession
         }
         byte[] consumerPublicKey = data.Slice(0, 32).ToArray();
         int keyLength = data[32];
-        if (keyLength > 32)
+        if (keyLength > 64)
         {
             await SendEmptyResponseAsync(ResponseOpcode.PUBLISH_RECORD, requestId, (int)PublishRecordResponseCode.ConsumerPublicKeyDataLengthMismatch);
             return;
@@ -1367,7 +1367,7 @@ public class SyncSession
         byte[] publisherPublicKey = data.Slice(0, 32).ToArray();
         byte[] consumerPublicKey = data.Slice(32, 32).ToArray();
         int keyLength = data[64];
-        if (keyLength > 32)
+        if (keyLength > 64)
         {
             await SendEmptyResponseAsync(ResponseOpcode.DELETE_RECORD, requestId, (int)DeleteRecordResponseCode.InvalidRequest);
             return;
@@ -1486,7 +1486,7 @@ public class SyncSession
         }
         byte[] publisherPublicKey = data.Slice(0, 32).ToArray();
         int keyLength = data[32];
-        if (keyLength > 32)
+        if (keyLength > 64)
         {
             await SendEmptyResponseAsync(ResponseOpcode.GET_RECORD, requestId, (int)GetRecordResponseCode.InvalidRequest);
             Interlocked.Increment(ref _server.Metrics.TotalGetRecordFailures);
