@@ -74,9 +74,6 @@ public class SyncSocketSession : IDisposable
         Action<SyncSocketSession, Opcode, byte, ReadOnlySpan<byte>>? onData = null, Action<SyncSocketSession, ChannelRelayed>? onNewChannel = null, Func<LinkType, SyncSocketSession, string, string?, uint, bool>? isHandshakeAllowed = null, Action<SyncSocketSession, ChannelRelayed, bool>? onChannelEstablished = null)
     {
         _socket = socket;
-        _socket.ReceiveBufferSize = MAXIMUM_PACKET_SIZE_ENCRYPTED;
-        _socket.SendBufferSize = MAXIMUM_PACKET_SIZE_ENCRYPTED;
-
         _onClose = onClose;
         _onHandshakeComplete = onHandshakeComplete;
         _onChannelEstablished = onChannelEstablished;
@@ -1727,8 +1724,8 @@ public class SyncSocketSession : IDisposable
     public async Task<bool> PublishRecordsAsync(IEnumerable<string> consumerPublicKeys, string key, byte[] data, ContentEncoding contentEncoding = ContentEncoding.Raw, CancellationToken cancellationToken = default)
     {
         var keyBytes = Encoding.UTF8.GetBytes(key);
-        if (string.IsNullOrEmpty(key) || keyBytes.Length > 32)
-            throw new ArgumentException("Key must be non-empty and at most 32 bytes.", nameof(key));
+        if (string.IsNullOrEmpty(key) || keyBytes.Length > 64)
+            throw new ArgumentException("Key must be non-empty and at most 64 bytes.", nameof(key));
 
         var consumerList = consumerPublicKeys.ToList();
         if (consumerList.Count == 0)
@@ -1830,8 +1827,8 @@ public class SyncSocketSession : IDisposable
     public async Task<bool> PublishRecordAsync(string consumerPublicKey, string key, byte[] data, ContentEncoding contentEncoding = ContentEncoding.Raw, CancellationToken cancellationToken = default)
     {
         var keyBytes = Encoding.UTF8.GetBytes(key);
-        if (string.IsNullOrEmpty(key) || keyBytes.Length > 32)
-            throw new ArgumentException("Key must be non-empty and at most 32 bytes.", nameof(key));
+        if (string.IsNullOrEmpty(key) || keyBytes.Length > 64)
+            throw new ArgumentException("Key must be non-empty and at most 64 bytes.", nameof(key));
 
         var requestId = GenerateRequestId();
         var tcs = new TaskCompletionSource<bool>();
@@ -1918,8 +1915,8 @@ public class SyncSocketSession : IDisposable
 
     public async Task<(byte[] Data, DateTime Timestamp)?> GetRecordAsync(string publisherPublicKey, string key, CancellationToken cancellationToken = default)
     {
-        if (string.IsNullOrEmpty(key) || key.Length > 32)
-            throw new ArgumentException("Key must be non-empty and at most 32 bytes.", nameof(key));
+        if (string.IsNullOrEmpty(key) || key.Length > 64)
+            throw new ArgumentException("Key must be non-empty and at most 64 bytes.", nameof(key));
 
         var tcs = new TaskCompletionSource<(byte[] Data, DateTime Timestamp)?>();
         var requestId = GenerateRequestId();
@@ -1938,6 +1935,8 @@ public class SyncSocketSession : IDisposable
                 throw new ArgumentException("Publisher public key must be 32 bytes.", nameof(publisherPublicKey));
 
             byte[] keyBytes = Encoding.UTF8.GetBytes(key);
+            if (keyBytes.Length > 64)
+                throw new ArgumentException("Key must be at most 64 bytes.", nameof(key));
             int packetSize = 4 + 32 + 1 + keyBytes.Length;
             var packet = new byte[packetSize];
             int offset = 0;
@@ -1963,8 +1962,8 @@ public class SyncSocketSession : IDisposable
 
     public async Task<Dictionary<string, (byte[] Data, DateTime Timestamp)>> GetRecordsAsync(IEnumerable<string> publisherPublicKeys, string key, CancellationToken cancellationToken = default)
     {
-        if (string.IsNullOrEmpty(key) || key.Length > 32)
-            throw new ArgumentException("Key must be non-empty and at most 32 bytes.", nameof(key));
+        if (string.IsNullOrEmpty(key) || key.Length > 64)
+            throw new ArgumentException("Key must be non-empty and at most 64 bytes.", nameof(key));
 
         var publishers = publisherPublicKeys.ToList();
         if (publishers.Count == 0)
@@ -1983,6 +1982,8 @@ public class SyncSocketSession : IDisposable
         try
         {
             byte[] keyBytes = Encoding.UTF8.GetBytes(key);
+            if (keyBytes.Length > 64)
+                throw new ArgumentException("Key must be at most 64 bytes.", nameof(key));
             int packetSize = 4 + 1 + keyBytes.Length + 1 + publishers.Count * 32;
             var packet = new byte[packetSize];
             int offset = 0;
@@ -2017,9 +2018,9 @@ public class SyncSocketSession : IDisposable
 
     public async Task<bool> DeleteRecordsAsync(string publisherPublicKey, string consumerPublicKey, IEnumerable<string> keys, CancellationToken cancellationToken = default)
     {
-        var keyList = keys.ToList();
-        if (keyList.Any(k => Encoding.UTF8.GetByteCount(k) > 32))
-            throw new ArgumentException("Keys must be at most 32 bytes.", nameof(keys));
+        var keyList = keys.Select(k => Encoding.UTF8.GetBytes(k)).ToList();
+        if (keyList.Any(k => k.Length < 1 || k.Length > 64))
+            throw new ArgumentException("Keys must be at most 64 bytes.", nameof(keys));
 
         var tcs = new TaskCompletionSource<bool>();
         var requestId = GenerateRequestId();
@@ -2047,9 +2048,8 @@ public class SyncSocketSession : IDisposable
             writer.Write(publisherPublicKeyBytes); // 32 bytes: Publisher public key
             writer.Write(consumerPublicKeyBytes); // 32 bytes: Consumer public key
             writer.Write((byte)keyList.Count); // 1 byte: Number of keys (max 255)
-            foreach (var key in keyList)
+            foreach (var keyBytes in keyList)
             {
-                byte[] keyBytes = Encoding.UTF8.GetBytes(key);
                 writer.Write((byte)keyBytes.Length); // 1 byte: Key length
                 writer.Write(keyBytes); // Variable: Key bytes
             }
@@ -2068,8 +2068,8 @@ public class SyncSocketSession : IDisposable
 
     public Task<bool> DeleteRecordAsync(string publisherPublicKey, string consumerPublicKey, string key, CancellationToken cancellationToken = default)
     {
-        if (key.Length > 32)
-            throw new ArgumentException("Key must be at most 32 bytes.", nameof(key));
+        if (key.Length > 64)
+            throw new ArgumentException("Key must be at most 64 bytes.", nameof(key));
 
         var tcs = new TaskCompletionSource<bool>();
         var requestId = GenerateRequestId();
@@ -2094,8 +2094,8 @@ public class SyncSocketSession : IDisposable
                 throw new ArgumentException("Consumer public key must be 32 bytes.", nameof(consumerPublicKey));
 
             byte[] keyBytes = Encoding.UTF8.GetBytes(key);
-            if (keyBytes.Length > 32)
-                throw new ArgumentException("Key must be at most 32 bytes.", nameof(key));
+            if (keyBytes.Length > 64)
+                throw new ArgumentException("Key must be at most 64 bytes.", nameof(key));
 
             var packet = new byte[4 + 32 + 32 + 1 + keyBytes.Length];
             int offset = 0;

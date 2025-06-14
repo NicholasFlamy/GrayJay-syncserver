@@ -306,9 +306,6 @@ public class TcpSyncServer : IDisposable
     {
         _listenSocket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
         _listenSocket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
-        _listenSocket.NoDelay = true;
-        _listenSocket.ReceiveBufferSize = MAXIMUM_PACKET_SIZE_ENCRYPTED;
-        _listenSocket.SendBufferSize = MAXIMUM_PACKET_SIZE_ENCRYPTED;
         _listenSocket.Bind(new IPEndPoint(IPAddress.Any, _port));
         _listenSocket.Listen(1000);
 
@@ -352,16 +349,8 @@ public class TcpSyncServer : IDisposable
                     SyncSession? session = null;
                     try
                     {
-                        //Small buffer for handshake
-                        clientSocket.ReceiveBufferSize = 1024;
-                        clientSocket.SendBufferSize = 1024;
-                        clientSocket.NoDelay = true;
-
                         session = new SyncSession(this, (s) =>
                         {
-                            s.Socket.ReceiveBufferSize = MAXIMUM_PACKET_SIZE_ENCRYPTED;
-                            s.Socket.SendBufferSize = MAXIMUM_PACKET_SIZE_ENCRYPTED;
-
                             lock (_pendingLock)
                                 _pendingHandshakes.Remove(s);
 
