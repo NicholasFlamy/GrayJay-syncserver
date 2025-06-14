@@ -6,6 +6,7 @@ using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
 using System.Text.Json.Serialization;
+using System.Threading;
 using static SyncServer.SyncSession;
 using static SyncServer.TcpSyncServer;
 using LogLevel = SyncShared.LogLevel;
@@ -134,7 +135,8 @@ public class TcpSyncServer : IDisposable
 
     private const int MAX_CONNECTIONS = 100000;
 
-    private Socket? _listenSocket;
+    private Socket? _listenSocket4;
+    private Socket? _listenSocket6;
     public readonly SemaphoreSlim MaxConnections;
     private readonly ConcurrentDictionary<Socket, SyncSession> _clients = new();
     public int ClientCount => _clients.Count;
@@ -166,7 +168,7 @@ public class TcpSyncServer : IDisposable
     private static readonly TimeSpan HandshakeBlacklistDuration = TimeSpan.FromMinutes(1);
 
     private readonly int _port;
-    public int Port => (_listenSocket?.LocalEndPoint as IPEndPoint)?.Port ?? _port;
+    public int Port => _port;
     private int _nextConnectionId = 0;
     public IRecordRepository RecordRepository { get; }
 
@@ -304,100 +306,109 @@ public class TcpSyncServer : IDisposable
 
     public void Start()
     {
-        _listenSocket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-        _listenSocket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
-        _listenSocket.Bind(new IPEndPoint(IPAddress.Any, _port));
-        _listenSocket.Listen(1000);
+        _listenSocket4 = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        _listenSocket4.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+        _listenSocket4.Bind(new IPEndPoint(IPAddress.Any, _port));
+        _listenSocket4.Listen(1000);
 
-        Logger.Info<TcpSyncServer>("Server started. Listening on port 9000...");
+        _listenSocket6 = new Socket(AddressFamily.InterNetworkV6, SocketType.Stream, ProtocolType.Tcp);
+        _listenSocket6.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+        _listenSocket6.SetSocketOption(SocketOptionLevel.IPv6, SocketOptionName.IPv6Only, true);
+        _listenSocket6.Bind(new IPEndPoint(IPAddress.IPv6Any, _port));
+        _listenSocket6.Listen(1000);
 
-        _ = Task.Run(async () =>
+        Logger.Info<TcpSyncServer>($"Server started. Listening on port {_port} for IPv4 & IPv6 (dual-socket).");
+
+        _ = AcceptLoopAsync(_listenSocket4);
+        _ = AcceptLoopAsync(_listenSocket6);
+    }
+
+    private async Task AcceptLoopAsync(Socket listenSocket)
+    {
+        try
         {
-            try
+            while (true)
             {
-                while (true)
+                await Task.Delay(_acceptDelay);
+
+                MaxConnections.Wait();
+                var clientSocket = await listenSocket.AcceptAsync();
+                if (clientSocket == null)
                 {
-                    await Task.Delay(_acceptDelay);
+                    Logger.Info<TcpSyncServer>("Accepted socket is null.");
+                    MaxConnections.Release();
+                    return;
+                }
 
-                    MaxConnections.Wait();
-                    var clientSocket = await _listenSocket.AcceptAsync();
-                    if (clientSocket == null)
-                    {
-                        Logger.Info<TcpSyncServer>("Accepted socket is null.");
-                        MaxConnections.Release();
-                        return;
-                    }
+                string ip = ((IPEndPoint)clientSocket.RemoteEndPoint!).Address.ToString();
+                if (_ipHandshakeBlacklist.TryGetValue(ip, out var blockedUntil) && blockedUntil > DateTime.UtcNow)
+                {
+                    clientSocket.Close();
+                    MaxConnections.Release();
+                    continue;
+                }
 
-                    string ip = ((IPEndPoint)clientSocket.RemoteEndPoint!).Address.ToString();
-                    if (_ipHandshakeBlacklist.TryGetValue(ip, out var blockedUntil) && blockedUntil > DateTime.UtcNow)
-                    {
-                        clientSocket.Close();
-                        MaxConnections.Release();
-                        continue;
-                    }
+                var bucket = _handshakeBuckets.GetOrAdd(ip, _ => new TokenBucket(MaxHandshakesPerWindow, MaxHandshakesPerWindow / HandshakeWindow.TotalSeconds));
+                if (!bucket.TryConsume(1))
+                {
+                    Logger.Warning<TcpSyncServer>($"Blacklisted IP {ip} for exceeding rate limit.");
+                    _ipHandshakeBlacklist[ip] = DateTime.UtcNow + HandshakeBlacklistDuration;
+                    clientSocket.Close();
+                    MaxConnections.Release();
+                    continue;
+                }
 
-                    var bucket = _handshakeBuckets.GetOrAdd(ip, _ => new TokenBucket(MaxHandshakesPerWindow, MaxHandshakesPerWindow / HandshakeWindow.TotalSeconds));
-                    if (!bucket.TryConsume(1))
-                    {
-                        Logger.Warning<TcpSyncServer>($"Blacklisted IP {ip} for exceeding rate limit.");
-                        _ipHandshakeBlacklist[ip] = DateTime.UtcNow + HandshakeBlacklistDuration;
-                        clientSocket.Close();
-                        MaxConnections.Release();
-                        continue;
-                    }
-
-                    SyncSession? session = null;
-                    try
-                    {
-                        session = new SyncSession(this, (s) =>
-                        {
-                            lock (_pendingLock)
-                                _pendingHandshakes.Remove(s);
-
-                            _sessions[s.RemotePublicKey!] = s;
-                        }, OnSessionClosed, _useRateLimits)
-                        {
-                            Socket = clientSocket,
-                            HandshakeState = NoiseProtocol.Create(false, s: _keyPair.PrivateKey)
-                        };
-                        _clients.TryAdd(clientSocket, session);
-                        Interlocked.Increment(ref Metrics.TotalConnectionsAccepted);
-                        Interlocked.Increment(ref Metrics.ActiveConnections);
-
-                        Logger.Info<TcpSyncServer>($"Client connected: {clientSocket.RemoteEndPoint}");
-                        session.Start();
-                    }
-                    catch (Exception ex)
-                    {
-                        Logger.Error<TcpSyncServer>($"Accept processing error", ex);
-                        MaxConnections.Release();
-                    }
-
-                    if (session != null)
+                SyncSession? session = null;
+                try
+                {
+                    session = new SyncSession(this, (s) =>
                     {
                         lock (_pendingLock)
+                            _pendingHandshakes.Remove(s);
+
+                        _sessions[s.RemotePublicKey!] = s;
+                    }, OnSessionClosed, _useRateLimits)
+                    {
+                        Socket = clientSocket,
+                        HandshakeState = NoiseProtocol.Create(false, s: _keyPair.PrivateKey)
+                    };
+                    _clients.TryAdd(clientSocket, session);
+                    Interlocked.Increment(ref Metrics.TotalConnectionsAccepted);
+                    Interlocked.Increment(ref Metrics.ActiveConnections);
+
+                    Logger.Info<TcpSyncServer>($"Client connected: {clientSocket.RemoteEndPoint}");
+                    session.Start();
+                }
+                catch (Exception ex)
+                {
+                    Logger.Error<TcpSyncServer>($"Accept processing error", ex);
+                    MaxConnections.Release();
+                }
+
+                if (session != null)
+                {
+                    lock (_pendingLock)
+                    {
+                        // Evict oldest if we're at capacity
+                        if (_pendingHandshakes.Count >= MAX_PENDING_HANDSHAKES)
                         {
-                            // Evict oldest if we're at capacity
-                            if (_pendingHandshakes.Count >= MAX_PENDING_HANDSHAKES)
-                            {
-                                var oldest = _pendingHandshakes.First!;
-                                _pendingHandshakes.RemoveFirst();
-                                oldest.Value.Dispose();
+                            var oldest = _pendingHandshakes.First!;
+                            _pendingHandshakes.RemoveFirst();
+                            oldest.Value.Dispose();
 
-                                Logger.Warning<TcpSyncServer>($"Evicted {ip} for not completing handshake in time when server is under load.");
-                            }
-
-                            _pendingHandshakes.AddLast(session);
+                            Logger.Warning<TcpSyncServer>($"Evicted {ip} for not completing handshake in time when server is under load.");
                         }
+
+                        _pendingHandshakes.AddLast(session);
                     }
                 }
             }
-            catch (Exception e)
-            {
-                Logger.Error<TcpSyncServer>($"Unhandled exception in listening socket", e);
-                Dispose();
-            }
-        });
+        }
+        catch (Exception e)
+        {
+            Logger.Error<TcpSyncServer>($"Unhandled exception in listening socket", e);
+            Dispose();
+        }
     }
 
     public bool IsBlacklisted(string initiator, string target)
@@ -428,7 +439,8 @@ public class TcpSyncServer : IDisposable
     {
         try
         {
-            _listenSocket?.Close();
+            _listenSocket4?.Close();
+            _listenSocket6?.Close();
             foreach (var client in _clients.Values)
                 client.Dispose();
         }
@@ -438,8 +450,10 @@ public class TcpSyncServer : IDisposable
         }
         finally
         {
-            _listenSocket?.Dispose();
-            _listenSocket = null;
+            _listenSocket4?.Dispose();
+            _listenSocket4 = null;
+            _listenSocket6?.Dispose();
+            _listenSocket6 = null;
         }
 
         MaxConnections.Dispose();
