@@ -444,7 +444,7 @@ public class SyncSession
                         return;
                     }
                     int keyLength = data[0];
-                    if (keyLength > 32 || data.Count < 6 + keyLength)
+                    if (keyLength < 1 || keyLength > 64 || data.Count < 6 + keyLength)
                     {
                         await SendEmptyResponseAsync(ResponseOpcode.BULK_PUBLISH_RECORD, requestId, (int)BulkPublishRecordResponseCode.InvalidRequest);
                         return;
@@ -516,7 +516,7 @@ public class SyncSession
                         return;
                     }
                     keyLength = data[0];
-                    if (keyLength > 32 || data.Count < 6 + keyLength)
+                    if (keyLength < 1 || keyLength > 64 || data.Count < 6 + keyLength)
                     {
                         await SendEmptyResponseAsync(ResponseOpcode.BULK_GET_RECORD, requestId, (int)BulkGetRecordResponseCode.InvalidRequest);
                         return;
