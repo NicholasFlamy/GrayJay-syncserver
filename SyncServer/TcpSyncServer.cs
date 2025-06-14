@@ -6,10 +6,6 @@ using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
 using System.Text.Json.Serialization;
-using System.Threading;
-using static SyncServer.SyncSession;
-using static SyncServer.TcpSyncServer;
-using LogLevel = SyncShared.LogLevel;
 
 namespace SyncServer;
 
