@@ -358,7 +358,7 @@ public class SqliteRecordRepository : IRecordRepository
         }
     }
 
-    public async Task<IEnumerable<(string Key, DateTime Timestamp)>> ListKeysAsync(byte[] publisherPublicKey, byte[] consumerPublicKey)
+    public async Task<IEnumerable<(string Key, DateTime Timestamp, int Size)>> ListKeysAsync(byte[] publisherPublicKey, byte[] consumerPublicKey)
     {
         var connection = await GetConnectionAsync();
         try
@@ -367,16 +367,17 @@ public class SqliteRecordRepository : IRecordRepository
             var consumerId = await GetOrCreateUserIdAsync(consumerPublicKey, connection);
 
             using var command = connection.CreateCommand();
-            command.CommandText = "SELECT key, timestamp FROM records WHERE publisher_id = @publisherId AND consumer_id = @consumerId";
+            command.CommandText = "SELECT key, timestamp, LENGTH(encrypted_blob) AS size FROM records WHERE publisher_id = @publisherId AND consumer_id = @consumerId";
             command.Parameters.AddWithValue("@publisherId", publisherId);
             command.Parameters.AddWithValue("@consumerId", consumerId);
             using var reader = await command.ExecuteReaderAsync();
-            var list = new List<(string, DateTime)>();
+            var list = new List<(string, DateTime, int)>();
             while (await reader.ReadAsync())
             {
                 list.Add((
                     reader.GetString(reader.GetOrdinal("key")),
-                    reader.GetDateTime(reader.GetOrdinal("timestamp"))
+                    reader.GetDateTime(reader.GetOrdinal("timestamp")),
+                    reader.GetInt32(reader.GetOrdinal("size"))
                 ));
             }
             return list;

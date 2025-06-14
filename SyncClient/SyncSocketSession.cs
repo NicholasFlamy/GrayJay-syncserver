@@ -61,7 +61,7 @@ public class SyncSocketSession : IDisposable
     private readonly ConcurrentDictionary<int, TaskCompletionSource<ConnectionInfo?>> _pendingConnectionInfoRequests = new();
     private readonly ConcurrentDictionary<int, TaskCompletionSource<bool>> _pendingPublishRequests = new();
     private readonly ConcurrentDictionary<int, TaskCompletionSource<bool>> _pendingDeleteRequests = new();
-    private readonly ConcurrentDictionary<int, TaskCompletionSource<List<(string Key, DateTime Timestamp)>>> _pendingListKeysRequests = new();
+    private readonly ConcurrentDictionary<int, TaskCompletionSource<List<(string Key, DateTime Timestamp, int Size)>>> _pendingListKeysRequests = new();
     private readonly ConcurrentDictionary<int, TaskCompletionSource<(byte[] EncryptedBlob, DateTime Timestamp)?>> _pendingGetRecordRequests = new();
     private readonly ConcurrentDictionary<int, TaskCompletionSource<Dictionary<string, (byte[] Data, DateTime Timestamp)>>> _pendingBulkGetRecordRequests = new();
     private readonly ConcurrentDictionary<int, TaskCompletionSource<Dictionary<string, ConnectionInfo>>> _pendingBulkConnectionInfoRequests = new();
@@ -937,7 +937,7 @@ public class SyncSocketSession : IDisposable
                         {
                             try
                             {
-                                var keys = new List<(string Key, DateTime Timestamp)>();
+                                var keys = new List<(string Key, DateTime Timestamp, int Size)>();
                                 if (data.Length < 4)
                                     throw new Exception("Packet too short for key count");
                                 int keyCount = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(0, 4));
@@ -962,8 +962,15 @@ public class SyncSocketSession : IDisposable
                                     }
                                     long timestampBinary = BinaryPrimitives.ReadInt64LittleEndian(data.Slice(0, 8));
                                     data = data.Slice(8);
+                                    data = data.Slice(keyLength);
+                                    if (data.Length < 8)
+                                    {
+                                        throw new Exception("Packet too short for timestamp");
+                                    }
+                                    int size = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(0, 4));
+                                    data = data.Slice(4);
                                     DateTime timestamp = DateTime.FromBinary(timestampBinary);
-                                    keys.Add((key, timestamp));
+                                    keys.Add((key, timestamp, size));
                                 }
                                 tcs.SetResult(keys);
                             }
@@ -2130,9 +2137,9 @@ public class SyncSocketSession : IDisposable
         return tcs.Task;
     }
 
-    public Task<List<(string Key, DateTime Timestamp)>> ListRecordKeysAsync(string publisherPublicKey, string consumerPublicKey, CancellationToken cancellationToken = default)
+    public Task<List<(string Key, DateTime Timestamp, int Size)>> ListRecordKeysAsync(string publisherPublicKey, string consumerPublicKey, CancellationToken cancellationToken = default)
     {
-        var tcs = new TaskCompletionSource<List<(string Key, DateTime Timestamp)>>();
+        var tcs = new TaskCompletionSource<List<(string Key, DateTime Timestamp, int Size)>>();
         var requestId = GenerateRequestId();
         _pendingListKeysRequests[requestId] = tcs;
 

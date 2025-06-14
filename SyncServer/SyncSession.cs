@@ -1443,12 +1443,13 @@ public class SyncSession
                 writer.Write(requestId);
                 writer.Write((int)ListRecordKeysResponseCode.Success); //Status code
                 writer.Write(keys.Count());
-                foreach (var (key, timestamp) in keys)
+                foreach (var (key, timestamp, size) in keys)
                 {
                     byte[] keyBytes = Encoding.UTF8.GetBytes(key);
                     writer.Write((byte)keyBytes.Length);
                     writer.Write(keyBytes);
                     writer.Write(timestamp.ToBinary());
+                    writer.Write(size);
                 }
                 var responseData = ms.ToArray();
                 await SendAsync(Opcode.RESPONSE, (byte)ResponseOpcode.LIST_RECORD_KEYS, responseData); // Success

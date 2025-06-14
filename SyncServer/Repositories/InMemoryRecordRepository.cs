@@ -107,11 +107,14 @@ public class InMemoryRecordRepository : IRecordRepository
         return null;
     }
 
-    public IEnumerable<(string Key, DateTime Timestamp)> ListKeys(byte[] publisherPublicKey, byte[] consumerPublicKey)
+    public IEnumerable<(string Key, DateTime Timestamp, int Size)> ListKeys(byte[] publisherPublicKey, byte[] consumerPublicKey)
     {
         return _store.Keys
             .Where(k => k.PublisherPublicKey.SequenceEqual(publisherPublicKey) && k.ConsumerPublicKey.SequenceEqual(consumerPublicKey))
-            .Select(k => (k.Key, _store[k].Timestamp));
+            .Select(k => {
+                var blob = _store[k];
+                return (k.Key, blob.Timestamp, blob.EncryptedBlob.Length);
+            });
     }
 
     public Task InsertOrUpdateAsync(byte[] publisherPublicKey, byte[] consumerPublicKey, string key, byte[] encryptedBlob)
@@ -137,7 +140,7 @@ public class InMemoryRecordRepository : IRecordRepository
         return Task.FromResult(Get(publisherPublicKey, consumerPublicKey, key));
     }
 
-    public Task<IEnumerable<(string Key, DateTime Timestamp)>> ListKeysAsync(byte[] publisherPublicKey, byte[] consumerPublicKey)
+    public Task<IEnumerable<(string Key, DateTime Timestamp, int Size)>> ListKeysAsync(byte[] publisherPublicKey, byte[] consumerPublicKey)
     {
         return Task.FromResult(ListKeys(publisherPublicKey, consumerPublicKey));
     }
