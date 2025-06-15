@@ -16,13 +16,16 @@ class Program
     static async Task Main()
     {
         var firebaseApps = new Dictionary<string, FirebaseApp>();
-        foreach (var path in Directory.GetFiles("ServiceAccounts"))
+        if (Directory.Exists("ServiceAccounts"))
         {
-            var appName = Path.GetFileNameWithoutExtension(path);
-            firebaseApps[appName] = FirebaseApp.Create(new AppOptions()
+            foreach (var path in Directory.GetFiles("ServiceAccounts"))
             {
-                Credential = GoogleCredential.FromFile(path)
-            });
+                var appName = Path.GetFileNameWithoutExtension(path);
+                firebaseApps[appName] = FirebaseApp.Create(new AppOptions()
+                {
+                    Credential = GoogleCredential.FromFile(path)
+                });
+            }
         }
 
         KeyPair keyPair;
