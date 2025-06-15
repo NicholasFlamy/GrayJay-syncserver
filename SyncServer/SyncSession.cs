@@ -8,7 +8,10 @@ using System.Net.Sockets;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using FirebaseAdmin.Messaging;
+using Newtonsoft.Json.Linq;
 using Noise;
+using SyncServer.Repositories;
 using SyncShared;
 using static System.Runtime.InteropServices.JavaScript.JSType;
 using static SyncServer.TcpSyncServer;
@@ -35,7 +38,7 @@ public class SyncSession
     public const int HEADER_SIZE = 7;
     public const int MAXIMUM_PACKET_SIZE = 65535 - 16;
     public const int MAXIMUM_PACKET_SIZE_ENCRYPTED = MAXIMUM_PACKET_SIZE + 16;
-    private const long KV_STORAGE_LIMIT_PER_PUBLISHER = 10 * 1024 * 1024; // 10MB
+    private const long KV_STORAGE_LIMIT_PER_PUBLISHER = 100 * 1024 * 1024; // 100MB
     private const int MAX_ACTIVE_STREAMS = 10;
 
     public required Socket Socket { get; init; }
@@ -692,7 +695,170 @@ public class SyncSession
             case NotifyOpcode.CONNECTION_INFO:
                 HandlePublishConnectionInfo(data);
                 break;
+            case NotifyOpcode.DEVICE_TOKEN:
+                HandleDeviceToken(data);
+                break;
+            case NotifyOpcode.SET_NOTIFICATION_ALLOW_LIST:
+                HandleNotificationAllowList(data);
+                break;
+            case NotifyOpcode.PUSH_NOTIFICATION:
+                HandlePushNotification(data);
+                break;
         }
+    }
+
+    private void HandleNotificationAllowList(Span<byte> data)
+    {
+        var span = data;
+        int offset = 0;
+        if (span.Length < 4)
+            throw new InvalidDataException("SET_NOTIFICATION_ALLOW_LIST too short for key count");
+
+        int numKeys = BinaryPrimitives.ReadInt32LittleEndian(span.Slice(offset, 4));
+        offset += 4;
+        var allowed = new HashSet<string>(StringComparer.Ordinal);
+
+        for (int i = 0; i < numKeys; i++)
+        {
+            if (span.Length < offset + 4)
+                throw new InvalidDataException("SET_NOTIFICATION_ALLOW_LIST too short for key length");
+            int keyLen = span[offset++];
+            if (keyLen != 32)
+                throw new InvalidDataException("Key must be 32 bytes.");
+
+            if (span.Length < offset + keyLen)
+                throw new InvalidDataException("SET_NOTIFICATION_ALLOW_LIST payload truncated");
+            string key = span.Slice(offset, keyLen).ToArray().EncodeBase64();
+            offset += keyLen;
+            allowed.Add(key);
+        }
+
+        _server.SetNotificationAllowList(RemotePublicKey!, allowed);
+    }
+
+    private void HandlePushNotification(Span<byte> data)
+    {
+        var span = data;
+        int offset = 0;
+        if (span.Length < 4)
+            throw new InvalidDataException("SEND_PUSH_NOTIFICATION too short for key count");
+
+        int numKeys = BinaryPrimitives.ReadInt32LittleEndian(span.Slice(offset, 4));
+        offset += 4;
+        var targets = new List<string>(numKeys);
+        for (int i = 0; i < numKeys; i++)
+        {
+            if (span.Length < offset + 4)
+                throw new InvalidDataException("SEND_PUSH_NOTIFICATION too short for key length");
+            int keyLen = span[offset++];
+            if (keyLen != 32)
+                throw new InvalidDataException("Key length must be 32.");
+            if (span.Length < offset + keyLen)
+                throw new InvalidDataException("SEND_PUSH_NOTIFICATION payload truncated");
+            string key = span.Slice(offset, keyLen).ToArray().EncodeBase64();
+            offset += keyLen;
+
+            targets.Add(key);
+        }
+
+        if (span.Length < offset + 4)
+            throw new InvalidDataException("SEND_PUSH_NOTIFICATION too short for title length");
+        int titleLen = BinaryPrimitives.ReadInt32LittleEndian(span.Slice(offset, 4));
+        offset += 4;
+        if (span.Length < offset + titleLen)
+            throw new InvalidDataException("SEND_PUSH_NOTIFICATION truncated title");
+        string title = Encoding.UTF8.GetString(span.Slice(offset, titleLen));
+        offset += titleLen;
+
+        if (span.Length < offset + 4)
+            throw new InvalidDataException("SEND_PUSH_NOTIFICATION too short for body length");
+        int bodyLen = BinaryPrimitives.ReadInt32LittleEndian(span.Slice(offset, 4));
+        offset += 4;
+        if (span.Length < offset + bodyLen)
+            throw new InvalidDataException("SEND_PUSH_NOTIFICATION truncated body");
+
+        string body = Encoding.UTF8.GetString(span.Slice(offset, bodyLen));
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await _server.SendPushNotificationAsync(RemotePublicKey!, targets, title, body);
+            }
+            catch (Exception e)
+            {
+                Logger.Error<SyncSession>("Failed to send push notifications.", e);
+            }
+        });
+    }
+
+    private void HandleDeviceToken(Span<byte> data)
+    {
+        var span = data;
+        int offset = 0;
+
+        if (span.Length < offset + 1)
+        {
+            Logger.Error<SyncSession>("DEVICE_TOKEN too short for appName length");
+            return;
+        }
+        int appLen = span[offset++];
+        if (span.Length < offset + appLen)
+        {
+            Logger.Error<SyncSession>("DEVICE_TOKEN truncated appName");
+            return;
+        }
+        string appName = Encoding.UTF8.GetString(span.Slice(offset, appLen));
+        offset += appLen;
+
+        if (span.Length < offset + 1)
+        {
+            Logger.Error<SyncSession>("DEVICE_TOKEN too short for platform length");
+            return;
+        }
+        int platformLen = span[offset++];
+        if (span.Length < offset + platformLen)
+        {
+            Logger.Error<SyncSession>("DEVICE_TOKEN truncated platform");
+            return;
+        }
+        string platform = Encoding.UTF8.GetString(span.Slice(offset, platformLen));
+        offset += platformLen;
+
+        if (span.Length < offset + 4)
+        {
+            Logger.Error<SyncSession>("DEVICE_TOKEN too short for token length");
+            return;
+        }
+        int tokenLen = BinaryPrimitives.ReadInt32LittleEndian(span.Slice(offset, 4));
+        offset += 4;
+        if (span.Length < offset + tokenLen)
+        {
+            Logger.Error<SyncSession>("DEVICE_TOKEN truncated token");
+            return;
+        }
+        string token = Encoding.UTF8.GetString(span.Slice(offset, tokenLen));
+        // offset += tokenLen;
+
+        _ = _server.DeviceTokenRepository.InsertOrUpdateAsync(RemotePublicKey!, platform, appName, token).ContinueWith(t =>
+        {
+            if (t.IsFaulted)
+                Logger.Error<SyncSession>("Failed to save device token", t.Exception!);
+        });
+
+#if DEBUG
+        _ = Task.Run(async () =>
+        {
+            if (platform == "android")
+            {
+                const string title = "Test notification";
+                string body = $"Your token for {appName} has been registered";
+                await _server.SendPushNotificationAsync(RemotePublicKey!, new List<string> { RemotePublicKey! }, title, body);
+                await Task.Delay(TimeSpan.FromSeconds(10));
+                await _server.SendPushNotificationAsync(RemotePublicKey!, new List<string> { RemotePublicKey! }, title + " (delayed)", body);
+            }
+            Logger.Info<SyncSession>($"Saved device token for app '{appName}', platform '{platform}'.");
+        });
+#endif
     }
 
     private async ValueTask HandleDecryptedPacketAsync(Opcode opcode, byte subOpcode, ArraySegment<byte> data, ContentEncoding contentEncoding)
@@ -1326,6 +1492,7 @@ public class SyncSession
                     return;
                 }
                 await _server.RecordRepository.InsertOrUpdateAsync(publisherPublicKey, consumerPublicKey, key, encryptedBlob);
+
                 stopwatch.Stop();
                 Interlocked.Add(ref _server.Metrics.TotalPublishRecordTimeMs, stopwatch.ElapsedMilliseconds);
                 Interlocked.Increment(ref _server.Metrics.PublishRecordCount);

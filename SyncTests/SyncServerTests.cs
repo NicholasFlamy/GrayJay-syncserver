@@ -20,7 +20,8 @@ namespace SyncServerTests
             var serverKeyPair = KeyPair.Generate();
             var serverPublicKey = Convert.ToBase64String(serverKeyPair.PublicKey);
             var recordRepository = new InMemoryRecordRepository();
-            var server = new TcpSyncServer(0, serverKeyPair, recordRepository, maxConnections);
+            var deviceTokenRepository = new InMemoryDeviceTokenRepository();
+            var server = new TcpSyncServer(0, serverKeyPair, recordRepository, deviceTokenRepository, null, maxConnections);
             server.Start();
             var port = server.Port;
             return (server, serverPublicKey, port);
@@ -36,7 +37,7 @@ namespace SyncServerTests
             uint appId = 0)
         {
             var keyPair = KeyPair.Generate();
-            var socket = Utilities.OpenTcpSocket("127.0.0.1", port);
+            var socket = await Utilities.OpenTcpSocketAsync("127.0.0.1", port);
             var tcs = new TaskCompletionSource<bool>();
             var socketSession = new SyncSocketSession(
                 "127.0.0.1",
@@ -53,7 +54,7 @@ namespace SyncServerTests
                 isHandshakeAllowed: (linkType, s, pk, pw, appId) => isHandshakeAllowed != null ? isHandshakeAllowed(linkType, s, pk, pw, appId) : true
             );
             socketSession.Authorizable = AlwaysAuthorized.Instance;
-            _ = socketSession.StartAsInitiatorAsync(serverPublicKey, appId);
+            socketSession.StartAsInitiator(serverPublicKey, appId);
             await tcs.Task.WithTimeout(500000, "Handshake timed out");
             return socketSession;
         }
@@ -81,7 +82,7 @@ namespace SyncServerTests
             {
                 var incorrectPublicKey = Convert.ToBase64String(KeyPair.Generate().PublicKey);
                 var keyPair = KeyPair.Generate();
-                var socket = Utilities.OpenTcpSocket("127.0.0.1", port);
+                var socket = await Utilities.OpenTcpSocketAsync("127.0.0.1", port);
                 var tcs = new TaskCompletionSource<bool>();
                 var socketSession = new SyncSocketSession(
                     "127.0.0.1",
@@ -92,7 +93,7 @@ namespace SyncServerTests
                     onData: (s, o, so, d) => { },
                     onNewChannel: (s, c) => { }
                 );
-                _ = socketSession.StartAsInitiatorAsync(incorrectPublicKey);
+                socketSession.StartAsInitiator(incorrectPublicKey);
                 await tcs.Task.WithTimeout(5000, "Connection close timed out");
                 Assert.IsNull(socketSession.RemotePublicKey, "Handshake should fail with incorrect public key");
                 socketSession.Dispose();

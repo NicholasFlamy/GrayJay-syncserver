@@ -50,10 +50,10 @@ internal class Program
             KeyPair keyPair = KeyPair.Generate(); // Generate in-memory key pair
             keyPairs.Add(keyPair);
             //var socket = Utilities.OpenTcpSocket("relay.grayjay.app", 9000); // Connect to server
-            var socket = Utilities.OpenTcpSocket("127.0.0.1", 9000); // Connect to server
+            var socket = await Utilities.OpenTcpSocketAsync("127.0.0.1", 9000); // Connect to server
             var session = CreateSocketSession(socket, keyPair, ServerPublicKey, sessionToPeer);
             sessions.Add(session);
-            _ = session.StartAsInitiatorAsync(ServerPublicKey); // Initiate handshake
+            session.StartAsInitiator(ServerPublicKey); // Initiate handshake
             ActiveClients++;
             await Task.Delay(1);
         }

@@ -1,4 +1,6 @@
-﻿using Noise;
+﻿using FirebaseAdmin;
+using Google.Apis.Auth.OAuth2;
+using Noise;
 using SyncServer.Repositories;
 using SyncShared;
 using System.Text.Json;
@@ -9,9 +11,20 @@ class Program
 {
 
     private const string _dbPath = "records.db";
+    private const string _dbDevicetokensPath = "deviceTokens.db";
 
     static async Task Main()
     {
+        var firebaseApps = new Dictionary<string, FirebaseApp>();
+        foreach (var path in Directory.GetFiles("ServiceAccounts"))
+        {
+            var appName = Path.GetFileNameWithoutExtension(path);
+            firebaseApps[appName] = FirebaseApp.Create(new AppOptions()
+            {
+                Credential = GoogleCredential.FromFile(path)
+            });
+        }
+
         KeyPair keyPair;
         try
         {
@@ -31,14 +44,16 @@ class Program
         var publicKey = Convert.ToBase64String(keyPair.PublicKey);
         Console.WriteLine("Public Key: " + publicKey);
 
-        var connectionString = $"Data Source={_dbPath};Pooling=False;";
-        using var recordRepository = new SqliteRecordRepository(connectionString);
+        using var recordRepository = new SqliteRecordRepository($"Data Source={_dbPath};Pooling=False;");
         await recordRepository.InitializeAsync();
+        using var deviceTokenRepository = new SqliteDeviceTokenRepository($"Data Source={_dbDevicetokensPath};Pooling=False;");
+        await deviceTokenRepository.InitializeAsync();
 
-        using var server = new TcpSyncServer(9000, keyPair, recordRepository);
+        using var server = new TcpSyncServer(9000, keyPair, recordRepository, deviceTokenRepository, firebaseApps);
         server.Start();
 
         var builder = WebApplication.CreateBuilder();
+        builder.Services.AddSingleton<IDictionary<string, FirebaseApp>>(firebaseApps);
         builder.Services.AddLogging((logBuilder) =>
         {
             logBuilder.ClearProviders();

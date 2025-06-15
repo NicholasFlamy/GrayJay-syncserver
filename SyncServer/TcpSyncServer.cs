@@ -1,4 +1,6 @@
-﻿using Noise;
+﻿using FirebaseAdmin;
+using FirebaseAdmin.Messaging;
+using Noise;
 using SyncServer.Repositories;
 using SyncShared;
 using System.Buffers.Binary;
@@ -159,26 +161,31 @@ public class TcpSyncServer : IDisposable
 
     private readonly ConcurrentDictionary<string, TokenBucket> _handshakeBuckets = new();
     private readonly ConcurrentDictionary<string, DateTime> _ipHandshakeBlacklist = new();
+    private ConcurrentDictionary<string, HashSet<string>> _notificationAllowList = new();
     private static readonly TimeSpan HandshakeWindow = TimeSpan.FromMinutes(1);
     private const int MaxHandshakesPerWindow = 20;
     private static readonly TimeSpan HandshakeBlacklistDuration = TimeSpan.FromMinutes(1);
 
+    private readonly IDictionary<string, FirebaseApp>? _firebaseApps;
     private readonly int _port;
     public int Port => _port;
     private int _nextConnectionId = 0;
     public IRecordRepository RecordRepository { get; }
+    public IDeviceTokenRepository DeviceTokenRepository { get; }
 
     public readonly TcpSyncServerMetrics Metrics;
 
     public bool _useRateLimits;
 
-    public TcpSyncServer(int port, KeyPair keyPair, IRecordRepository recordRepository, int maxConnections = MAX_CONNECTIONS, bool useRateLimits = false)
+    public TcpSyncServer(int port, KeyPair keyPair, IRecordRepository recordRepository, IDeviceTokenRepository deviceTokenRepository, IDictionary<string, FirebaseApp>? firebaseApps = null, int maxConnections = MAX_CONNECTIONS, bool useRateLimits = false)
     {
         Metrics = new TcpSyncServerMetrics(this);
         _port = port;
         MaxConnections = new SemaphoreSlim(maxConnections, maxConnections);
         _keyPair = keyPair;
+        _firebaseApps = firebaseApps;
         RecordRepository = recordRepository;
+        DeviceTokenRepository = deviceTokenRepository;
         _useRateLimits = useRateLimits;
     }
 
@@ -600,5 +607,74 @@ public class TcpSyncServer : IDisposable
                 RemoveRelayedConnection(connId);
             }
         }
+    }
+
+    private bool IsNotificationAllowed(string sourceKey, string targetKey)
+    {
+        return sourceKey == targetKey || _notificationAllowList.TryGetValue(targetKey, out var v) && v != null && v.Contains(sourceKey);
+    }
+
+    public void SetNotificationAllowList(string sourceKey, HashSet<string> targetKeys)
+    {
+        _notificationAllowList[sourceKey] = targetKeys;
+    }
+
+    public async Task SendPushNotificationAsync(string sourceKey, List<string> targetKeys, string title, string body)
+    {
+        var allowed = await DeviceTokenRepository.GetAllAsync(targetKeys.Where(target => IsNotificationAllowed(sourceKey, target)).ToList());
+
+        var byApp = allowed.GroupBy(d => d.AppName);
+        var tasks = new List<Task>();
+
+        foreach (var appGroup in byApp)
+        {
+            var appName = appGroup.Key;
+            var byPlatform = appGroup.GroupBy(d => d.Platform?.ToLowerInvariant());
+
+            foreach (var platformGroup in byPlatform)
+            {
+                var tokens = platformGroup
+                    .Select(d => d.Token)
+                    .Where(t => !string.IsNullOrWhiteSpace(t))
+                    .ToList();
+
+                if (tokens.Count == 0)
+                    continue;
+
+                switch (platformGroup.Key)
+                {
+                    case "android":
+                        tasks.Add(SendAndroidPushNotificationAsync(appName, tokens, title, body));
+                        break;
+                }
+            }
+        }
+
+        await Task.WhenAll(tasks);
+    }
+
+    private async Task SendAndroidPushNotificationAsync(string appName, List<string> tokens, string title, string body)
+    {
+        if (_firebaseApps == null || !_firebaseApps.TryGetValue(appName, out var firebaseApp))
+            return;
+
+        await FirebaseMessaging.GetMessaging(firebaseApp).SendEachAsync(tokens.Select(token => new Message()
+        {
+            Token = token,
+            Notification = new Notification
+            {
+                Title = title,
+                Body = body
+            },
+            Android = new AndroidConfig
+            {
+                Priority = Priority.High,
+                Notification = new AndroidNotification
+                {
+                    ChannelId = "fcm_default_channel",
+                    ClickAction = "OPEN_MAIN"
+                }
+            }
+        }).ToList());
     }
 }

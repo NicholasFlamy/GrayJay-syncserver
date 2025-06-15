@@ -16,7 +16,10 @@ public enum NotifyOpcode : byte
 {
     AUTHORIZED = 0,
     UNAUTHORIZED = 1,
-    CONNECTION_INFO = 2
+    CONNECTION_INFO = 2,
+    DEVICE_TOKEN = 3,
+    SET_NOTIFICATION_ALLOW_LIST = 4,
+    PUSH_NOTIFICATION = 5
 }
 
 public enum StreamOpcode : byte

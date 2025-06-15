@@ -1419,6 +1419,101 @@ public class SyncSocketSession : IDisposable
         }
     }
 
+    public async Task SetNotificationAllowListAsync(IEnumerable<string> allowedKeys)
+    {
+        var keyList = allowedKeys.ToList();
+        var keyBytes = keyList.Select(k => k.DecodeBase64()).ToList();
+        int totalLength = 4 + keyBytes.Sum(b => 1 + b.Length);
+        var buffer = new byte[totalLength];
+
+        int offset = 0;
+        BinaryPrimitives.WriteInt32LittleEndian(buffer.AsSpan(offset, 4), keyBytes.Count);
+        offset += 4;
+
+        foreach (var kb in keyBytes)
+        {
+            buffer[offset++] = (byte)kb.Length;
+            Buffer.BlockCopy(kb, 0, buffer, offset, kb.Length);
+            offset += kb.Length;
+        }
+
+        await SendAsync(Opcode.NOTIFY, (byte)NotifyOpcode.SET_NOTIFICATION_ALLOW_LIST, buffer, 0, totalLength);
+    }
+
+    public async Task SendPushNotificationAsync(IEnumerable<string> targetKeys, string title, string body)
+    {
+        var targets = targetKeys.ToList();
+        var targetB = targets.Select(t => t.DecodeBase64()).ToList();
+        var titleB = Encoding.UTF8.GetBytes(title);
+        var bodyB = Encoding.UTF8.GetBytes(body);
+
+        int totalLength =
+            4 + targetB.Sum(b => 1 + b.Length)
+          + 4 + titleB.Length
+          + 4 + bodyB.Length;
+
+        var buffer = new byte[totalLength];
+        int offset = 0;
+
+        BinaryPrimitives.WriteInt32LittleEndian(buffer.AsSpan(offset, 4), targetB.Count);
+        offset += 4;
+
+        foreach (var kb in targetB)
+        {
+            buffer[offset++] = (byte)kb.Length;
+            Buffer.BlockCopy(kb, 0, buffer, offset, kb.Length);
+            offset += kb.Length;
+        }
+
+        BinaryPrimitives.WriteInt32LittleEndian(buffer.AsSpan(offset, 4), titleB.Length);
+        offset += 4;
+        Buffer.BlockCopy(titleB, 0, buffer, offset, titleB.Length);
+        offset += titleB.Length;
+
+        BinaryPrimitives.WriteInt32LittleEndian(buffer.AsSpan(offset, 4), bodyB.Length);
+        offset += 4;
+        Buffer.BlockCopy(bodyB, 0, buffer, offset, bodyB.Length);
+        // offset += bodyB.Length; // not needed
+
+        await SendAsync(Opcode.NOTIFY, (byte)NotifyOpcode.PUSH_NOTIFICATION, buffer, 0, totalLength);
+    }
+
+    public async Task SendDeviceTokenAsync(string appName, string platform, string token)
+    {
+        var appBytes = Encoding.UTF8.GetBytes(appName);
+        if (appBytes.Length > 255)
+            throw new ArgumentException("App name too long", nameof(appName));
+
+        var platformBytes = Encoding.UTF8.GetBytes(platform);
+        if (platformBytes.Length > 255)
+            throw new ArgumentException("Platform name too long", nameof(platform));
+
+        var tokenBytes = Encoding.UTF8.GetBytes(token);
+
+        int totalLength =
+            1 + appBytes.Length
+          + 1 + platformBytes.Length
+          + 4 + tokenBytes.Length;
+
+        var buffer = new byte[totalLength];
+        int offset = 0;
+
+        buffer[offset++] = (byte)appBytes.Length;
+        Buffer.BlockCopy(appBytes, 0, buffer, offset, appBytes.Length);
+        offset += appBytes.Length;
+
+        buffer[offset++] = (byte)platformBytes.Length;
+        Buffer.BlockCopy(platformBytes, 0, buffer, offset, platformBytes.Length);
+        offset += platformBytes.Length;
+
+        BinaryPrimitives.WriteInt32LittleEndian(buffer.AsSpan(offset, 4), tokenBytes.Length);
+        offset += 4;
+        Buffer.BlockCopy(tokenBytes, 0, buffer, offset, tokenBytes.Length);
+        // offset += tokenBytes.Length; // not needed
+
+        await SendAsync(Opcode.NOTIFY, (byte)NotifyOpcode.DEVICE_TOKEN, buffer, 0, totalLength);
+    }
+
     private void HandleRelayedData(ReadOnlySpan<byte> data)
     {
         if (data.Length < 8)
