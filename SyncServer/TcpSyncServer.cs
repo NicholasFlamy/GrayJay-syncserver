@@ -5,6 +5,7 @@ using SyncServer.Repositories;
 using SyncShared;
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
+using System.Linq;
 using System.Net;
 using System.Net.Sockets;
 using System.Text.Json.Serialization;
@@ -658,7 +659,10 @@ public class TcpSyncServer : IDisposable
         if (_firebaseApps == null || !_firebaseApps.TryGetValue(appName, out var firebaseApp))
             return;
 
-        await FirebaseMessaging.GetMessaging(firebaseApp).SendEachAsync(tokens.Select(token => new Message()
+        if (Logger.WillLog(SyncShared.LogLevel.Info))
+            Logger.Info<TcpSyncServer>($"Sent push notification (app name: {appName}, title: {title}).");
+
+        var response = await FirebaseMessaging.GetMessaging(firebaseApp).SendEachAsync(tokens.Select(token => new Message()
         {
             Token = token,
             Notification = new Notification
@@ -676,5 +680,16 @@ public class TcpSyncServer : IDisposable
                 }
             }
         }).ToList());
+
+        if (Logger.WillLog(SyncShared.LogLevel.Error) && response.FailureCount > 0)
+        {
+            foreach (var resp in response.Responses)
+            {
+                if (resp.IsSuccess)
+                    continue;
+
+                Logger.Error<TcpSyncServer>("Failed to send push notification.", resp.Exception);
+            }
+        }
     }
 }
