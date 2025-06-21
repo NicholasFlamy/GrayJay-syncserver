@@ -162,7 +162,7 @@ public class TcpSyncServer : IDisposable
 
     private readonly ConcurrentDictionary<string, TokenBucket> _handshakeBuckets = new();
     private readonly ConcurrentDictionary<string, DateTime> _ipHandshakeBlacklist = new();
-    private ConcurrentDictionary<string, HashSet<string>> _notificationAllowList = new();
+    private Dictionary<string, HashSet<string>> _notificationAllowList = new();
     private static readonly TimeSpan HandshakeWindow = TimeSpan.FromMinutes(1);
     private const int MaxHandshakesPerWindow = 20;
     private static readonly TimeSpan HandshakeBlacklistDuration = TimeSpan.FromMinutes(1);
@@ -612,15 +612,45 @@ public class TcpSyncServer : IDisposable
 
     private bool IsNotificationAllowed(string sourceKey, string targetKey)
     {
-        return sourceKey == targetKey || _notificationAllowList.TryGetValue(targetKey, out var v) && v != null && v.Contains(sourceKey);
+        if (sourceKey == targetKey)
+            return true;
+
+        HashSet<string>? current;
+        lock (_notificationAllowList)
+        {
+            if (!_notificationAllowList.TryGetValue(targetKey, out current) || current == null)
+                return false;
+        }
+
+        lock (current)
+        {
+            return current.Contains(sourceKey);
+        }
     }
 
-    public void SetNotificationAllowList(string sourceKey, HashSet<string> targetKeys)
+    public void SetNotificationAllowList(string sourceKey, HashSet<string> allowed, HashSet<string> disallowed)
     {
-        _notificationAllowList[sourceKey] = targetKeys;
+        HashSet<string>? current;
+        lock (_notificationAllowList)
+        {
+            if (!_notificationAllowList.TryGetValue(sourceKey, out current) || current == null)
+            {
+                current = new HashSet<string>(StringComparer.Ordinal);
+                _notificationAllowList[sourceKey] = current;
+            }
+        }
+
+        lock (current)
+        {
+            foreach (var key in allowed)
+                current.Add(key);
+
+            foreach (var key in disallowed)
+                current.Remove(key);
+        }
     }
 
-    public async Task SendPushNotificationAsync(string sourceKey, List<string> targetKeys, string title, string body)
+    public async Task SendPushNotificationAsync(string sourceKey, List<string> targetKeys, bool highPriority, int timeToLive_s, string title, string body, string? data = null, string? collapseKey = null, Dictionary<string, string>? platformData = null)
     {
         var allowed = await DeviceTokenRepository.GetAllAsync(targetKeys.Where(target => IsNotificationAllowed(sourceKey, target)).ToList());
 
@@ -645,7 +675,7 @@ public class TcpSyncServer : IDisposable
                 switch (platformGroup.Key)
                 {
                     case "android":
-                        tasks.Add(SendAndroidPushNotificationAsync(appName, tokens, title, body));
+                        tasks.Add(SendAndroidPushNotificationAsync(sourceKey, appName, tokens, highPriority, timeToLive_s, title, body, data, collapseKey, platformData));
                         break;
                 }
             }
@@ -654,13 +684,19 @@ public class TcpSyncServer : IDisposable
         await Task.WhenAll(tasks);
     }
 
-    private async Task SendAndroidPushNotificationAsync(string appName, List<string> tokens, string title, string body)
+    private async Task SendAndroidPushNotificationAsync(string sourceKey, string appName, List<string> tokens, bool highPriority, int timeToLive_s, string title, string body, string? data = null, string? collapseKey = null, Dictionary<string, string>? platformData = null)
     {
         if (_firebaseApps == null || !_firebaseApps.TryGetValue(appName, out var firebaseApp))
             return;
 
         if (Logger.WillLog(SyncShared.LogLevel.Info))
             Logger.Info<TcpSyncServer>($"Sent push notification (app name: {appName}, title: {title}).");
+
+        platformData ??= new Dictionary<string, string>(StringComparer.Ordinal);
+
+        var clickAction = platformData.TryGetValue("android:clickAction", out var ca) ? ca : "OPEN_MAIN";
+        var channelId = platformData.TryGetValue("android:channelId", out var ch) ? ch : "fcm_default_channel";
+        var directBootOk = !platformData.TryGetValue("android:directBootOk", out var dbOk) || dbOk == "true";
 
         var response = await FirebaseMessaging.GetMessaging(firebaseApp).SendEachAsync(tokens.Select(token => new Message()
         {
@@ -672,13 +708,21 @@ public class TcpSyncServer : IDisposable
             },
             Android = new AndroidConfig
             {
-                Priority = Priority.High,
+                Priority = highPriority ? Priority.High : Priority.Normal,
                 Notification = new AndroidNotification
                 {
-                    ChannelId = "fcm_default_channel",
-                    ClickAction = "OPEN_MAIN"
-                }
-            }
+                    ChannelId = channelId,
+                    ClickAction = clickAction
+                },
+                CollapseKey = collapseKey,
+                RestrictedPackageName = appName,
+                DirectBootOk = directBootOk,
+                TimeToLive = TimeSpan.FromSeconds(timeToLive_s)
+            },
+            Data = data != null ? new Dictionary<string, string>()
+            {
+                { "data", data }
+            } : new Dictionary<string, string>()
         }).ToList());
 
         if (Logger.WillLog(SyncShared.LogLevel.Error) && response.FailureCount > 0)

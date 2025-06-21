@@ -12,6 +12,7 @@ using System.IO.Compression;
 using System.Drawing;
 using System.Threading;
 using System.Buffers.Text;
+using System.Text.Json;
 
 namespace SyncClient;
 
@@ -1439,18 +1440,44 @@ public class SyncSocketSession : IDisposable
 
         await SendAsync(Opcode.NOTIFY, (byte)NotifyOpcode.SET_NOTIFICATION_ALLOW_LIST, buffer, 0, totalLength);
     }
-
-    public async Task SendPushNotificationAsync(IEnumerable<string> targetKeys, string title, string body)
+    public async Task SendPushNotificationAsync(
+        IEnumerable<string> targetKeys,
+        bool highPriority,
+        int timeToLive_s,
+        string title,
+        string body,
+        string? data = null,
+        string? collapseKey = null,
+        Dictionary<string, string>? platformData = null
+    )
     {
         var targets = targetKeys.ToList();
         var targetB = targets.Select(t => t.DecodeBase64()).ToList();
         var titleB = Encoding.UTF8.GetBytes(title);
         var bodyB = Encoding.UTF8.GetBytes(body);
+        var dataB = data != null ? Encoding.UTF8.GetBytes(data) : null;
+        var collapseKeyB = collapseKey != null ? Encoding.UTF8.GetBytes(collapseKey) : null;
+
+        int platformDataLength = 0;
+        if (platformData != null)
+        {
+            foreach (var kvp in platformData)
+            {
+                var keyB = Encoding.UTF8.GetBytes(kvp.Key);
+                var valB = Encoding.UTF8.GetBytes(kvp.Value);
+                platformDataLength += 4 + keyB.Length + 4 + valB.Length;
+            }
+        }
 
         int totalLength =
             4 + targetB.Sum(b => 1 + b.Length)
+          + 1 // highPriority
+          + 4 // timeToLive
           + 4 + titleB.Length
-          + 4 + bodyB.Length;
+          + 4 + bodyB.Length
+          + 1 + (dataB != null ? 4 + dataB.Length : 0)
+          + 1 + (collapseKeyB != null ? 4 + collapseKeyB.Length : 0)
+          + 1 + (platformData != null ? 4 + platformDataLength : 0);
 
         var buffer = new byte[totalLength];
         int offset = 0;
@@ -1460,10 +1487,15 @@ public class SyncSocketSession : IDisposable
 
         foreach (var kb in targetB)
         {
+            if (kb.Length != 32) throw new InvalidOperationException("Key must be 32 bytes");
             buffer[offset++] = (byte)kb.Length;
             Buffer.BlockCopy(kb, 0, buffer, offset, kb.Length);
             offset += kb.Length;
         }
+
+        buffer[offset++] = (byte)(highPriority ? 1 : 0);
+        BinaryPrimitives.WriteInt32LittleEndian(buffer.AsSpan(offset, 4), timeToLive_s);
+        offset += 4;
 
         BinaryPrimitives.WriteInt32LittleEndian(buffer.AsSpan(offset, 4), titleB.Length);
         offset += 4;
@@ -1473,7 +1505,51 @@ public class SyncSocketSession : IDisposable
         BinaryPrimitives.WriteInt32LittleEndian(buffer.AsSpan(offset, 4), bodyB.Length);
         offset += 4;
         Buffer.BlockCopy(bodyB, 0, buffer, offset, bodyB.Length);
-        // offset += bodyB.Length; // not needed
+        offset += bodyB.Length;
+
+        // Optional data
+        buffer[offset++] = (byte)(dataB != null ? 1 : 0);
+        if (dataB != null)
+        {
+            BinaryPrimitives.WriteInt32LittleEndian(buffer.AsSpan(offset, 4), dataB.Length);
+            offset += 4;
+            Buffer.BlockCopy(dataB, 0, buffer, offset, dataB.Length);
+            offset += dataB.Length;
+        }
+
+        // Optional collapseKey
+        buffer[offset++] = (byte)(collapseKeyB != null ? 1 : 0);
+        if (collapseKeyB != null)
+        {
+            BinaryPrimitives.WriteInt32LittleEndian(buffer.AsSpan(offset, 4), collapseKeyB.Length);
+            offset += 4;
+            Buffer.BlockCopy(collapseKeyB, 0, buffer, offset, collapseKeyB.Length);
+            offset += collapseKeyB.Length;
+        }
+
+        // Optional platformData
+        buffer[offset++] = (byte)(platformData != null ? 1 : 0);
+        if (platformData != null)
+        {
+            BinaryPrimitives.WriteInt32LittleEndian(buffer.AsSpan(offset, 4), platformData.Count);
+            offset += 4;
+
+            foreach (var kvp in platformData)
+            {
+                var keyB = Encoding.UTF8.GetBytes(kvp.Key);
+                var valB = Encoding.UTF8.GetBytes(kvp.Value);
+
+                BinaryPrimitives.WriteInt32LittleEndian(buffer.AsSpan(offset, 4), keyB.Length);
+                offset += 4;
+                Buffer.BlockCopy(keyB, 0, buffer, offset, keyB.Length);
+                offset += keyB.Length;
+
+                BinaryPrimitives.WriteInt32LittleEndian(buffer.AsSpan(offset, 4), valB.Length);
+                offset += 4;
+                Buffer.BlockCopy(valB, 0, buffer, offset, valB.Length);
+                offset += valB.Length;
+            }
+        }
 
         await SendAsync(Opcode.NOTIFY, (byte)NotifyOpcode.PUSH_NOTIFICATION, buffer, 0, totalLength);
     }
