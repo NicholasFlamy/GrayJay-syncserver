@@ -770,9 +770,8 @@ public class SyncSession
         var span = data;
         int offset = 0;
 
-        if (span.Length < 4)
+        if (span.Length < offset + 4)
             throw new InvalidDataException("SEND_PUSH_NOTIFICATION too short for key count");
-
         int numKeys = BinaryPrimitives.ReadInt32LittleEndian(span.Slice(offset, 4));
         offset += 4;
 
@@ -800,59 +799,15 @@ public class SyncSession
         int timeToLive_s = BinaryPrimitives.ReadInt32LittleEndian(span.Slice(offset, 4));
         offset += 4;
 
-        // Title
         if (span.Length < offset + 4)
-            throw new InvalidDataException("SEND_PUSH_NOTIFICATION too short for title length");
-        int titleLen = BinaryPrimitives.ReadInt32LittleEndian(span.Slice(offset, 4));
+            throw new InvalidDataException("SEND_PUSH_NOTIFICATION too short for data length");
+        int dataLen = BinaryPrimitives.ReadInt32LittleEndian(span.Slice(offset, 4));
         offset += 4;
-        if (span.Length < offset + titleLen)
-            throw new InvalidDataException("SEND_PUSH_NOTIFICATION truncated title");
-        string title = Encoding.UTF8.GetString(span.Slice(offset, titleLen));
-        offset += titleLen;
+        if (span.Length < offset + dataLen)
+            throw new InvalidDataException("SEND_PUSH_NOTIFICATION truncated data");
+        string datad = Encoding.UTF8.GetString(span.Slice(offset, dataLen));
+        offset += dataLen;
 
-        // Body
-        if (span.Length < offset + 4)
-            throw new InvalidDataException("SEND_PUSH_NOTIFICATION too short for body length");
-        int bodyLen = BinaryPrimitives.ReadInt32LittleEndian(span.Slice(offset, 4));
-        offset += 4;
-        if (span.Length < offset + bodyLen)
-            throw new InvalidDataException("SEND_PUSH_NOTIFICATION truncated body");
-        string body = Encoding.UTF8.GetString(span.Slice(offset, bodyLen));
-        offset += bodyLen;
-
-        // Optional Data
-        string? datad = null;
-        if (span.Length < offset + 1)
-            throw new InvalidDataException("SEND_PUSH_NOTIFICATION too short for data flag");
-        if (span[offset++] == 1)
-        {
-            if (span.Length < offset + 4)
-                throw new InvalidDataException("SEND_PUSH_NOTIFICATION too short for data length");
-            int dataLen = BinaryPrimitives.ReadInt32LittleEndian(span.Slice(offset, 4));
-            offset += 4;
-            if (span.Length < offset + dataLen)
-                throw new InvalidDataException("SEND_PUSH_NOTIFICATION truncated data");
-            datad = Encoding.UTF8.GetString(span.Slice(offset, dataLen));
-            offset += dataLen;
-        }
-
-        // Optional CollapseKey
-        string? collapseKey = null;
-        if (span.Length < offset + 1)
-            throw new InvalidDataException("SEND_PUSH_NOTIFICATION too short for collapseKey flag");
-        if (span[offset++] == 1)
-        {
-            if (span.Length < offset + 4)
-                throw new InvalidDataException("SEND_PUSH_NOTIFICATION too short for collapseKey length");
-            int ckLen = BinaryPrimitives.ReadInt32LittleEndian(span.Slice(offset, 4));
-            offset += 4;
-            if (span.Length < offset + ckLen)
-                throw new InvalidDataException("SEND_PUSH_NOTIFICATION truncated collapseKey");
-            collapseKey = Encoding.UTF8.GetString(span.Slice(offset, ckLen));
-            offset += ckLen;
-        }
-
-        // Optional PlatformData
         Dictionary<string, string>? platformData = null;
         if (span.Length < offset + 1)
             throw new InvalidDataException("SEND_PUSH_NOTIFICATION too short for platformData flag");
@@ -873,7 +828,7 @@ public class SyncSession
                 offset += 4;
                 if (span.Length < offset + keyLen)
                     throw new InvalidDataException("SEND_PUSH_NOTIFICATION truncated platformData key");
-                string key = Encoding.UTF8.GetString(span.Slice(offset, keyLen));
+                string pdKey = Encoding.UTF8.GetString(span.Slice(offset, keyLen));
                 offset += keyLen;
 
                 // Value
@@ -883,10 +838,10 @@ public class SyncSession
                 offset += 4;
                 if (span.Length < offset + valLen)
                     throw new InvalidDataException("SEND_PUSH_NOTIFICATION truncated platformData value");
-                string val = Encoding.UTF8.GetString(span.Slice(offset, valLen));
+                string pdVal = Encoding.UTF8.GetString(span.Slice(offset, valLen));
                 offset += valLen;
 
-                platformData[key] = val;
+                platformData[pdKey] = pdVal;
             }
         }
 
@@ -894,7 +849,7 @@ public class SyncSession
         {
             try
             {
-                await _server.SendPushNotificationAsync(RemotePublicKey!, targets, highPriority, timeToLive_s, title, body, datad, collapseKey, platformData);
+                await _server.SendPushNotificationAsync(RemotePublicKey!, targets, highPriority, timeToLive_s, datad, platformData);
             }
             catch (Exception e)
             {
@@ -956,21 +911,6 @@ public class SyncSession
             if (t.IsFaulted)
                 Logger.Error<SyncSession>("Failed to save device token", t.Exception!);
         });
-
-#if DEBUG
-        _ = Task.Run(async () =>
-        {
-            if (platform == "android")
-            {
-                const string title = "Test notification";
-                string body = $"Your token for {appName} has been registered";
-                await _server.SendPushNotificationAsync(RemotePublicKey!, new List<string> { RemotePublicKey! }, true, 0, title, body);
-                await Task.Delay(TimeSpan.FromSeconds(10));
-                await _server.SendPushNotificationAsync(RemotePublicKey!, new List<string> { RemotePublicKey! }, true, 0, title + " (delayed)", body);
-            }
-            Logger.Info<SyncSession>($"Saved device token for app '{appName}', platform '{platform}'.");
-        });
-#endif
     }
 
     private async ValueTask HandleDecryptedPacketAsync(Opcode opcode, byte subOpcode, ArraySegment<byte> data, ContentEncoding contentEncoding)

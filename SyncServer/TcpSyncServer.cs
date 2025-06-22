@@ -8,6 +8,7 @@ using System.Collections.Concurrent;
 using System.Linq;
 using System.Net;
 using System.Net.Sockets;
+using System.Text.Json;
 using System.Text.Json.Serialization;
 
 namespace SyncServer;
@@ -650,7 +651,7 @@ public class TcpSyncServer : IDisposable
         }
     }
 
-    public async Task SendPushNotificationAsync(string sourceKey, List<string> targetKeys, bool highPriority, int timeToLive_s, string title, string body, string? data = null, string? collapseKey = null, Dictionary<string, string>? platformData = null)
+    public async Task SendPushNotificationAsync(string sourceKey, List<string> targetKeys, bool highPriority, int timeToLive_s, string data, Dictionary<string, string>? platformData = null)
     {
         var allowed = await DeviceTokenRepository.GetAllAsync(targetKeys.Where(target => IsNotificationAllowed(sourceKey, target)).ToList());
 
@@ -675,7 +676,7 @@ public class TcpSyncServer : IDisposable
                 switch (platformGroup.Key)
                 {
                     case "android":
-                        tasks.Add(SendAndroidPushNotificationAsync(sourceKey, appName, tokens, highPriority, timeToLive_s, title, body, data, collapseKey, platformData));
+                        tasks.Add(SendAndroidPushNotificationAsync(sourceKey, appName, tokens, highPriority, timeToLive_s, data, platformData));
                         break;
                 }
             }
@@ -684,45 +685,27 @@ public class TcpSyncServer : IDisposable
         await Task.WhenAll(tasks);
     }
 
-    private async Task SendAndroidPushNotificationAsync(string sourceKey, string appName, List<string> tokens, bool highPriority, int timeToLive_s, string title, string body, string? data = null, string? collapseKey = null, Dictionary<string, string>? platformData = null)
+    private async Task SendAndroidPushNotificationAsync(string sourceKey, string appName, List<string> tokens, bool highPriority, int timeToLive_s, string data, Dictionary<string, string>? platformData = null)
     {
         if (_firebaseApps == null || !_firebaseApps.TryGetValue(appName, out var firebaseApp))
             return;
 
         if (Logger.WillLog(SyncShared.LogLevel.Info))
-            Logger.Info<TcpSyncServer>($"Sent push notification (app name: {appName}, title: {title}).");
+            Logger.Info<TcpSyncServer>($"Sent push notification (data: {data}).");
 
         platformData ??= new Dictionary<string, string>(StringComparer.Ordinal);
-
-        var clickAction = platformData.TryGetValue("android:clickAction", out var ca) ? ca : "OPEN_MAIN";
-        var channelId = platformData.TryGetValue("android:channelId", out var ch) ? ch : "fcm_default_channel";
-        var directBootOk = !platformData.TryGetValue("android:directBootOk", out var dbOk) || dbOk == "true";
-
         var response = await FirebaseMessaging.GetMessaging(firebaseApp).SendEachAsync(tokens.Select(token => new Message()
         {
             Token = token,
-            Notification = new Notification
-            {
-                Title = title,
-                Body = body
-            },
             Android = new AndroidConfig
             {
                 Priority = highPriority ? Priority.High : Priority.Normal,
-                Notification = new AndroidNotification
-                {
-                    ChannelId = channelId,
-                    ClickAction = clickAction
-                },
-                CollapseKey = collapseKey,
-                RestrictedPackageName = appName,
-                DirectBootOk = directBootOk,
                 TimeToLive = TimeSpan.FromSeconds(timeToLive_s)
             },
-            Data = data != null ? new Dictionary<string, string>()
+            Data = new Dictionary<string, string>()
             {
                 { "data", data }
-            } : new Dictionary<string, string>()
+            }
         }).ToList());
 
         if (Logger.WillLog(SyncShared.LogLevel.Error) && response.FailureCount > 0)
