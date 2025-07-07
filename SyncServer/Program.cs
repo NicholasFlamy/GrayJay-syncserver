@@ -24,7 +24,7 @@ class Program
                 firebaseApps[appName] = FirebaseApp.Create(new AppOptions()
                 {
                     Credential = GoogleCredential.FromFile(path)
-                });
+                }, appName);
             }
         }
 
