@@ -6,13 +6,15 @@ using System.IO.Compression;
 using System.Text;
 namespace SyncClient;
 
+public delegate void ChannelDataHandler(SyncSocketSession session, IChannel channel, Opcode opcode, byte subOpcode, ReadOnlySpan<byte> data);
+
 public interface IChannel : IDisposable
 {
     public string? RemotePublicKey { get; }
     public int? RemoteVersion { get; }
     public IAuthorizable? Authorizable { get; set; }
     public object? SyncSession { get; set; } //TODO: Replace with SyncSession once library is properly structured
-    public void SetDataHandler(Action<SyncSocketSession, IChannel, Opcode, byte, ReadOnlySpan<byte>>? onData);
+    public void SetDataHandler(ChannelDataHandler? onData);
     public Task SendAsync(Opcode opcode, byte subOpcode, byte[]? data = null, int offset = 0, int count = -1, ContentEncoding contentEncoding = ContentEncoding.Raw, CancellationToken cancellationToken = default);
     public void SetCloseHandler(Action<IChannel>? onClose);
     public LinkType LinkType { get; }
@@ -23,7 +25,7 @@ public class ChannelSocket : IChannel
     public string? RemotePublicKey => _session.RemotePublicKey;
     public int? RemoteVersion => _session.RemoteVersion;
     private readonly SyncSocketSession _session;
-    private Action<SyncSocketSession, IChannel, Opcode, byte, ReadOnlySpan<byte>>? _onData;
+    private ChannelDataHandler? _onData;
     private Action<IChannel>? _onClose;
     public LinkType LinkType => LinkType.Direct;
 
@@ -39,7 +41,7 @@ public class ChannelSocket : IChannel
         _session = session;
     }
 
-    public void SetDataHandler(Action<SyncSocketSession, IChannel, Opcode, byte, ReadOnlySpan<byte>>? onData)
+    public void SetDataHandler(ChannelDataHandler? onData)
     {
         _onData = onData;
     }
@@ -85,7 +87,7 @@ public class ChannelRelayed : IChannel
 
     private readonly KeyPair _localKeyPair;
     private readonly SyncSocketSession _session;
-    private Action<SyncSocketSession, IChannel, Opcode, byte, ReadOnlySpan<byte>>? _onData;
+    private ChannelDataHandler? _onData;
     private Action<IChannel>? _onClose;
     private bool _disposed = false;
     private DateTime _lastPongTime;
@@ -102,7 +104,7 @@ public class ChannelRelayed : IChannel
         RemotePublicKey = publicKey.DecodeBase64().EncodeBase64();
     }
 
-    public void SetDataHandler(Action<SyncSocketSession, IChannel, Opcode, byte, ReadOnlySpan<byte>>? onData)
+    public void SetDataHandler(ChannelDataHandler? onData)
     {
         _onData = onData;
     }

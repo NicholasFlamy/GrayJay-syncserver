@@ -28,6 +28,8 @@ public record ConnectionInfo(
     bool AllowRemoteRelayed
 );
 
+public delegate void SocketDataHandler(SyncSocketSession socketSession, Opcode opcode, byte subOpcode, ReadOnlySpan<byte> data);
+
 //TODO: Cancellation token source and cancel on dispose
 public class SyncSocketSession : IDisposable
 {
@@ -54,7 +56,7 @@ public class SyncSocketSession : IDisposable
     private KeyPair _localKeyPair;
     private readonly string _localPublicKey;
     public string LocalPublicKey => _localPublicKey;
-    private readonly Action<SyncSocketSession, Opcode, byte, ReadOnlySpan<byte>>? _onData;
+    private readonly SocketDataHandler? _onData;
     public string RemoteAddress { get; }
     public int RemoteVersion { get; private set; } = -1;
     private readonly ConcurrentDictionary<long, ChannelRelayed> _channels = new();
@@ -72,7 +74,7 @@ public class SyncSocketSession : IDisposable
 
     public SyncSocketSession(string remoteAddress, KeyPair localKeyPair, Socket socket,
         Action<SyncSocketSession>? onClose = null, Action<SyncSocketSession>? onHandshakeComplete = null,
-        Action<SyncSocketSession, Opcode, byte, ReadOnlySpan<byte>>? onData = null, Action<SyncSocketSession, ChannelRelayed>? onNewChannel = null, Func<LinkType, SyncSocketSession, string, string?, uint, bool>? isHandshakeAllowed = null, Action<SyncSocketSession, ChannelRelayed, bool>? onChannelEstablished = null)
+        SocketDataHandler? onData = null, Action<SyncSocketSession, ChannelRelayed>? onNewChannel = null, Func<LinkType, SyncSocketSession, string, string?, uint, bool>? isHandshakeAllowed = null, Action<SyncSocketSession, ChannelRelayed, bool>? onChannelEstablished = null)
     {
         _socket = socket;
         _onClose = onClose;

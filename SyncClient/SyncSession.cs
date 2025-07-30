@@ -13,7 +13,7 @@ public class SyncSession : IDisposable, IAuthorizable
     private readonly Action<SyncSession> _onUnauthorized;
     private readonly Action<SyncSession> _onClose;
     private readonly Action<SyncSession, bool> _onConnectedChanged;
-    private readonly Action<SyncSession, Opcode, byte, ReadOnlySpan<byte>> _dataHandler;
+    private readonly DataHandler _dataHandler;
     public string RemotePublicKey { get; }
     public bool IsAuthorized => _authorized && _remoteAuthorized;
     public bool _wasAuthorized = false;
@@ -59,7 +59,7 @@ public class SyncSession : IDisposable, IAuthorizable
     }
 
     public SyncSession(string remotePublicKey, Action<SyncSession, bool, bool> onAuthorized, Action<SyncSession> onUnauthorized,
-        Action<SyncSession, bool> onConnectedChanged, Action<SyncSession> onClose, Action<SyncSession, Opcode, byte, ReadOnlySpan<byte>> dataHandler, string? remoteDeviceName)
+        Action<SyncSession, bool> onConnectedChanged, Action<SyncSession> onClose, DataHandler dataHandler, string? remoteDeviceName)
     {
         RemotePublicKey = remotePublicKey.DecodeBase64().EncodeBase64();
         RemoteDeviceName = remoteDeviceName;

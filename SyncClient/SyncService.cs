@@ -24,6 +24,8 @@ public record class SyncServiceSettings
     public bool RelayConnectRelayed { get; init; } = true;
 }
 
+public delegate void DataHandler(SyncSession session, Opcode opcode, byte subOpcode, ReadOnlySpan<byte> data);
+
 public class SyncService : IDisposable
 {
     private readonly ISyncDatabaseProvider _database;
@@ -45,7 +47,7 @@ public class SyncService : IDisposable
     public Action<SyncSession>? OnUnauthorized;
     public Action<SyncSession, bool>? OnConnectedChanged;
     public Action<SyncSession>? OnClose;
-    public Action<SyncSession, Opcode, byte, ReadOnlySpan<byte>>? OnData;
+    public DataHandler? OnData;
     public Action<string, Action<bool>>? AuthorizePrompt;
     private SyncSocketSession? _relaySession;
     private readonly string _relayServer;
