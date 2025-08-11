@@ -235,7 +235,9 @@ public class ChannelRelayed : IChannel
         await _sendSemaphore.WaitAsync(cancellationToken);
         try
         {
-            Span<byte> packet = stackalloc byte[4];
+            //TODO: Change when upgrading to .NET 9
+            //Span<byte> packet = stackalloc byte[4];
+            var packet = new byte[4];
             BinaryPrimitives.WriteInt32LittleEndian(packet, (int)errorCode);
 
             var encryptedPayload = new byte[4 + 16];

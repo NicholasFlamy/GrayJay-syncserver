@@ -304,16 +304,14 @@ public class SyncSocketSession : IDisposable
             {
                 var pairingProtocol = new Protocol(HandshakePattern.N, CipherFunction.ChaChaPoly, HashFunction.Blake2b);
                 using var pairingHandshakeState = pairingProtocol.Create(false, s: _localKeyPair.PrivateKey);
-                var pairingMessage = message.AsSpan(offset, pairingMessageLength);
                 offset += pairingMessageLength;
                 var pairingPlaintext = new byte[512];
-                var (_, _, _) = pairingHandshakeState.ReadMessage(pairingMessage, pairingPlaintext);
+                var (_, _, _) = pairingHandshakeState.ReadMessage(message.AsSpan(offset, pairingMessageLength), pairingPlaintext);
                 receivedPairingCode = Encoding.UTF8.GetString(pairingPlaintext, 0, Array.IndexOf(pairingPlaintext, (byte)0, 0, Math.Min(32, pairingPlaintext.Length)));
                 Logger.Info<SyncSocketSession>($"HandshakeAsResponder: Received pairing code '{receivedPairingCode}' (app id: {appId})");
             }
 
-            var channelMessage = message.AsSpan(offset, messageSize - offset);
-            var (_, _, _) = handshakeState.ReadMessage(channelMessage, plaintext);
+            var (_, _, _) = handshakeState.ReadMessage(message.AsSpan(offset, messageSize - offset), plaintext);
             var remotePublicKey = Convert.ToBase64String(handshakeState.RemoteStaticPublicKey);
 
             var isAllowedToConnect = remotePublicKey != _localPublicKey && (_isHandshakeAllowed?.Invoke(LinkType.Direct, this, remotePublicKey, receivedPairingCode, appId) ?? true);
@@ -1649,9 +1647,12 @@ public class SyncSocketSession : IDisposable
 
     public async Task SendRelayError(long connectionId, RelayErrorCode errorCode, CancellationToken cancellationToken = default)
     {
-        Span<byte> errorPacket = stackalloc byte[12];
-        BinaryPrimitives.WriteInt64LittleEndian(errorPacket.Slice(0, 8), connectionId);
-        BinaryPrimitives.WriteInt32LittleEndian(errorPacket.Slice(8, 4), (int)errorCode);
+        
+        //TODO: Change when upgrading to .NET 9
+        //Span<byte> errorPacket = stackalloc byte[12];
+        var errorPacket = new byte[12];
+        BinaryPrimitives.WriteInt64LittleEndian(errorPacket.AsSpan().Slice(0, 8), connectionId);
+        BinaryPrimitives.WriteInt32LittleEndian(errorPacket.AsSpan().Slice(8, 4), (int)errorCode);
         await SendAsync(Opcode.RELAY, (byte)RelayOpcode.RELAY_ERROR, errorPacket.ToArray(), cancellationToken: cancellationToken);
     }
 
@@ -1945,8 +1946,7 @@ public class SyncSocketSession : IDisposable
                 for (int i = 0; i < chunkCount; i++)
                 {
                     int chunkSize = Math.Min(MaxPlaintextSize, data.Length - dataOffset);
-                    var plaintextSpan = data.AsSpan(dataOffset, chunkSize);
-                    transport!.WriteMessage(plaintextSpan, encryptedChunkBuffer.AsSpan(0, chunkSize + TagSize));
+                    transport!.WriteMessage(data.AsSpan(dataOffset, chunkSize), encryptedChunkBuffer.AsSpan(0, chunkSize + TagSize));
                     BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(offset, 4), chunkSize + TagSize);
                     offset += 4;
                     encryptedChunkBuffer.AsSpan(0, chunkSize + TagSize).CopyTo(packet.AsSpan(offset));
@@ -2033,8 +2033,7 @@ public class SyncSocketSession : IDisposable
             for (int i = 0; i < chunkCount; i++)
             {
                 int chunkSize = Math.Min(MaxPlaintextSize, data.Length - dataOffset);
-                var plaintextSpan = data.AsSpan(dataOffset, chunkSize);
-                transport!.WriteMessage(plaintextSpan, encryptedChunkBuffer.AsSpan(0, chunkSize + TagSize));
+                transport!.WriteMessage(data.AsSpan(dataOffset, chunkSize), encryptedChunkBuffer.AsSpan(0, chunkSize + TagSize));
                 BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(offset, 4), chunkSize + TagSize);
                 offset += 4;
                 encryptedChunkBuffer.AsSpan(0, chunkSize + TagSize).CopyTo(packet.AsSpan(offset));
