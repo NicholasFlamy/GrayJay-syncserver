@@ -1,0 +1,8 @@
+name: grayjay-syncserver
+services:
+  grayjay-syncserver:
+    container_name: grayjay-syncserver
+    image: #image here
+    ports:
+      - '3131:3131'
+    restart: unless-stopped
