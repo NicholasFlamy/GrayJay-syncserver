@@ -49,7 +49,7 @@ namespace SyncServerTests
                     onHandshakeComplete?.Invoke(s);
                     tcs.SetResult(true);
                 },
-                onData: onData ?? ((s, o, so, d) => { }),
+                //onData: onData ?? ((s, o, so, d) => { }),
                 onNewChannel: onNewChannel ?? ((s, c) => { }),
                 isHandshakeAllowed: (linkType, s, pk, pw, appId) => isHandshakeAllowed != null ? isHandshakeAllowed(linkType, s, pk, pw, appId) : true
             );
